@@ -25,6 +25,11 @@ import type {
   ExportMessage,
   ExportImageFile,
 } from "./types.ts";
+import {
+  findBranchInsertionIndex,
+  getMessageParentId,
+  walkActiveBranchNodes,
+} from "./conversation-branch.ts";
 
 // -----------------------------------------------------------------------
 // DEV LOGGING
@@ -315,32 +320,6 @@ function normalizePage(page: ApiConversationPage): ApiConversationPage {
 // MESSAGE PARENT RESOLUTION
 // -----------------------------------------------------------------------
 
-function getParentId(msg: ApiMessage): string | null {
-  const candidates = [
-    msg.parent,
-    msg.parent_message_id,
-    msg.parent_id,
-    msg.metadata?.parent_message_id,
-    msg.metadata?.parent_id,
-  ];
-
-  return (
-    candidates.find(
-      (c): c is string => typeof c === "string" && c.length > 0,
-    ) ?? null
-  );
-}
-
-function hasExplicitRootParent(msg: ApiMessage): boolean {
-  return [
-    msg.parent,
-    msg.parent_message_id,
-    msg.parent_id,
-    msg.metadata?.parent_message_id,
-    msg.metadata?.parent_id,
-  ].some((parentId) => parentId === null);
-}
-
 function getTimestamp(msg: ApiMessage): number {
   return msg.create_time ?? Number.MAX_SAFE_INTEGER;
 }
@@ -378,42 +357,6 @@ function isExportable(
  * Walk backwards from `currentNode` up the parent chain to reconstruct
  * the active conversation branch, then reverse to get chronological order.
  */
-function walkActiveBranch(
-  byId: Map<string, ApiMessage>,
-  currentNode: string,
-  downloadImages: boolean,
-): ApiMessage[] | null {
-  const path: ApiMessage[] = [];
-  const visited = new Set<string>();
-  let nodeId: string | null = currentNode;
-
-  while (nodeId && !visited.has(nodeId)) {
-    visited.add(nodeId);
-    const msg = byId.get(nodeId);
-    if (!msg) break;
-
-    if (isExportable(msg, downloadImages)) {
-      path.push(msg);
-    }
-
-    const parentId = getParentId(msg);
-    const reachedRoot =
-      parentId === "client-created-root" ||
-      (!parentId && hasExplicitRootParent(msg));
-    if (reachedRoot) {
-      // Reached a root explicitly identified by the API.
-      return path.reverse();
-    }
-
-    if (!parentId) return null;
-
-    nodeId = parentId;
-  }
-
-  // Didn't reach root (missing pages, etc.)
-  return null;
-}
-
 /**
  * Chronological pairing fallback: match users to the nearest assistant
  * response that came after them, using a time-ordered scan.
@@ -433,7 +376,7 @@ function buildChronologicalMessages(
   // Build a lookup: parentId → assistant messages (for explicit parent-linking)
   const byParent = new Map<string, ApiMessage[]>();
   for (const a of assistants) {
-    const pid = getParentId(a);
+    const pid = getMessageParentId(a);
     if (!pid) continue;
     const list = byParent.get(pid) ?? [];
     list.push(a);
@@ -844,9 +787,13 @@ async function doLoadConversation(
   );
 
   let orderedMessages: ApiMessage[];
+  let activeBranchNodes: ApiMessage[] | null = null;
 
   if (currentNode) {
-    const branch = walkActiveBranch(allById, currentNode, downloadImages);
+    activeBranchNodes = walkActiveBranchNodes(allById, currentNode);
+    const branch = activeBranchNodes?.filter((message) =>
+      isExportable(message, downloadImages),
+    );
     if (branch && branch.length > 0) {
       orderedMessages = branch;
       devLog(
@@ -863,7 +810,9 @@ async function doLoadConversation(
 
   if (downloadImages) {
     const activeIds = new Set(
-      orderedMessages.flatMap((message) => message.id ? [message.id] : []),
+      (activeBranchNodes ?? orderedMessages).flatMap((message) =>
+        message.id ? [message.id] : [],
+      ),
     );
     const generatedMessages = getUnattachedRenderedGeneratedImages(
       orderedMessages,
@@ -871,12 +820,16 @@ async function doLoadConversation(
     );
 
     for (const generated of generatedMessages) {
-      const parentId = getParentId(generated);
-      const parentIndex = parentId
-        ? orderedMessages.findIndex((message) => message.id === parentId)
-        : -1;
+      const parentId = getMessageParentId(generated);
+      const insertionIndex = parentId
+        ? findBranchInsertionIndex(
+            orderedMessages,
+            activeBranchNodes,
+            parentId,
+          )
+        : orderedMessages.length;
       orderedMessages.splice(
-        parentIndex >= 0 ? parentIndex + 1 : orderedMessages.length,
+        insertionIndex,
         0,
         generated,
       );
