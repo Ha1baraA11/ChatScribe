@@ -1,0 +1,845 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ChatScribe Settings</title>
+    <style>
+      :root {
+        color-scheme: light;
+
+        --canvas: #f4f5f8;
+        --surface: #ffffff;
+        --border: #dadde5;
+        --text: #242936;
+        --text-muted: #626b7a;
+        --brand: #272b37;
+        --brand-hover: #363c4a;
+        --brand-text: #ffffff;
+        --accent: var(--brand);
+        --accent-hover: var(--brand-hover);
+        --accent-text: var(--brand-text);
+        --success: #1e7c5a;
+        --github: #24292e;
+        --github-hover: #1b1f23;
+        --github-text: #ffffff;
+        --danger: #cf222e;
+        --danger-surface: #fff1f0;
+        --overlay: rgba(0, 0, 0, 0.4);
+        --shadow: 0 24px 60px rgba(39, 43, 55, 0.22);
+      }
+
+      :root[data-theme="light"] {
+        color-scheme: light;
+      }
+
+      :root[data-theme="dark"] {
+        color-scheme: dark;
+        --canvas: #313644;
+        --surface: #272b37;
+        --border: #464c5b;
+        --text: #f4f6f9;
+        --text-muted: #bbc2d0;
+        --brand: #272b37;
+        --brand-hover: #363c4a;
+        --brand-text: #ffffff;
+        --accent: #b9c6e2;
+        --accent-hover: #ced8ee;
+        --accent-text: #272b37;
+        --success: #7bd5a7;
+        --github: #21262d;
+        --github-hover: #30363d;
+        --github-text: #f4f6f9;
+        --danger: #f85149;
+        --danger-surface: #2d1114;
+        --overlay: rgba(0, 0, 0, 0.6);
+        --shadow: 0 24px 60px rgba(0, 0, 0, 0.42);
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root:not([data-theme]) {
+          color-scheme: dark;
+          --canvas: #313644;
+          --surface: #272b37;
+          --border: #464c5b;
+          --text: #f4f6f9;
+          --text-muted: #bbc2d0;
+          --brand: #272b37;
+          --brand-hover: #363c4a;
+          --brand-text: #ffffff;
+          --accent: #b9c6e2;
+          --accent-hover: #ced8ee;
+          --accent-text: #272b37;
+          --success: #7bd5a7;
+          --github: #21262d;
+          --github-hover: #30363d;
+          --github-text: #f4f6f9;
+          --danger: #f85149;
+          --danger-surface: #2d1114;
+          --overlay: rgba(0, 0, 0, 0.6);
+          --shadow: 0 24px 60px rgba(0, 0, 0, 0.42);
+        }
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        min-width: 320px;
+        min-height: 100vh;
+        margin: 0;
+        color: var(--text);
+        line-height: 1.5;
+        background: var(--surface);
+      }
+
+      .settings-page {
+        width: min(100%, 1120px);
+        margin: 0 auto;
+        padding: 48px 32px 32px;
+      }
+
+      .page-header {
+        margin-bottom: 26px;
+        padding-bottom: 22px;
+        border-bottom: 1px solid var(--border);
+      }
+
+      .page-heading {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+      }
+
+      .page-logo {
+        display: block;
+        width: 48px;
+        height: 48px;
+        flex: 0 0 48px;
+        object-fit: contain;
+      }
+
+      .page-heading-copy {
+        min-width: 0;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 30px;
+        font-weight: 650;
+        letter-spacing: -0.025em;
+        text-wrap: balance;
+      }
+
+      p.subtitle {
+        color: var(--text-muted);
+        font-size: 14px;
+        margin: 6px 0 0;
+      }
+
+      .settings-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        align-items: stretch;
+        gap: 18px;
+      }
+
+      fieldset {
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        min-width: 0;
+        padding: 18px 20px 20px;
+        margin: 0;
+        background: var(--canvas);
+        transition: border-color 0.16s ease;
+      }
+
+      fieldset:hover {
+        border-color: var(--text-muted);
+      }
+
+      .settings-card-wide {
+        grid-column: 1 / -1;
+      }
+
+      legend {
+        font-weight: 600;
+        font-size: 14px;
+        padding: 0 8px;
+        color: var(--text);
+      }
+
+      label {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 14px;
+        padding: 8px 0;
+        cursor: pointer;
+      }
+
+      label.choice-row {
+        justify-content: space-between;
+        gap: 20px;
+      }
+
+      input[type="checkbox"],
+      input[type="radio"] {
+        width: 17px;
+        height: 17px;
+        flex: 0 0 auto;
+        margin: 0;
+        accent-color: var(--accent);
+      }
+
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+        background: var(--surface);
+        padding: 2px 6px;
+        border: 1px solid var(--border);
+        border-radius: 5px;
+      }
+
+      .select-control {
+        position: relative;
+        display: block;
+        flex: 0 1 230px;
+        min-width: 150px;
+        max-width: 65%;
+      }
+
+      .select-control-language {
+        flex-basis: 270px;
+      }
+
+      .select-chevron {
+        position: absolute;
+        top: 50%;
+        right: 12px;
+        display: block;
+        width: 18px;
+        height: 18px;
+        color: var(--text-muted);
+        pointer-events: none;
+        transform: translateY(-50%);
+        transition: color 0.16s ease;
+      }
+
+      .select-control:focus-within .select-chevron {
+        color: var(--accent);
+      }
+
+      select {
+        appearance: none;
+        -webkit-appearance: none;
+        display: block;
+        width: 100%;
+        min-width: 0;
+        max-width: none;
+        font: inherit;
+        font-size: 13px;
+        line-height: 1.4;
+        padding: 8px 38px 8px 12px;
+        border-radius: 9px;
+        border: 1px solid var(--border);
+        background: var(--surface);
+        color: var(--text);
+        text-overflow: ellipsis;
+        cursor: pointer;
+        transition: border-color 0.16s ease;
+      }
+
+      select:hover {
+        border-color: var(--text-muted);
+      }
+
+      select:focus-visible {
+        border-color: var(--accent);
+        outline-offset: 1px;
+      }
+
+      button {
+        font-family: inherit;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        border-radius: 9px;
+        padding: 10px 16px;
+        border: 1px solid var(--border);
+        background: var(--surface);
+        color: var(--text);
+        transition:
+          background-color 0.16s ease,
+          border-color 0.16s ease,
+          transform 0.16s ease;
+      }
+
+      button:hover:not(:disabled) {
+        border-color: var(--text-muted);
+      }
+
+      button:active:not(:disabled) {
+        transform: translateY(1px);
+      }
+
+      button:focus-visible,
+      a:focus-visible,
+      select:focus-visible,
+      input:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+      }
+
+      #save {
+        background: var(--accent);
+        color: var(--accent-text);
+        border-color: var(--accent);
+        min-width: 148px;
+        min-height: 44px;
+      }
+
+      #save:hover {
+        background: var(--accent-hover);
+      }
+
+      #status {
+        font-size: 13px;
+        color: var(--success);
+        margin: 0;
+        opacity: 0;
+        transition: opacity 0.2s;
+      }
+
+      #status.visible {
+        opacity: 1;
+      }
+
+      .hint {
+        margin: 4px 0 0;
+        color: var(--text-muted);
+        font-size: 12px;
+        line-height: 1.55;
+      }
+
+      .save-bar {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 14px;
+        margin-top: 22px;
+        padding-top: 18px;
+        border-top: 1px solid var(--border);
+      }
+
+      .downloads-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        gap: 0;
+      }
+
+      .download-option {
+        min-width: 0;
+        padding: 6px 0;
+      }
+
+      .download-option + .download-option {
+        margin-top: 8px;
+        padding-top: 14px;
+        border-top: 1px solid var(--border);
+      }
+
+      .download-option label {
+        align-items: center;
+        padding: 2px 0;
+      }
+
+      .download-option .hint {
+        margin-left: 27px;
+      }
+
+      .repository-link {
+        display: inline-block;
+        margin: 10px 0 0 27px;
+        color: var(--text-muted);
+        font-size: 13px;
+        font-weight: 500;
+      }
+
+      .repository-link:hover {
+        color: var(--text);
+      }
+
+      /*
+       * ---------------------------------------------------
+       * GITHUB SECTION
+       * ---------------------------------------------------
+       */
+
+      .github-status {
+        font-size: 14px;
+        color: var(--text-muted);
+        margin: 0;
+      }
+
+      .github-status.connected {
+        color: var(--success);
+        font-weight: 500;
+      }
+
+      .github-panel {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+      }
+
+      .github-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      #github-connect {
+        background: var(--github);
+        color: var(--github-text);
+      }
+
+      #github-connect:hover:not(:disabled) {
+        background: var(--github-hover);
+      }
+
+      #github-connect:disabled {
+        opacity: 0.6;
+        cursor: default;
+      }
+
+      #github-disconnect {
+        background: var(--canvas);
+        color: var(--danger);
+        border-color: var(--danger);
+      }
+
+      #github-disconnect:hover {
+        background: var(--danger-surface);
+      }
+
+      /*
+       * ---------------------------------------------------
+       * DEVICE CODE OVERLAY
+       * ---------------------------------------------------
+       *
+       * Full-screen takeover for the one moment in this
+       * whole extension that deserves visual weight: the
+       * person is about to alt-tab away to authorize on
+       * github.com, so they need exactly one thing to
+       * remember, displayed as large and unmissable as
+       * possible, with nothing else competing for attention.
+       */
+
+      #github-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        background: var(--overlay);
+        backdrop-filter: blur(2px);
+        align-items: center;
+        justify-content: center;
+        z-index: 100;
+      }
+
+      #github-overlay.open {
+        display: flex;
+      }
+
+      #github-overlay-card {
+        background: var(--canvas);
+        border-radius: 16px;
+        border: 1px solid var(--border);
+        padding: 36px 40px;
+        max-width: 460px;
+        width: calc(100% - 32px);
+        text-align: center;
+        box-shadow: var(--shadow);
+      }
+
+      #github-overlay-eyebrow {
+        font-size: 13px;
+        color: var(--text-muted);
+        margin: 0 0 20px 0;
+      }
+
+      #github-overlay-code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: clamp(28px, 8vw, 40px);
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        color: var(--text);
+        margin: 0 0 24px 0;
+        word-break: break-all;
+      }
+
+      #github-overlay-instruction {
+        font-size: 14px;
+        color: var(--text-muted);
+        margin: 0 0 28px 0;
+        line-height: 1.5;
+      }
+
+      #github-overlay-instruction strong {
+        color: var(--text);
+      }
+
+      #github-overlay-spinner {
+        width: 20px;
+        height: 20px;
+        margin: 0 auto 16px auto;
+        border: 2px solid var(--border);
+        border-top-color: var(--accent);
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      #github-overlay-cancel {
+        background: none;
+        color: var(--text-muted);
+        border: none;
+        font-size: 13px;
+        text-decoration: underline;
+        padding: 4px;
+      }
+
+      #github-overlay-error {
+        display: none;
+        font-size: 13px;
+        color: var(--danger);
+        margin: 0 0 20px 0;
+      }
+
+      @media (max-width: 760px) {
+        .settings-page {
+          padding: 32px 20px 24px;
+        }
+
+        .settings-grid {
+          grid-template-columns: minmax(0, 1fr);
+          gap: 14px;
+        }
+
+        .settings-card-wide {
+          grid-column: auto;
+        }
+      }
+
+      @media (max-width: 520px) {
+        .settings-page {
+          padding: 24px 16px 20px;
+        }
+
+        .page-heading {
+          gap: 12px;
+        }
+
+        .page-logo {
+          width: 42px;
+          height: 42px;
+          flex-basis: 42px;
+        }
+
+        h1 {
+          font-size: 25px;
+        }
+
+        label.choice-row {
+          align-items: flex-start;
+          flex-direction: column;
+          gap: 8px;
+        }
+
+        .select-control,
+        .select-control-language {
+          flex: 0 1 auto;
+          width: 100%;
+          min-width: 0;
+          max-width: 100%;
+        }
+
+        .github-panel {
+          align-items: flex-start;
+          flex-direction: column;
+          gap: 14px;
+        }
+
+        .save-bar {
+          justify-content: space-between;
+        }
+
+        #save {
+          flex: 1;
+        }
+
+        #github-overlay-card {
+          padding: 28px 22px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="settings-page">
+      <header class="page-header">
+        <div class="page-heading">
+          <img class="page-logo" src="icons/icon128.png" alt="" aria-hidden="true" />
+          <div class="page-heading-copy">
+            <h1 data-i18n="options.title">ChatScribe Settings</h1>
+            <p class="subtitle" data-i18n="options.subtitle">
+              These preferences apply to every export.
+            </p>
+          </div>
+        </div>
+      </header>
+
+      <div class="settings-grid">
+        <fieldset>
+          <legend data-i18n="options.appearance.legend">Appearance</legend>
+          <label class="choice-row" for="theme">
+            <span data-i18n="options.appearance.theme">Theme</span>
+            <span class="select-control">
+              <select id="theme">
+                <option value="system" data-i18n="options.appearance.themeSystem">
+                  System
+                </option>
+                <option value="light" data-i18n="options.appearance.themeLight">
+                  Light
+                </option>
+                <option value="dark" data-i18n="options.appearance.themeDark">
+                  Dark
+                </option>
+              </select>
+              <svg
+                class="select-chevron"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+                focusable="false"
+              >
+                <path
+                  d="m7 10 5 5 5-5"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </span>
+          </label>
+          <p class="hint" data-i18n="options.appearance.themeHint">
+            System follows your browser/operating system theme.
+          </p>
+        </fieldset>
+
+        <fieldset>
+          <legend data-i18n="options.language.legend">Language</legend>
+          <label class="choice-row" for="language">
+            <span data-i18n="options.language.label">Language</span>
+            <span class="select-control select-control-language">
+              <select id="language">
+                <option value="auto" data-i18n="options.language.auto">
+                  Auto-detect (browser language)
+                </option>
+                <option value="en">English</option>
+                <option value="es">Español</option>
+                <option value="fr">Français</option>
+                <option value="de">Deutsch</option>
+                <option value="ru">Русский</option>
+                <option value="zh">中文</option>
+              </select>
+              <svg
+                class="select-chevron"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+                focusable="false"
+              >
+                <path
+                  d="m7 10 5 5 5-5"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </span>
+          </label>
+          <p class="hint" data-i18n="options.language.hint">
+            Choose the language for ChatScribe's interface.
+          </p>
+        </fieldset>
+
+        <fieldset id="downloads-settings" class="settings-card-wide">
+          <legend data-i18n="options.downloads.legend">Downloads</legend>
+          <div class="downloads-grid">
+            <div class="download-option">
+              <label for="askWhereToSave">
+                <input type="checkbox" id="askWhereToSave" />
+                <span data-i18n="options.downloads.askWhereToSave"
+                  >Ask where to save each export</span
+                >
+              </label>
+            </div>
+            <div class="download-option">
+              <label for="downloadImagesLocally">
+                <input type="checkbox" id="downloadImagesLocally" />
+                <span data-i18n="options.downloads.bundleImages"
+                  >Bundle downloaded images with exports as a ZIP</span
+                >
+              </label>
+              <p class="hint" data-i18n="options.downloads.bundleImagesHint">
+                When enabled, image exports include an images folder. Otherwise,
+                exports keep ChatGPT-hosted image links.
+              </p>
+              <a
+                class="repository-link"
+                id="downloads-settings-link"
+                href="#"
+                data-i18n="options.downloads.settingsLink"
+              >
+                Open browser download location settings
+              </a>
+            </div>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend data-i18n="options.headings.legend">Message headings</legend>
+          <label>
+            <input type="radio" name="headingStyle" value="h2" />
+            <span data-i18n-html="options.headings.h2"
+              >Markdown heading (<code>## User</code>)</span
+            >
+          </label>
+          <label>
+            <input type="radio" name="headingStyle" value="bold" />
+            <span data-i18n-html="options.headings.bold"
+              >Bold label (<code>**User:**</code>)</span
+            >
+          </label>
+          <label>
+            <input type="radio" name="headingStyle" value="none" />
+            <span data-i18n="options.headings.none">No heading</span>
+          </label>
+        </fieldset>
+
+        <fieldset>
+          <legend data-i18n="options.spacing.legend">
+            Spacing between messages
+          </legend>
+          <label>
+            <input type="radio" name="messageSeparator" value="single" />
+            <span data-i18n="options.spacing.single">Single blank line</span>
+          </label>
+          <label>
+            <input type="radio" name="messageSeparator" value="double" />
+            <span data-i18n="options.spacing.double">Double blank line</span>
+          </label>
+          <label>
+            <input type="radio" name="messageSeparator" value="rule" />
+            <span data-i18n-html="options.spacing.rule"
+              >Horizontal rule (<code>---</code>)</span
+            >
+          </label>
+        </fieldset>
+
+        <fieldset>
+          <legend data-i18n="options.timestamp.legend">Timestamp</legend>
+          <label for="includeTimestamp">
+            <input type="checkbox" id="includeTimestamp" />
+            <span data-i18n="options.timestamp.include"
+              >Include export date/time at the top of the file</span
+            >
+          </label>
+        </fieldset>
+
+        <fieldset>
+          <legend data-i18n="options.github.legend">GitHub</legend>
+          <div class="github-panel">
+            <p
+              id="github-status"
+              class="github-status"
+              aria-live="polite"
+              data-i18n="options.github.statusDisconnected"
+            >
+              Save exports straight to a GitHub repo.
+            </p>
+            <div class="github-actions">
+              <button id="github-connect" data-i18n="options.github.connect">
+                Connect GitHub
+              </button>
+              <button
+                id="github-disconnect"
+                hidden
+                data-i18n="options.github.disconnect"
+              >
+                Disconnect
+              </button>
+            </div>
+          </div>
+        </fieldset>
+      </div>
+
+      <footer class="save-bar">
+        <span id="status" role="status" aria-live="polite" data-i18n="options.saved">
+          Saved
+        </span>
+        <button id="save" data-i18n="options.save">Save Settings</button>
+      </footer>
+    </main>
+
+    <!--
+      Device flow confirmation overlay. Hidden by default;
+      options.ts opens it with the "open" class the moment
+      GITHUB_START_AUTH returns a user_code, and closes it
+      when GITHUB_AUTH_COMPLETE arrives (success or failure).
+    -->
+    <div id="github-overlay">
+      <div id="github-overlay-card">
+        <p
+          id="github-overlay-eyebrow"
+          data-i18n="options.githubOverlay.eyebrow"
+        >
+          Connect GitHub
+        </p>
+        <p id="github-overlay-code">····-····</p>
+        <p
+          id="github-overlay-instruction"
+          data-i18n="options.githubOverlay.instruction"
+        >
+          A GitHub tab just opened. Enter this code there, then approve access
+          for ChatScribe.
+        </p>
+        <div
+          id="github-overlay-spinner"
+          role="status"
+          aria-label="Waiting"
+          data-i18n-aria-label="options.githubOverlay.waiting"
+        ></div>
+        <p id="github-overlay-error"></p>
+        <button
+          id="github-overlay-cancel"
+          data-i18n="options.githubOverlay.cancel"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+
+    <script type="module" src="/options.js"></script>
+  </body>
+</html>

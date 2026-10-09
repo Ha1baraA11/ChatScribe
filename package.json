@@ -1,0 +1,23 @@
+{
+  "name": "chatscribe",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "build:chrome": "npm run build && node -e \"require('fs').copyFileSync('manifest.chrome.json', 'dist/manifest.json')\"",
+    "build:firefox": "tsc && vite build --outDir dist-firefox && node -e \"require('fs').copyFileSync('manifest.firefox.json', 'dist-firefox/manifest.json')\""
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.2.7",
+    "typescript": "~6.0.2",
+    "vite": "^8.2.2",
+    "vitest": "^5.0.0"
+  }
+}

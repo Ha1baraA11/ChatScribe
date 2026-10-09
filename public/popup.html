@@ -1,0 +1,1016 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ChatScribe</title>
+    <style>
+      :root {
+        color-scheme: light;
+
+        --surface: #ffffff;
+        --canvas: #f4f5f8;
+        --border: #dadde5;
+        --text: #242936;
+        --text-muted: #626b7a;
+        --brand: #272b37;
+        --brand-hover: #363c4a;
+        --brand-text: #ffffff;
+        --accent: var(--brand);
+        --accent-hover: var(--brand-hover);
+        --accent-text: var(--brand-text);
+        --success: #1e7c5a;
+        --github: #24292e;
+        --github-hover: #1b1f23;
+        --github-text: #ffffff;
+        --toast-surface: #202530;
+        --toast-text: #ffffff;
+        --radius: 6px;
+        --overlay: rgba(0, 0, 0, 0.4);
+        --loading-overlay: rgba(255, 255, 255, 0.85);
+        --shadow: 0 8px 24px rgba(39, 43, 55, 0.18);
+      }
+
+      :root[data-theme="light"] {
+        color-scheme: light;
+      }
+
+      :root[data-theme="dark"] {
+        color-scheme: dark;
+        --surface: #272b37;
+        --canvas: #313644;
+        --border: #464c5b;
+        --text: #f4f6f9;
+        --text-muted: #bbc2d0;
+        --brand: #272b37;
+        --brand-hover: #363c4a;
+        --brand-text: #ffffff;
+        --accent: #b9c6e2;
+        --accent-hover: #ced8ee;
+        --accent-text: #272b37;
+        --success: #7bd5a7;
+        --github: #21262d;
+        --github-hover: #30363d;
+        --github-text: #f4f6f9;
+        --toast-surface: #171a23;
+        --toast-text: #f4f6f9;
+        --overlay: rgba(0, 0, 0, 0.6);
+        --loading-overlay: rgba(39, 43, 55, 0.92);
+        --shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root:not([data-theme]) {
+          color-scheme: dark;
+          --surface: #272b37;
+          --canvas: #313644;
+          --border: #464c5b;
+          --text: #f4f6f9;
+          --text-muted: #bbc2d0;
+          --brand: #272b37;
+          --brand-hover: #363c4a;
+          --brand-text: #ffffff;
+          --accent: #b9c6e2;
+          --accent-hover: #ced8ee;
+          --accent-text: #272b37;
+          --success: #7bd5a7;
+          --github: #21262d;
+          --github-hover: #30363d;
+          --github-text: #f4f6f9;
+          --toast-surface: #171a23;
+          --toast-text: #f4f6f9;
+          --overlay: rgba(0, 0, 0, 0.6);
+          --loading-overlay: rgba(39, 43, 55, 0.92);
+          --shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+        }
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        background: var(--surface);
+        width: 360px;
+        overflow: hidden;
+      }
+
+      body.overlay-open {
+        height: 600px;
+      }
+
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 13px;
+        color: var(--text);
+        width: 360px;
+        padding: 16px;
+        margin: 0;
+        background: var(--surface);
+        min-height: min-content;
+        position: relative;
+        border-radius: 8px;
+        overflow: hidden;
+      }
+
+      button {
+        display: block;
+        width: 100%;
+        padding: 10px 10px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        background: var(--surface);
+        color: var(--text);
+        cursor: pointer;
+        font-family: inherit;
+        font-size: 13px;
+        font-weight: 500;
+        transition: background 0.12s ease;
+      }
+
+      button:hover:not(:disabled) {
+        background: var(--canvas);
+      }
+
+      button:disabled {
+        cursor: default;
+        opacity: 0.6;
+      }
+
+      button:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 1px;
+      }
+
+      .popup-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 14px;
+      }
+
+      .brand-lockup {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        min-width: 0;
+      }
+
+      .brand-lockup img {
+        display: block;
+        width: 24px;
+        height: 24px;
+        border-radius: 6px;
+      }
+
+      .brand-lockup h1 {
+        margin: 0;
+        color: var(--text);
+        font-size: 15px;
+        font-weight: 650;
+        letter-spacing: -0.01em;
+        line-height: 1.2;
+      }
+
+      .github-profile {
+        display: grid;
+        width: 34px;
+        height: 34px;
+        place-items: center;
+        flex: none;
+        border: 1px solid transparent;
+        border-radius: 50%;
+        color: var(--text-muted);
+        text-decoration: none;
+        transition:
+          color 150ms ease,
+          background-color 150ms ease;
+      }
+
+      .github-profile:hover {
+        color: var(--text);
+        background: var(--canvas);
+      }
+
+      .github-profile:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+      }
+
+      .github-profile svg {
+        display: block;
+        width: 19px;
+        height: 19px;
+      }
+
+      /*
+       * ---------------------------------------------------
+       * MAIN POPUP BODY - just Copy + Export
+       * ---------------------------------------------------
+       */
+
+      .popup-actions {
+        display: grid;
+        gap: 10px;
+      }
+
+      .popup-actions button {
+        padding: 12px 14px;
+        border-radius: 8px;
+        font-size: 14px;
+      }
+
+      .copy-control {
+        display: grid;
+        gap: 6px;
+      }
+
+      .copy-main-row {
+        display: flex;
+        min-width: 0;
+      }
+
+      .copy-main-row #copy {
+        flex: 1;
+        min-width: 0;
+        border-radius: 8px 0 0 8px;
+      }
+
+      #copy-menu-toggle {
+        display: grid;
+        width: 42px;
+        flex: none;
+        padding: 0;
+        place-items: center;
+        border-left: 0;
+        border-radius: 0 8px 8px 0;
+        color: var(--text-muted);
+      }
+
+      #copy-menu-toggle svg {
+        width: 16px;
+        height: 16px;
+        transition: transform 150ms ease;
+      }
+
+      #copy-control.open #copy-menu-toggle svg {
+        transform: rotate(180deg);
+      }
+
+      #copy-options {
+        display: grid;
+        gap: 2px;
+        padding-top: 6px;
+        border-top: 1px solid var(--border);
+      }
+
+      #copy-options[hidden] {
+        display: none;
+      }
+
+      #copy-options button {
+        padding: 8px 10px;
+        border-color: transparent;
+        border-radius: 6px;
+        background: transparent;
+        font-size: 13px;
+        font-weight: 500;
+        text-align: left;
+      }
+
+      #copy-options button:hover:not(:disabled) {
+        background: var(--canvas);
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        #copy-menu-toggle svg {
+          transition: none;
+        }
+      }
+
+      #export {
+        background: var(--accent);
+        color: var(--accent-text);
+        border-color: var(--accent);
+      }
+
+      #export:hover:not(:disabled) {
+        background: var(--accent-hover);
+      }
+
+      .footer-link {
+        display: block;
+        width: fit-content;
+        margin: 12px auto 0;
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--text-muted);
+        text-decoration: none;
+        text-align: center;
+      }
+
+      .footer-link:hover {
+        color: var(--text);
+        text-decoration: underline;
+      }
+
+      /*
+       * ---------------------------------------------------
+       * LOADING OVERLAY
+       * ---------------------------------------------------
+       *
+       * Grays out and covers the entire popup while messages
+       * are being fetched, so the person can't click anything
+       * else mid-load and can see something is happening.
+       */
+
+      #loading-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 2000;
+        align-items: center;
+        justify-content: center;
+        background: var(--loading-overlay);
+        backdrop-filter: blur(1px);
+      }
+
+      #loading-overlay.open {
+        display: flex;
+      }
+
+      #loading-overlay-content {
+        text-align: center;
+      }
+
+      #loading-overlay-spinner {
+        width: 28px;
+        height: 28px;
+        margin: 0 auto 14px auto;
+        border: 3px solid var(--border);
+        border-top-color: var(--accent);
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      #loading-overlay-message {
+        margin: 0;
+        font-size: 13px;
+        font-weight: 500;
+        color: var(--text);
+      }
+
+      /*
+       * ---------------------------------------------------
+       * TOAST
+       * ---------------------------------------------------
+       *
+       * On-screen feedback for quick actions (Copied!,
+       * Download started, errors) - replaces swapping a
+       * button's own text, which is easy to miss and
+       * conflicts with disabling buttons during busy state.
+       */
+
+      #toast {
+        position: fixed;
+        left: 50%;
+        bottom: 14px;
+        transform: translateX(-50%) translateY(8px);
+        max-width: calc(100% - 28px);
+        padding: 9px 14px;
+        border-radius: var(--radius);
+        background: var(--toast-surface);
+        color: var(--toast-text);
+        font-size: 12.5px;
+        font-weight: 500;
+        text-align: center;
+        opacity: 0;
+        pointer-events: none;
+        transition:
+          opacity 0.15s ease,
+          transform 0.15s ease;
+        z-index: 3000;
+        box-shadow: 0 8px 20px rgba(27, 31, 36, 0.3);
+      }
+
+      #toast.visible {
+        opacity: 1;
+        transform: translateX(-50%) translateY(0);
+      }
+
+      /*
+       * ---------------------------------------------------
+       * MESSAGE SELECTOR / EXPORT PANEL
+       * ---------------------------------------------------
+       */
+
+      #selector-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 1000;
+        align-items: center;
+        justify-content: center;
+        padding: 14px;
+        background: var(--overlay);
+      }
+
+      #selector-overlay.open {
+        display: flex;
+      }
+
+      #selector-modal {
+        width: 100%;
+        max-height: 572px;
+        display: flex;
+        flex-direction: column;
+        padding: 14px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        background: var(--surface);
+        box-shadow: 0 8px 24px rgba(27, 31, 36, 0.25);
+        overflow-y: auto;
+      }
+
+      #selector-title {
+        margin: 0 0 4px;
+        font-size: 14px;
+        font-weight: 600;
+      }
+
+      #selector-panel-message {
+        margin: 0 0 10px;
+        font-size: 12px;
+        color: var(--text-muted);
+        line-height: 1.4;
+      }
+
+      .selector-filter-row {
+        display: flex;
+        gap: 4px;
+        margin-bottom: 8px;
+      }
+
+      .selector-filter-row button {
+        flex: 1;
+        padding: 6px 4px;
+        font-size: 11px;
+      }
+
+      .selector-expand-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-bottom: 8px;
+        font-size: 12px;
+        color: var(--text);
+        cursor: pointer;
+      }
+
+      #selector-list {
+        flex: 1;
+        min-height: 140px;
+        max-height: 280px;
+        overflow-y: auto;
+        overflow-x: hidden;
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        background: var(--canvas);
+        margin-bottom: 8px;
+      }
+
+      .selector-row {
+        display: flex;
+        align-items: flex-start;
+        gap: 6px;
+        padding: 7px 8px;
+        font-size: 12px;
+        cursor: pointer;
+        border-bottom: 1px solid var(--border);
+      }
+
+      .selector-row:last-child {
+        border-bottom: none;
+      }
+
+      .selector-row:hover {
+        background: var(--surface);
+      }
+
+      .selector-row input[type="checkbox"] {
+        margin-top: 2px;
+        flex-shrink: 0;
+      }
+
+      .selector-role-icon {
+        flex-shrink: 0;
+      }
+
+      .selector-preview {
+        color: var(--text);
+        line-height: 1.4;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      /*
+       * When expanded, previews wrap their full text and the
+       * list becomes a normal scrollable, readable column
+       * instead of truncated one-liners.
+       */
+      #selector-list.expanded .selector-preview {
+        white-space: pre-wrap;
+        word-break: break-word;
+        overflow: visible;
+        text-overflow: unset;
+      }
+
+      .selector-footer-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+
+      #selector-count {
+        font-size: 11px;
+        color: var(--text-muted);
+        white-space: nowrap;
+      }
+
+      .selector-action-row {
+        display: flex;
+        gap: 8px;
+      }
+
+      #selector-format-select {
+        width: 100%;
+        flex: 1;
+        font-family: inherit;
+        font-size: 13px;
+        padding: 8px;
+        border-radius: 4px;
+        border: 1px solid var(--border);
+        background: var(--surface);
+        color: var(--text);
+      }
+
+      .selector-action-row button {
+        width: auto;
+        white-space: nowrap;
+      }
+
+      #selector-export {
+        flex: 1;
+        background: var(--accent);
+        color: var(--github-text);
+        border-color: var(--accent);
+      }
+
+      #selector-export:hover:not(:disabled) {
+        background: var(--accent-hover);
+      }
+
+      #selector-copy {
+        flex: 1;
+      }
+
+      #selector-github-button {
+        flex: 1;
+        background: var(--github);
+        color: var(--github-text);
+        border-color: var(--github);
+      }
+
+      #selector-github-button:hover:not(:disabled) {
+        background: var(--github-hover);
+      }
+
+      #selector-cancel {
+        margin-top: 8px;
+        font-size: 12px;
+        padding: 7px 10px;
+      }
+
+      /*
+       * ---------------------------------------------------
+       * GITHUB REPO PANEL
+       * ---------------------------------------------------
+       */
+
+      #github-panel {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 1100;
+        align-items: center;
+        justify-content: center;
+        padding: 14px;
+        background: var(--overlay);
+      }
+
+      #github-panel.open {
+        display: flex;
+      }
+
+      #github-panel-modal {
+        width: 100%;
+        padding: 14px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        background: var(--surface);
+        box-shadow: 0 8px 24px rgba(27, 31, 36, 0.25);
+      }
+
+      #github-panel-message {
+        font-size: 12px;
+        color: var(--text-muted);
+        margin: 0 0 10px 0;
+        line-height: 1.4;
+      }
+
+      #github-panel-message a {
+        color: var(--accent);
+        font-weight: 500;
+      }
+
+      #github-repo-select {
+        width: 100%;
+        font-family: inherit;
+        font-size: 13px;
+        padding: 8px;
+        border-radius: 4px;
+        border: 1px solid var(--border);
+        margin-bottom: 8px;
+        box-sizing: border-box;
+        background: var(--surface);
+        color: var(--text);
+      }
+
+      #github-panel-save {
+        background: var(--github);
+        color: var(--github-text);
+        border-color: var(--github);
+        margin-bottom: 6px;
+      }
+
+      #github-panel-save:hover:not(:disabled) {
+        background: var(--github-hover);
+      }
+
+      #github-panel-cancel {
+        font-size: 12px;
+        padding: 7px 10px;
+      }
+
+      /*
+       * ---------------------------------------------------
+       * GITHUB EXPORT CONFIRMATION MODAL
+       * ---------------------------------------------------
+       */
+
+      #github-confirm-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 1200;
+        align-items: center;
+        justify-content: center;
+        padding: 14px;
+        background: var(--overlay);
+      }
+
+      #github-confirm-overlay.open {
+        display: flex;
+      }
+
+      #github-confirm-modal {
+        width: 100%;
+        padding: 14px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        background: var(--surface);
+        box-shadow: var(--shadow);
+      }
+
+      #github-confirm-title {
+        margin: 0 0 8px;
+        font-size: 14px;
+        font-weight: 600;
+      }
+
+      #github-confirm-message {
+        margin: 0 0 8px;
+        color: var(--text);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      #github-confirm-private {
+        margin: 0 0 12px;
+        color: var(--text-muted);
+        font-size: 11px;
+        line-height: 1.4;
+      }
+
+      .github-confirm-actions {
+        display: flex;
+        gap: 8px;
+      }
+
+      .github-confirm-actions button {
+        flex: 1;
+      }
+
+      #github-confirm-export {
+        background: var(--github);
+        color: var(--github-text);
+        border-color: var(--github);
+      }
+
+      #github-confirm-export:hover:not(:disabled) {
+        background: var(--github-hover);
+      }
+    </style>
+  </head>
+  <body>
+    <header class="popup-header">
+      <div class="brand-lockup">
+        <img src="/icons/icon48.png" alt="" />
+        <h1>ChatScribe</h1>
+      </div>
+      <a
+        class="github-profile"
+        href="https://github.com/Ha1baraA11"
+        target="_blank"
+        rel="noopener noreferrer"
+        aria-label="Visit GitHub profile"
+        data-i18n-aria-label="popup.githubProfile"
+      >
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <path
+            d="M12 .297a12 12 0 0 0-3.794 23.383c.6.111.82-.258.82-.577v-2.234c-3.338.726-4.043-1.416-4.043-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.605-2.665-.305-5.466-1.334-5.466-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.536-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.046.138 3.003.404 2.291-1.552 3.297-1.23 3.297-1.23.655 1.652.243 2.873.12 3.176.77.84 1.235 1.91 1.235 3.221 0 4.609-2.804 5.623-5.475 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.216.694.825.576A12.002 12.002 0 0 0 12 .297z"
+          />
+        </svg>
+      </a>
+    </header>
+
+    <div class="popup-actions">
+      <button id="export" data-i18n="popup.export">Export ▾</button>
+      <div class="copy-control" id="copy-control">
+        <div class="copy-main-row">
+          <button id="copy" data-i18n="popup.copy">Copy Conversation</button>
+          <button
+            id="copy-menu-toggle"
+            type="button"
+            aria-controls="copy-options"
+            aria-expanded="false"
+            aria-label="More copy options"
+            data-i18n-aria-label="popup.copyOptions.toggle"
+          >
+            <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="m4 6 4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
+        </div>
+        <div
+          id="copy-options"
+          role="group"
+          aria-label="Copy options"
+          data-i18n-aria-label="popup.copyOptions.group"
+          hidden
+        >
+          <button id="copy-latest" type="button" data-i18n="popup.copyLatest">
+            Copy latest answer
+          </button>
+          <button id="copy-select" type="button" data-i18n="popup.copySelect">
+            Choose messages…
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <a
+      class="footer-link"
+      id="options-link"
+      href="#"
+      data-i18n="popup.settingsLink"
+      >Settings</a
+    >
+
+    <!-- Loading overlay: covers the popup while messages fetch -->
+    <div id="loading-overlay">
+      <div id="loading-overlay-content">
+        <div
+          id="loading-overlay-spinner"
+          role="status"
+          aria-label="Loading"
+          data-i18n-aria-label="popup.loading.aria"
+        ></div>
+        <p id="loading-overlay-message" data-i18n="popup.loading.default">
+          Loading messages...
+        </p>
+      </div>
+    </div>
+
+    <!-- On-screen toast for quick action feedback -->
+    <div id="toast" role="status" aria-live="polite"></div>
+
+    <!-- Message selector / export panel -->
+    <div
+      id="selector-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="selector-title"
+    >
+      <div id="selector-modal">
+        <p id="selector-title" data-i18n="popup.selector.title">
+          Select Messages
+        </p>
+        <p id="selector-panel-message" data-i18n="popup.selector.subtitle">
+          Choose which messages to copy or export.
+        </p>
+
+        <div class="selector-filter-row">
+          <button
+            id="selector-filter-all"
+            type="button"
+            data-i18n="popup.selector.filterAll"
+          >
+            All
+          </button>
+          <button
+            id="selector-filter-questions"
+            type="button"
+            data-i18n="popup.selector.filterQuestions"
+          >
+            Questions
+          </button>
+          <button
+            id="selector-filter-answers"
+            type="button"
+            data-i18n="popup.selector.filterAnswers"
+          >
+            Answers
+          </button>
+          <button
+            id="selector-filter-none"
+            type="button"
+            data-i18n="popup.selector.filterNone"
+          >
+            None
+          </button>
+          <button
+            id="selector-filter-invert"
+            type="button"
+            data-i18n="popup.selector.filterInvert"
+          >
+            Invert
+          </button>
+        </div>
+
+        <label class="selector-expand-row">
+          <input type="checkbox" id="selector-expand-toggle" />
+          <span data-i18n="popup.selector.expand"
+            >Expand messages (show full text)</span
+          >
+        </label>
+
+        <div id="selector-list" role="list"></div>
+
+        <div class="selector-footer-row">
+          <span id="selector-count">0/0 selected</span>
+        </div>
+
+        <div class="selector-action-row">
+          <select id="selector-format-select">
+            <option value="md" data-i18n="popup.selector.formatMd">
+              Markdown (.md)
+            </option>
+            <option value="txt" data-i18n="popup.selector.formatTxt">
+              Plain text (.txt)
+            </option>
+            <option value="json" data-i18n="popup.selector.formatJson">
+              JSON (.json)
+            </option>
+            <option value="csv" data-i18n="popup.selector.formatCsv">
+              CSV (.csv)
+            </option>
+          </select>
+        </div>
+
+        <div class="selector-action-row">
+          <button
+            id="selector-copy"
+            type="button"
+            data-i18n="popup.selector.copy"
+          >
+            Copy
+          </button>
+          <button
+            id="selector-export"
+            type="button"
+            data-i18n="popup.selector.export"
+          >
+            Export
+          </button>
+          <button
+            id="selector-github-button"
+            type="button"
+            data-i18n="popup.selector.github"
+          >
+            GitHub
+          </button>
+        </div>
+
+        <button
+          id="selector-cancel"
+          type="button"
+          data-i18n="popup.selector.cancel"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+
+    <!-- GitHub repo picker panel -->
+    <div
+      id="github-panel"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="github-panel-message"
+    >
+      <div id="github-panel-modal">
+        <p id="github-panel-message" data-i18n="popup.github.chooseRepo">
+          Choose a repo to save into.
+        </p>
+        <select id="github-repo-select"></select>
+        <button id="github-panel-save" data-i18n="popup.github.save">
+          Save to exports/
+        </button>
+        <button
+          id="github-panel-cancel"
+          type="button"
+          data-i18n="popup.github.cancel"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+
+    <!-- GitHub export confirmation modal -->
+    <div
+      id="github-confirm-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="github-confirm-title"
+    >
+      <div id="github-confirm-modal">
+        <p id="github-confirm-title" data-i18n="popup.githubConfirm.title">
+          ⚠ Warning
+        </p>
+        <p id="github-confirm-message" data-i18n="popup.githubConfirm.message">
+          This action will export this chat directly to your GitHub repository.
+        </p>
+        <p id="github-confirm-private" data-i18n="popup.githubConfirm.private">
+          Make sure the conversation does not contain sensitive or private
+          information.
+        </p>
+
+        <p
+          id="github-confirm-message"
+          data-i18n="popup.githubConfirm.confirmQuestion"
+        >
+          Are you sure you want to continue?
+        </p>
+
+        <div class="github-confirm-actions">
+          <button
+            id="github-confirm-cancel"
+            type="button"
+            data-i18n="popup.githubConfirm.cancel"
+          >
+            Cancel
+          </button>
+          <button
+            id="github-confirm-export"
+            type="button"
+            data-i18n="popup.githubConfirm.export"
+          >
+            Export to GitHub
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/popup.js"></script>
+  </body>
+</html>
