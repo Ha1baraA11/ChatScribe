@@ -5,14 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "tsc && vite build && vite build --config vite.content.config.ts",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest",
     "test:run": "vitest run",
     "test:coverage": "vitest run --coverage",
     "build:chrome": "npm run build && node -e \"require('fs').copyFileSync('manifest.chrome.json', 'dist/manifest.json')\"",
-    "build:firefox": "tsc && vite build --outDir dist-firefox && node -e \"require('fs').copyFileSync('manifest.firefox.json', 'dist-firefox/manifest.json')\""
+    "build:firefox": "tsc && vite build --outDir dist-firefox && vite build --config vite.content.config.ts --outDir dist-firefox && node -e \"require('fs').copyFileSync('manifest.firefox.json', 'dist-firefox/manifest.json')\""
   },
   "devDependencies": {
     "@types/chrome": "^0.2.7",

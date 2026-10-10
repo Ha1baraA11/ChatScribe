@@ -18,6 +18,33 @@ export function getMessageParentId(message: ApiMessage): string | null {
   );
 }
 
+/**
+ * Recover whether an API node belongs to a visible/exportable turn when
+ * ChatGPT's current_node chain is incomplete in the returned page.
+ *
+ * This is deliberately only a parent-chain fallback. Callers should use the
+ * fully resolved current branch whenever it is available.
+ */
+export function isMessageLinkedToActiveMessage(
+  messageId: string,
+  messagesById: ReadonlyMap<string, ApiMessage>,
+  activeMessageIds: ReadonlySet<string>,
+): boolean {
+  const visited = new Set<string>();
+  let currentId: string | null = messageId;
+
+  while (currentId && !visited.has(currentId)) {
+    if (activeMessageIds.has(currentId)) return true;
+    visited.add(currentId);
+
+    const message = messagesById.get(currentId);
+    if (!message) return false;
+    currentId = getMessageParentId(message);
+  }
+
+  return false;
+}
+
 function hasExplicitRootParent(message: ApiMessage): boolean {
   return [
     message.parent,

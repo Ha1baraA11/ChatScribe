@@ -38,6 +38,146 @@ function makeHeading(role: "user" | "assistant", style: Settings["headingStyle"]
   }
 }
 
+/**
+ * Nest headings from a message below its question-and-answer heading.
+ * Fenced code examples are left untouched, and the relative heading levels are
+ * preserved while ensuring message headings start at level 3 or deeper.
+ */
+function nestMessageHeadings(content: string): string {
+  const lines = content.split("\n");
+  const headingLevels: number[] = [];
+  let fence: { marker: string; length: number } | null = null;
+
+  for (const line of lines) {
+    const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (fence) {
+      if (
+        fenceMatch &&
+        fenceMatch[1][0] === fence.marker &&
+        fenceMatch[1].length >= fence.length &&
+        fenceMatch[2].trim() === ""
+      ) {
+        fence = null;
+      }
+      continue;
+    }
+
+    if (fenceMatch) {
+      fence = { marker: fenceMatch[1][0], length: fenceMatch[1].length };
+      continue;
+    }
+
+    const headingMatch = line.match(/^( {0,3})(#{1,6})(?:[ \t]+.*)?[ \t]*$/);
+    if (headingMatch) headingLevels.push(headingMatch[2].length);
+  }
+
+  if (headingLevels.length === 0) return content;
+
+  const minimumLevel = Math.min(...headingLevels);
+  const levelOffset = Math.max(0, 3 - minimumLevel);
+  if (levelOffset === 0) return content;
+
+  fence = null;
+  return lines
+    .map((line) => {
+      const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+      if (fence) {
+        if (
+          fenceMatch &&
+          fenceMatch[1][0] === fence.marker &&
+          fenceMatch[1].length >= fence.length &&
+          fenceMatch[2].trim() === ""
+        ) {
+          fence = null;
+        }
+        return line;
+      }
+
+      if (fenceMatch) {
+        fence = { marker: fenceMatch[1][0], length: fenceMatch[1].length };
+        return line;
+      }
+
+      return line.replace(
+        /^( {0,3})(#{1,6})(?=[ \t]|$)/,
+        (_match, indentation: string, hashes: string) =>
+          `${indentation}${"#".repeat(Math.min(6, hashes.length + levelOffset))}`,
+      );
+    })
+    .join("\n");
+}
+
+/**
+ * ChatGPT can wrap a quoted selection and the actual request in labeled
+ * Markdown headings. Keep those labels visible without promoting them into
+ * the exported document outline.
+ */
+function formatQuotedRequestLabels(content: string): string {
+  const hasSelectedText = /^ {0,3}#{1,6}[ \t]+selected text[ \t]*:?[ \t]*$/im.test(
+    content,
+  ) || /^ {0,3}\*\*selected text:\*\*[ \t]*$/im.test(content);
+  const hasRequest = /^ {0,3}#{1,6}[ \t]+my request[ \t]*:?[ \t]*$/im.test(
+    content,
+  ) || /^ {0,3}\*\*my request:\*\*[ \t]*$/im.test(content);
+  if (!hasSelectedText || !hasRequest) return content;
+
+  const normalized = content
+    .replace(
+      /^ {0,3}#{1,6}[ \t]+(selected text|my request|files mentioned by the user)[ \t]*:?[ \t]*$/gim,
+      (_match, label: string) => `**${label}:**`,
+    )
+    .replace(
+      /^ {0,3}#{1,6}[ \t]+(selection\s+\d+)[ \t]*$/gim,
+      (_match, label: string) => `**${label}**`,
+    );
+
+  const lines = normalized.split("\n");
+  const normalizeLabel = (line: string): string =>
+    line.replace(/^ {0,3}#{1,6}[ \t]+/, "")
+      .replace(/\*/g, "")
+      .replace(/:$/, "")
+      .trim()
+      .toLocaleLowerCase();
+  const selectedIndex = lines.findIndex((line) => normalizeLabel(line) === "selected text");
+  const requestIndex = lines.findIndex(
+    (line, index) => index > selectedIndex && normalizeLabel(line) === "my request",
+  );
+  if (selectedIndex < 0 || requestIndex < 0) return normalized;
+
+  let fence: { marker: string; length: number } | null = null;
+  const quotedContext = lines.slice(selectedIndex, requestIndex).map((line) => {
+    const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (fenceMatch) {
+      if (!fence) {
+        fence = { marker: fenceMatch[1][0], length: fenceMatch[1].length };
+      } else if (
+        fenceMatch[1][0] === fence.marker &&
+        fenceMatch[1].length >= fence.length &&
+        fenceMatch[2].trim() === ""
+      ) {
+        fence = null;
+      }
+      return line ? `> ${line}` : ">";
+    }
+
+    if (!fence) {
+      const headingMatch = line.match(/^ {0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$/);
+      if (headingMatch) line = `**${headingMatch[1].trim()}**`;
+    }
+    return line ? `> ${line}` : ">";
+  });
+
+  return [
+    ...lines.slice(0, selectedIndex),
+    ...quotedContext,
+    ...lines.slice(requestIndex),
+  ].join("\n");
+}
+
+function makeExchangeHeading(): string {
+  return "## User\n\n";
+}
+
 // -----------------------------------------------------------------------
 // TIMESTAMP HEADER
 // -----------------------------------------------------------------------
@@ -54,7 +194,9 @@ function makeTimestampHeader(): string {
 export function formatMarkdown(
   messages: ExportMessage[],
   settings: Settings,
+  options: { includeRoleHeadings?: boolean } = {},
 ): string {
+  const includeRoleHeadings = options.includeRoleHeadings ?? true;
   const sep = SEPARATOR_MAP[settings.separatorStyle];
   const parts: string[] = [];
 
@@ -62,16 +204,45 @@ export function formatMarkdown(
     parts.push(makeTimestampHeader());
   }
 
+  let exchangeOpen = false;
+  let assistantHasStarted = false;
+
   for (const msg of messages) {
-    const heading = makeHeading(msg.role, settings.headingStyle);
     let body = msg.content;
+    let heading = includeRoleHeadings
+      ? makeHeading(msg.role, settings.headingStyle)
+      : "";
+
+    if (msg.role === "user") body = formatQuotedRequestLabels(body);
+
+    if (settings.headingStyle === "h2" && includeRoleHeadings) {
+      body = nestMessageHeadings(body);
+
+      if (msg.role === "user") {
+        if (!exchangeOpen || assistantHasStarted) {
+          heading = makeExchangeHeading();
+          exchangeOpen = true;
+          assistantHasStarted = false;
+        } else {
+          heading = "**User:**\n\n";
+        }
+      } else if (exchangeOpen) {
+        heading = "**Assistant:**\n\n";
+        assistantHasStarted = true;
+      } else {
+        heading = "## Assistant\n\n";
+        exchangeOpen = true;
+        assistantHasStarted = true;
+      }
+    }
 
     // Append image links
     if (msg.imagePaths.length > 0) {
       const imageLinks = msg.imagePaths
+        .filter((path) => !body.includes(`](${path})`))
         .map((p, i) => `![Image ${i + 1}](${p})`)
         .join("\n");
-      body = body ? `${body}\n\n${imageLinks}` : imageLinks;
+      if (imageLinks) body = body ? `${body}\n\n${imageLinks}` : imageLinks;
     }
 
     parts.push(`${heading}${body}`);

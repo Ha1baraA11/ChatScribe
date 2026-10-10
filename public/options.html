@@ -643,6 +643,37 @@
           <p class="hint" data-i18n="options.appearance.themeHint">
             System follows your browser/operating system theme.
           </p>
+          <label class="choice-row" for="panelMode">
+            <span data-i18n="options.appearance.panelModeLabel">Open ChatScribe as</span>
+            <span class="select-control">
+              <select id="panelMode">
+                <option value="popup" data-i18n="options.appearance.panelModePopup">
+                  Popup (default)
+                </option>
+                <option value="sidebar" data-i18n="options.appearance.panelModeSidebar">
+                  Persistent sidebar
+                </option>
+              </select>
+              <svg
+                class="select-chevron"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+                focusable="false"
+              >
+                <path
+                  d="m7 10 5 5 5-5"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </span>
+          </label>
+          <p class="hint" data-i18n="options.appearance.panelModeHint">
+            Choose whether ChatScribe opens in a toolbar popup or a persistent sidebar.
+          </p>
         </fieldset>
 
         <fieldset>
@@ -714,6 +745,21 @@
                 Open browser download location settings
               </a>
             </div>
+            <div class="download-option">
+              <label for="includeGeneratedImages">
+                <input type="checkbox" id="includeGeneratedImages" />
+                <span data-i18n="options.downloads.includeGeneratedImages"
+                  >Include images generated in ChatGPT answers</span
+                >
+              </label>
+              <p
+                class="hint"
+                data-i18n="options.downloads.generatedImagesHint"
+              >
+                Applies when image bundling is enabled. Turn off to omit images
+                generated in ChatGPT answers.
+              </p>
+            </div>
           </div>
         </fieldset>
 
@@ -735,6 +781,11 @@
             <input type="radio" name="headingStyle" value="none" />
             <span data-i18n="options.headings.none">No heading</span>
           </label>
+          <p class="hint" data-i18n="options.headings.groupHint">
+            Each exchange starts with a User heading. User and Assistant
+            messages stay together in that exchange, and headings inside
+            message content are nested below it in the document outline.
+          </p>
         </fieldset>
 
         <fieldset>

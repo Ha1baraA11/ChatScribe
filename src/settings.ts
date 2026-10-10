@@ -14,6 +14,10 @@ function isSeparatorStyle(value: unknown): value is Settings["separatorStyle"] {
   return value === "single" || value === "double" || value === "rule";
 }
 
+function isPanelMode(value: unknown): value is Settings["panelMode"] {
+  return value === "popup" || value === "sidebar";
+}
+
 export async function loadSettings(): Promise<Settings> {
   const defaults = await chrome.storage.sync.get(
     DEFAULT_SETTINGS as unknown as Record<string, unknown>,
@@ -41,6 +45,12 @@ export async function loadSettings(): Promise<Settings> {
       : typeof stored.downloadImagesLocally === "boolean"
         ? stored.downloadImagesLocally
         : defaults.downloadImages as boolean,
+    includeGeneratedImages: typeof stored.includeGeneratedImages === "boolean"
+      ? stored.includeGeneratedImages
+      : defaults.includeGeneratedImages as boolean,
+    panelMode: isPanelMode(stored.panelMode)
+      ? stored.panelMode
+      : defaults.panelMode as Settings["panelMode"],
   } as Settings;
 }
 

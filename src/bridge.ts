@@ -160,6 +160,58 @@
       : [byResolver, byConversation, byFileId];
   }
 
+  function imageRetryDelay(response: Response, attempt: number): number {
+    const retryAfter = response.headers.get("retry-after");
+    if (retryAfter) {
+      const seconds = Number(retryAfter);
+      if (Number.isFinite(seconds)) return Math.min(5_000, Math.max(0, seconds * 1_000));
+
+      const date = Date.parse(retryAfter);
+      if (Number.isFinite(date)) return Math.min(5_000, Math.max(0, date - Date.now()));
+    }
+
+    return Math.min(2_000, 300 * 2 ** attempt);
+  }
+
+  async function fetchImageResponse(
+    url: string,
+    init: RequestInit,
+  ): Promise<Response> {
+    const maxAttempts = 3;
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const response = await nativeFetch(url, init);
+        const retryable =
+          response.status === 408 ||
+          response.status === 425 ||
+          response.status === 429 ||
+          response.status >= 500;
+        if (!retryable || attempt === maxAttempts - 1) return response;
+
+        try {
+          await response.body?.cancel();
+        } catch {
+          // A failed body cleanup should not prevent the bounded retry.
+        }
+        await new Promise((resolve) =>
+          window.setTimeout(resolve, imageRetryDelay(response, attempt)),
+        );
+      } catch (error) {
+        lastError = error;
+        if (attempt === maxAttempts - 1) throw error;
+        await new Promise((resolve) =>
+          window.setTimeout(resolve, Math.min(2_000, 300 * 2 ** attempt)),
+        );
+      }
+    }
+
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("Image download failed after retries.");
+  }
+
   async function readImageResponse(
     response: Response,
     resolverDepth = 0,
@@ -223,7 +275,7 @@
 
     const url = new URL(imageUrl);
     const sameOrigin = url.protocol === "https:" && url.origin === window.location.origin;
-    const response = await nativeFetch(imageUrl, {
+    const response = await fetchImageResponse(imageUrl, {
       method: "GET",
       credentials: sameOrigin ? "include" : "omit",
       headers: sameOrigin && capturedHeaders
@@ -382,7 +434,7 @@
             if (!safeRoute) continue;
 
             try {
-              const response = await nativeFetch(safeRoute, {
+              const response = await fetchImageResponse(safeRoute, {
                 method: "GET",
                 credentials: "include",
                 headers: new Headers(capturedHeaders),

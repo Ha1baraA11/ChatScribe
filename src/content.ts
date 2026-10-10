@@ -28,8 +28,10 @@ import type {
 import {
   findBranchInsertionIndex,
   getMessageParentId,
+  isMessageLinkedToActiveMessage,
   walkActiveBranchNodes,
 } from "./conversation-branch.ts";
+import { renderSvgDataUrlToPngBase64 } from "./svg-template.ts";
 
 // -----------------------------------------------------------------------
 // DEV LOGGING
@@ -52,6 +54,8 @@ const BRIDGE_TIMEOUT_MS = 20_000;
 const API_PAGE_TIMEOUT_MS = 30_000;
 const IMAGE_TIMEOUT_MS = 60_000;
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024; // 20 MB
+const CONVERSATION_CACHE_TTL_MS = 2 * 60_000;
+const MAX_CONCURRENT_IMAGE_DOWNLOADS = 4;
 
 // -----------------------------------------------------------------------
 // BRIDGE STATE
@@ -141,6 +145,11 @@ interface ImageResource {
   imageUrl?: string;
   fileId?: string;
   scheme?: "file-service" | "sediment";
+  inlineSvgDataUrl?: string;
+  inlineImageDataUrl?: string;
+  filename?: string;
+  renderedFromDom?: boolean;
+  downloadLink?: boolean;
 }
 
 function requestConversationPage(
@@ -331,13 +340,18 @@ function getTimestamp(msg: ApiMessage): number {
 function isExportable(
   msg: ApiMessage,
   downloadImages: boolean,
+  includeGeneratedImages: boolean,
 ): boolean {
   const role = msg.author?.role;
   if (role !== "user" && role !== "assistant") return false;
   if (msg.metadata?.is_visually_hidden_from_conversation) return false;
 
   const hasText = Boolean(extractText(msg));
-  const hasImage = downloadImages && getImageResources(msg).length > 0;
+  const mayIncludeImages = downloadImages &&
+    (role !== "assistant" || includeGeneratedImages);
+  // Branch filtering runs repeatedly. Use API metadata here; rendered-image
+  // fallbacks are collected once after the active branch has been resolved.
+  const hasImage = mayIncludeImages && getImageResources(msg, false).length > 0;
 
   if (!hasText && !hasImage) return false;
 
@@ -364,6 +378,7 @@ function isExportable(
 function buildChronologicalMessages(
   exportable: ApiMessage[],
   downloadImages: boolean,
+  includeGeneratedImages: boolean,
 ): ApiMessage[] {
   const users = exportable
     .filter((m) => m.author?.role === "user")
@@ -414,7 +429,7 @@ function buildChronologicalMessages(
     if (
       chosen?.id &&
       !used.has(chosen.id) &&
-      isExportable(chosen, downloadImages)
+      isExportable(chosen, downloadImages, includeGeneratedImages)
     ) {
       used.add(chosen.id);
       result.push(chosen);
@@ -447,7 +462,14 @@ function extractText(msg: ApiMessage): string {
  * Generated images can also exist only in the rendered page, so the DOM is a
  * narrowly scoped fallback for images attached to this message's ID.
  */
-function getImageResources(msg: ApiMessage): ImageResource[] {
+function getImageResources(
+  msg: ApiMessage,
+  includeRenderedImageParts = true,
+): ImageResource[] {
+  const variants = imageResourceCache.get(msg) ?? new Map<boolean, ImageResource[]>();
+  const cached = variants.get(includeRenderedImageParts);
+  if (cached) return cached;
+
   const resources = new Map<string, ImageResource>();
   const visited = new WeakSet<object>();
   let visitedValues = 0;
@@ -460,6 +482,15 @@ function getImageResources(msg: ApiMessage): ImageResource[] {
         return;
       }
 
+      const inlineImageDataUrl = getSafeRenderedImageDataUrl(value);
+      if (inlineImageDataUrl) {
+        mergeResource({
+          key: `inline-image:${inlineImageDataUrl}`,
+          inlineImageDataUrl,
+        });
+        return;
+      }
+
       const imageUrl = getSafeHostedImageUrl(value);
       if (imageUrl) mergeResource({ key: `url:${imageUrl}`, imageUrl });
       return;
@@ -467,20 +498,52 @@ function getImageResources(msg: ApiMessage): ImageResource[] {
 
     if (!isRecord(value)) return;
 
-    const reference = getImageReference(value.asset_pointer);
+    const inlineSvgDataUrl = getSafeRenderedSvgDataUrl(value.rendered_svg_data_url);
+    const inlineSvgKey = value.rendered_svg_key;
+    if (inlineSvgDataUrl && typeof inlineSvgKey === "string") {
+      mergeResource({
+        key: inlineSvgKey,
+        inlineSvgDataUrl,
+        renderedFromDom: value.rendered_from_dom === true,
+      });
+    }
+
+    const filename = getImageFilename(
+      value.image_filename ?? value.file_name ?? value.filename ?? value.name,
+    );
+    const reference = getImageReference(value.asset_pointer) ??
+      getImageFileIdReference(value, filename);
     const imageUrl = getImageUrlFromPart(value);
-    if (reference || imageUrl) {
+    const rasterDataUrl = getSafeRenderedImageDataUrl(value.inline_image_data_url);
+    if (reference || imageUrl || rasterDataUrl) {
       const key = reference
         ? `${reference.scheme}:${reference.fileId}`
-        : `url:${imageUrl}`;
-      mergeResource({ key, ...reference, imageUrl: imageUrl ?? undefined });
+        : imageUrl
+          ? `url:${imageUrl}`
+          : `inline-image:${rasterDataUrl}`;
+      mergeResource({
+        key,
+        ...reference,
+        imageUrl: imageUrl ?? undefined,
+        inlineImageDataUrl: rasterDataUrl ?? undefined,
+        filename: filename ?? undefined,
+        renderedFromDom: value.rendered_from_dom === true,
+        downloadLink: value.rendered_download_link === true,
+      });
     }
   };
 
   const mergeResource = (resource: ImageResource): void => {
     const existing = resources.get(resource.key);
     resources.set(resource.key, existing
-      ? { ...existing, ...resource, imageUrl: resource.imageUrl ?? existing.imageUrl }
+      ? {
+          ...existing,
+          ...resource,
+          imageUrl: resource.imageUrl ?? existing.imageUrl,
+          filename: resource.filename ?? existing.filename,
+          renderedFromDom: resource.renderedFromDom || existing.renderedFromDom,
+          downloadLink: resource.downloadLink || existing.downloadLink,
+        }
       : resource);
   };
 
@@ -503,15 +566,49 @@ function getImageResources(msg: ApiMessage): ImageResource[] {
     Object.values(value).forEach((item) => visit(item, depth + 1));
   };
 
-  visit(msg.content?.parts, 0);
-  visit(msg.metadata, 0);
+  const cachedApiResources = variants.get(false);
+  if (cachedApiResources) {
+    cachedApiResources.forEach(mergeResource);
+  } else {
+    visit(msg.content?.parts, 0);
+    visit(msg.metadata, 0);
+    variants.set(false, [...resources.values()]);
+  }
 
-  if (msg.id) {
+  if (includeRenderedImageParts && msg.id) {
     visit(getRenderedImagePartsForMessage(msg.id), 0);
   }
 
-  return [...resources.values()];
+  const result = deduplicateNamedImageResources([...resources.values()]);
+  variants.set(includeRenderedImageParts, result);
+  imageResourceCache.set(msg, variants);
+  return result;
 }
+
+function deduplicateNamedImageResources(resources: ImageResource[]): ImageResource[] {
+  const apiFilenames = new Set(resources.flatMap((resource) =>
+    !resource.renderedFromDom && resource.filename
+      ? [resource.filename.toLocaleLowerCase()]
+      : [],
+  ));
+  const downloadLinkFilenames = new Set(resources.flatMap((resource) =>
+    resource.renderedFromDom && resource.downloadLink && resource.filename
+      ? [resource.filename.toLocaleLowerCase()]
+      : [],
+  ));
+
+  return resources.filter((resource) => {
+    if (!resource.renderedFromDom || !resource.filename) return true;
+    const filename = resource.filename.toLocaleLowerCase();
+    if (apiFilenames.has(filename)) return false;
+    return resource.downloadLink || !downloadLinkFilenames.has(filename);
+  });
+}
+
+// Image metadata is walked several times while resolving the active branch.
+// Cache per API object for the duration of one load to avoid repeating deep
+// metadata traversal and full-page DOM image lookups.
+let imageResourceCache = new WeakMap<ApiMessage, Map<boolean, ImageResource[]>>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -533,6 +630,100 @@ function getImageReference(value: unknown): Pick<
     fileId,
     scheme: match[1].toLowerCase() as ImageResource["scheme"],
   };
+}
+
+function getImageFileIdReference(
+  value: Record<string, unknown>,
+  filename: string | null,
+): Pick<ImageResource, "fileId" | "scheme"> | null {
+  const mimeType = value.mime_type ?? value.mimeType ?? value.content_type;
+  const isImage =
+    (typeof mimeType === "string" && mimeType.toLowerCase().startsWith("image/")) ||
+    Boolean(filename);
+  if (!isImage) return null;
+
+  const fileId = value.file_id ?? value.fileId ?? value.asset_id;
+  if (typeof fileId !== "string" || !/^file[-_][A-Za-z0-9_-]{1,255}$/i.test(fileId)) {
+    return null;
+  }
+
+  const explicitScheme = value.scheme ?? value.storage_scheme;
+  const scheme = explicitScheme === "sediment" ? "sediment" : "file-service";
+  return { fileId, scheme };
+}
+
+function getImageFilename(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const candidate = value.trim().split(/[\\/]/).at(-1) ?? "";
+  const decoded = (() => {
+    try {
+      return decodeURIComponent(candidate);
+    } catch {
+      return candidate;
+    }
+  })();
+  return /\.(?:png|jpe?g|gif|webp|avif|bmp)$/i.test(decoded)
+    ? decoded
+    : null;
+}
+
+function getSandboxImageFilenames(content: string): string[] {
+  const filenames = new Set<string>();
+  for (const match of content.matchAll(/sandbox:\/mnt\/data\/([^\s)>\]]+)/gi)) {
+    const filename = getImageFilename(match[1].split(/[?#]/, 1)[0]);
+    if (filename) filenames.add(filename);
+  }
+  return [...filenames];
+}
+
+function imageResourceToPart(
+  resource: ImageResource,
+  filename?: string,
+): Record<string, string | number> {
+  const part: Record<string, string | number> = {};
+  if (resource.fileId) {
+    part.asset_pointer = `${resource.scheme ?? "file-service"}://${resource.fileId}`;
+  }
+  if (resource.imageUrl) part.image_url = resource.imageUrl;
+  if (resource.inlineSvgDataUrl) {
+    part.rendered_svg_data_url = resource.inlineSvgDataUrl;
+    part.rendered_svg_key = resource.key;
+  }
+  if (resource.inlineImageDataUrl) {
+    part.inline_image_data_url = resource.inlineImageDataUrl;
+  }
+  const resolvedFilename = filename ?? resource.filename;
+  if (resolvedFilename) part.image_filename = resolvedFilename;
+  if (resource.renderedFromDom) part.rendered_from_dom = 1;
+  if (resource.downloadLink) part.rendered_download_link = 1;
+  return part;
+}
+
+function getSafeRenderedImageDataUrl(value: unknown): string | null {
+  if (typeof value !== "string" || value.length > 28_000_000) return null;
+  const match = value.match(
+    /^data:(image\/(?:png|jpeg|gif|webp|avif|bmp));base64,([A-Za-z0-9+/=\r\n]+)$/i,
+  );
+  return match ? value : null;
+}
+
+function decodeRenderedImageDataUrl(value: string): {
+  base64: string;
+  mimeType: string;
+  sizeBytes: number;
+} {
+  const match = value.match(
+    /^data:(image\/(?:png|jpeg|gif|webp|avif|bmp));base64,([A-Za-z0-9+/=\r\n]+)$/i,
+  );
+  if (!match) throw new Error("Rendered image data is invalid.");
+
+  const base64 = match[2].replace(/\s+/g, "");
+  const sizeBytes = estimateBase64Size(base64);
+  if (!sizeBytes || sizeBytes > MAX_IMAGE_BYTES) {
+    throw new Error("Rendered image exceeds the 20 MB export limit.");
+  }
+
+  return { base64, mimeType: match[1].toLowerCase(), sizeBytes };
 }
 
 function getSafeHostedImageUrl(value: unknown): string | null {
@@ -572,8 +763,21 @@ function getSafeHostedImageUrl(value: unknown): string | null {
   return null;
 }
 
+function getSafeRenderedSvgDataUrl(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0 || value.length > 900_000) {
+    return null;
+  }
+
+  const comma = value.indexOf(",");
+  if (comma < 0) return null;
+  const header = value.slice(0, comma);
+  return /^data:image\/svg\+xml(?:;charset=[\w-]+)?(?:;base64)?$/i.test(header)
+    ? value
+    : null;
+}
+
 function getImageUrlFromPart(part: Record<string, unknown>): string | null {
-  const imageUrl = part.image_url;
+  const imageUrl = part.image_url ?? part.download_url ?? part.downloadUrl;
   if (typeof imageUrl === "string") {
     return getSafeHostedImageUrl(imageUrl);
   }
@@ -586,13 +790,14 @@ function getImageUrlFromPart(part: Record<string, unknown>): string | null {
 
 function getRenderedImagePartsForMessage(
   messageId: string,
-): Array<{ image_url: string }> {
-  const parts: Array<{ image_url: string }> = [];
+): Array<Record<string, string | number>> {
+  const parts: Array<Record<string, string | number>> = [];
 
   for (const element of document.querySelectorAll<HTMLElement>(
-    "[data-message-id], [data-chatgpt-search-message-ids]",
+    "[data-dil-message-id], [data-message-id], [data-chatgpt-search-message-ids]",
   )) {
     const ids = [
+      element.dataset.dilMessageId,
       element.dataset.messageId,
       element.dataset.chatgptSearchMessageIds,
     ]
@@ -601,59 +806,408 @@ function getRenderedImagePartsForMessage(
 
     if (!ids.includes(messageId)) continue;
 
+    let svgIndex = 0;
     for (const image of element.querySelectorAll<HTMLImageElement>("img")) {
-      const imageUrl = getSafeHostedImageUrl(image.currentSrc || image.src);
-      if (imageUrl) parts.push({ image_url: imageUrl });
+      const src = image.currentSrc || image.src;
+      const filename = getRenderedImageFilename(image, element);
+      if (image.dataset.dComponent === "svg" && getSafeRenderedSvgDataUrl(src)) {
+        parts.push({
+          rendered_svg_data_url: src,
+          rendered_svg_key: `rendered-svg:${messageId}:${svgIndex++}`,
+          rendered_from_dom: 1,
+          ...(filename ? { image_filename: filename } : {}),
+        });
+        continue;
+      }
+
+      const inlineImageDataUrl = getSafeRenderedImageDataUrl(src);
+      if (inlineImageDataUrl) {
+        parts.push({
+          inline_image_data_url: inlineImageDataUrl,
+          rendered_from_dom: 1,
+          ...(filename ? { image_filename: filename } : {}),
+        });
+        continue;
+      }
+
+      const imageUrl = getSafeHostedImageUrl(src);
+      if (imageUrl) {
+        parts.push({
+          image_url: imageUrl,
+          rendered_from_dom: 1,
+          ...(filename ? { image_filename: filename } : {}),
+        });
+      }
+    }
+
+    // Some file cards expose their authenticated download URL on a link even
+    // when the thumbnail is rendered as a background instead of an <img>.
+    for (const link of element.querySelectorAll<HTMLAnchorElement>("a[href]")) {
+      const imageUrl = getSafeHostedImageUrl(link.href);
+      const filename = getRenderedImageFilename(link, element);
+      if (!imageUrl || (!filename && !/image|download/i.test(link.textContent ?? ""))) {
+        continue;
+      }
+      parts.push({
+        image_url: imageUrl,
+        rendered_from_dom: 1,
+        rendered_download_link: 1,
+        ...(filename ? { image_filename: filename } : {}),
+      });
     }
   }
 
   return parts;
 }
 
+function getRenderedImageFilename(element: Element, messageElement: Element): string | null {
+  const pattern = /[\p{L}\p{N}][\p{L}\p{N} ._()\-]*\.(?:png|jpe?g|gif|webp|avif|bmp)\b/iu;
+  let current: Element | null = element;
+  let depth = 0;
+
+  while (current && current !== messageElement && depth < 5) {
+    const candidates = [
+      current.getAttribute("aria-label"),
+      current.getAttribute("title"),
+      current.getAttribute("download"),
+      current.getAttribute("href"),
+      current.childElementCount <= 4 ? current.textContent : null,
+    ];
+    for (const candidate of candidates) {
+      const match = candidate?.match(pattern)?.[0];
+      const filename = getImageFilename(match);
+      if (filename) return filename;
+    }
+    current = current.parentElement;
+    depth++;
+  }
+
+  return null;
+}
+
+/**
+ * Rewrite ChatGPT's temporary sandbox links to the image files bundled in the
+ * export. Those links are only valid inside ChatGPT's sandbox and otherwise
+ * become dead links in the downloaded Markdown.
+ */
+function replaceSandboxImageLinks(
+  content: string,
+  pathsByFilename: ReadonlyMap<string, string>,
+  renderedImagePaths: readonly string[],
+  preserveUnresolved = false,
+): string {
+  const pattern = /(!?\[[^\]]*\]\(\s*)(<sandbox:\/mnt\/data\/[^>]+>|sandbox:\/mnt\/data\/[^)\s]+)([^)]*\))/gi;
+  const resolvedPaths = new Map(pathsByFilename);
+  const references: Array<{
+    full: string;
+    prefix: string;
+    destination: string;
+    suffix: string;
+    filename: string;
+    key: string;
+    isImage: boolean;
+    path?: string;
+  }> = [];
+
+  for (const match of content.matchAll(pattern)) {
+    const destination = match[2].replace(/^<|>$/g, "").split(/[?#]/, 1)[0];
+    const filename = getImageFilename(destination);
+    if (!filename || !match[0]) continue;
+    references.push({
+      full: match[0],
+      prefix: match[1],
+      destination: match[2],
+      suffix: match[3],
+      filename,
+      key: filename.toLocaleLowerCase(),
+      isImage: match[1].startsWith("!"),
+      path: resolvedPaths.get(filename.toLocaleLowerCase()),
+    });
+  }
+
+  const unmatchedNames = [...new Set(
+    references.filter((reference) => !reference.path).map((reference) => reference.key),
+  )];
+  const matchedPaths = new Set(references.flatMap((reference) =>
+    reference.path ? [reference.path] : [],
+  ));
+  const fallbackPaths = [...new Set(renderedImagePaths)].filter((path) =>
+    !matchedPaths.has(path),
+  );
+  if (unmatchedNames.length > 0 && unmatchedNames.length === fallbackPaths.length) {
+    unmatchedNames.forEach((filename, index) => {
+      references.forEach((reference) => {
+        if (reference.key === filename && !reference.path) {
+          reference.path = fallbackPaths[index];
+          resolvedPaths.set(filename, fallbackPaths[index]);
+        }
+      });
+    });
+  }
+
+  const embeddedPaths = new Set(
+    references.flatMap((reference) =>
+      reference.path && reference.isImage ? [reference.path] : [],
+    ),
+  );
+  const seenEmbeddedPaths = new Set<string>();
+  const seenLinkPaths = new Set<string>();
+  let referenceIndex = 0;
+
+  let rewritten = content.replace(pattern, (full, prefix: string, destination: string, suffix: string) => {
+    const filename = getImageFilename(
+      destination.replace(/^<|>$/g, "").split(/[?#]/, 1)[0],
+    );
+    if (!filename) return full;
+    const reference = references[referenceIndex++];
+    if (!reference) return full;
+
+    if (!reference.path) {
+      return preserveUnresolved
+        ? full
+        : `[Image not bundled: ${reference.filename}]`;
+    }
+    if (!reference.isImage && embeddedPaths.has(reference.path)) return "";
+
+    if (reference.isImage) {
+      if (seenEmbeddedPaths.has(reference.path)) return "";
+      seenEmbeddedPaths.add(reference.path);
+    } else {
+      if (seenLinkPaths.has(reference.path)) return "";
+      seenLinkPaths.add(reference.path);
+    }
+
+    return `${prefix}${reference.path}${suffix}`;
+  });
+
+  // Also handle sandbox image paths written as bare URLs rather than Markdown
+  // links. Non-image sandbox files are deliberately left untouched.
+  rewritten = rewritten.replace(
+    /sandbox:\/mnt\/data\/([^\s)\]>]*?\.(?:png|jpe?g|gif|webp|avif|bmp)(?:[?#][^\s)\]>]*)?)/gi,
+    (full, rawFilename: string) => {
+      const filename = getImageFilename(rawFilename.split(/[?#]/, 1)[0]);
+      if (!filename) return full;
+      return resolvedPaths.get(filename.toLocaleLowerCase()) ??
+        (preserveUnresolved ? full : `[Image not bundled: ${filename}]`);
+    },
+  );
+
+  return rewritten.replace(/\n{3,}/g, "\n\n");
+}
+
 function getUnattachedRenderedGeneratedImages(
   existingMessages: ApiMessage[],
-  conversationMessageIds: ReadonlySet<string>,
+  branchNodes: ApiMessage[] | null,
+  allMessagesById: ReadonlyMap<string, ApiMessage>,
 ): ApiMessage[] {
-  const knownIds = new Set(conversationMessageIds);
+  const activeMessageIds = new Set(
+    existingMessages.flatMap((message) => message.id ? [message.id] : []),
+  );
+  const resolvedBranchIds = branchNodes
+    ? new Set(branchNodes.flatMap((message) => message.id ? [message.id] : []))
+    : null;
   const existingImageKeys = new Set(
     existingMessages.flatMap((message) =>
       getImageResources(message).map((resource) => resource.key),
     ),
   );
-  const generatedByParent = new Map<string, Array<{ image_url: string }>>();
+  const generatedBySource = new Map<string, ApiMessage>();
   const recoveredKeys = new Set(existingImageKeys);
 
   for (const element of document.querySelectorAll<HTMLElement>(
-    "[data-chatgpt-search-message-ids]",
+    "[data-dil-message-id], [data-message-id], [data-chatgpt-search-message-ids]",
   )) {
-    const ids = element.dataset.chatgptSearchMessageIds
-      ?.split(/[\s,]+/)
-      .filter(Boolean);
-    const parentId = ids?.find((id) => knownIds.has(id));
-    if (!parentId) continue;
+    const ids = [
+      element.dataset.dilMessageId,
+      element.dataset.messageId,
+      element.dataset.chatgptSearchMessageIds,
+    ]
+      .filter((id): id is string => Boolean(id))
+      .flatMap((id) => id.split(/[\s,]+/));
+    if (ids.length === 0) continue;
 
-    for (const image of element.querySelectorAll<HTMLImageElement>("img")) {
-      if (!/generated image/i.test(image.alt)) continue;
-      const imageUrl = getSafeHostedImageUrl(image.currentSrc || image.src);
-      if (!imageUrl) continue;
+    const candidateIds = [...new Set(ids)].filter((id) => {
+      if (!allMessagesById.has(id)) return false;
+      if (resolvedBranchIds) return resolvedBranchIds.has(id);
+      return isMessageLinkedToActiveMessage(
+        id,
+        allMessagesById,
+        activeMessageIds,
+      );
+    });
+    if (candidateIds.length === 0) continue;
 
-      const key = `url:${imageUrl}`;
-      if (recoveredKeys.has(key)) continue;
-      recoveredKeys.add(key);
-      const parts = generatedByParent.get(parentId) ?? [];
-      parts.push({ image_url: imageUrl });
-      generatedByParent.set(parentId, parts);
+    // Sandbox links live in the assistant's text, while the corresponding
+    // image can be attached to a related tool message. Walk the candidate
+    // messages and their parents so the filename can be matched to that image.
+    const relatedIds = new Set(candidateIds);
+    for (const candidateId of candidateIds) {
+      let message = allMessagesById.get(candidateId);
+      const visitedParents = new Set<string>();
+      for (let depth = 0; message && depth < 4; depth++) {
+        const parentId = getMessageParentId(message);
+        if (!parentId || visitedParents.has(parentId)) break;
+        visitedParents.add(parentId);
+        const parent = allMessagesById.get(parentId);
+        if (!parent) break;
+        relatedIds.add(parentId);
+        message = parent;
+      }
+    }
+    const sandboxFilenames = [...new Set(
+      [...relatedIds].flatMap((id) => {
+        const message = allMessagesById.get(id);
+        if (!message || !["assistant", "tool"].includes(message.author?.role ?? "")) {
+          return [];
+        }
+        return getSandboxImageFilenames(extractText(message));
+      }),
+    )];
+    const generatedImages = Array.from(
+      element.querySelectorAll<HTMLImageElement>("img"),
+    ).filter((image) => /generated image/i.test(image.alt));
+    if (generatedImages.length === 0 && sandboxFilenames.length === 0) continue;
+    // ChatGPT's generated-image cards sometimes render with an empty alt, so
+    // use the message's own image nodes when its text provides a sandbox name.
+    const renderedImageCandidates = generatedImages.length > 0
+      ? generatedImages
+      : sandboxFilenames.length > 0
+        ? Array.from(element.querySelectorAll<HTMLImageElement>("img"))
+        : [];
+
+    // Generated images can be represented by an assistant or tool message.
+    // Prefer that API node so its authenticated file pointer is used instead
+    // of a short-lived page blob URL.
+    const apiImageId = [...relatedIds].find((id) => {
+      const message = allMessagesById.get(id);
+      return Boolean(
+        message &&
+          ["assistant", "tool"].includes(message.author?.role ?? "") &&
+          getImageResources({ ...message, id: undefined }, false).length > 0,
+      );
+    });
+    const sandboxMessageId = [...relatedIds].find((id) => {
+      const message = allMessagesById.get(id);
+      return message?.author?.role === "assistant" &&
+        getSandboxImageFilenames(extractText(message)).length > 0;
+    });
+    const sourceId = apiImageId ?? sandboxMessageId ?? candidateIds[0];
+    if (!sourceId || generatedBySource.has(sourceId)) continue;
+
+    const sourceMessage = allMessagesById.get(sourceId);
+    const apiImageResources = sourceMessage
+      ? getImageResources({ ...sourceMessage, id: undefined }, false)
+      : [];
+
+    if (sourceMessage && apiImageResources.length > 0) {
+      const canMapSandboxNames =
+        sandboxFilenames.length === apiImageResources.length;
+      // Even if the image bytes were already found on another message, keep
+      // this synthetic association so the sandbox URL in this response gets
+      // a local filename-to-path mapping of its own.
+      const needsSandboxNameMapping = canMapSandboxNames;
+      if (
+        apiImageResources.every((resource) => recoveredKeys.has(resource.key)) &&
+        !needsSandboxNameMapping
+      ) {
+        continue;
+      }
+      apiImageResources.forEach((resource) => recoveredKeys.add(resource.key));
+      generatedBySource.set(sourceId, {
+        ...sourceMessage,
+        id: `rendered-generated-image:${sourceId}`,
+        parent: sourceId,
+        author: { role: "assistant" },
+        create_time: sourceMessage.create_time ?? Date.now() / 1000,
+        end_turn: true,
+        content: {
+          content_type: "multimodal",
+          parts: apiImageResources.map((resource, index) =>
+            imageResourceToPart(
+              resource,
+              canMapSandboxNames ? sandboxFilenames[index] : undefined,
+            ),
+          ),
+        },
+      });
+      continue;
+    }
+
+    let renderedParts = sourceMessage
+      ? getRenderedImagePartsForMessage(sourceId)
+      : [];
+    if (renderedParts.length === 0) {
+      let svgIndex = 0;
+      const fallbackParts: Array<Record<string, string | number>> = [];
+      for (const image of renderedImageCandidates) {
+        const src = image.currentSrc || image.src;
+        const filename = getRenderedImageFilename(image, element);
+        if (image.dataset.dComponent === "svg" && getSafeRenderedSvgDataUrl(src)) {
+          fallbackParts.push({
+            rendered_svg_data_url: src,
+            rendered_svg_key: `rendered-svg:${sourceId}:${svgIndex++}`,
+            rendered_from_dom: 1,
+            ...(filename ? { image_filename: filename } : {}),
+          });
+          continue;
+        }
+        const inlineImageDataUrl = getSafeRenderedImageDataUrl(src);
+        if (inlineImageDataUrl) {
+          fallbackParts.push({
+            inline_image_data_url: inlineImageDataUrl,
+            rendered_from_dom: 1,
+            ...(filename ? { image_filename: filename } : {}),
+          });
+          continue;
+        }
+        const imageUrl = getSafeHostedImageUrl(src);
+        if (imageUrl) {
+          fallbackParts.push({
+            image_url: imageUrl,
+            rendered_from_dom: 1,
+            ...(filename ? { image_filename: filename } : {}),
+          });
+        }
+      }
+      renderedParts = fallbackParts;
+    }
+
+    const renderedResources = renderedParts.length > 0
+      ? getImageResources({
+          content: { content_type: "multimodal", parts: renderedParts },
+        }, false)
+      : [];
+    if (renderedResources.length > 0) {
+      const canMapSandboxNames =
+        sandboxFilenames.length === renderedResources.length;
+      const needsSandboxNameMapping = canMapSandboxNames;
+      if (
+        renderedResources.every((resource) => recoveredKeys.has(resource.key)) &&
+        !needsSandboxNameMapping
+      ) {
+        continue;
+      }
+      renderedResources.forEach((resource) => recoveredKeys.add(resource.key));
+      generatedBySource.set(sourceId, {
+        id: `rendered-generated-image:${sourceId}`,
+        parent: sourceId,
+        author: { role: "assistant" },
+        create_time: sourceMessage?.create_time ?? Date.now() / 1000,
+        end_turn: true,
+        content: {
+          content_type: "multimodal",
+          parts: renderedResources.map((resource, index) =>
+            imageResourceToPart(
+              resource,
+              canMapSandboxNames ? sandboxFilenames[index] : undefined,
+            ),
+          ),
+        },
+      });
     }
   }
 
-  return [...generatedByParent.entries()].map(([parentId, parts]) => ({
-    id: `rendered-generated-image:${parentId}`,
-    parent: parentId,
-    author: { role: "assistant" },
-    create_time: Date.now(),
-    end_turn: true,
-    content: { content_type: "multimodal", parts },
-  }));
+  return [...generatedBySource.values()];
 }
 
 // -----------------------------------------------------------------------
@@ -674,27 +1228,106 @@ function mimeToExtension(mime: string): string | null {
   return MIME_TO_EXT[base] ?? null;
 }
 
+async function fingerprintImage(base64: string): Promise<string> {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
+function estimateBase64Size(base64: string): number {
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((base64.length * 3) / 4) - padding);
+}
+
 // -----------------------------------------------------------------------
 // MAIN: LOAD ENTIRE CONVERSATION
 // -----------------------------------------------------------------------
 
-let loadInFlight: Promise<ConversationData> | null = null;
+let loadInFlight: {
+  key: string;
+  promise: Promise<ConversationData>;
+} | null = null;
+let cachedLoad: {
+  key: string;
+  data: ConversationData;
+  completedAt: number;
+} | null = null;
+let cachedRawConversation: {
+  key: string;
+  messages: Map<string, ApiMessage>;
+  currentNode: string | null;
+  completedAt: number;
+} | null = null;
+let lastLoadProgress = 0;
+
+function publishLoadProgress(progress: {
+  stage?: "messages" | "images";
+  completed?: number;
+  total?: number;
+} = {}): void {
+  void chrome.runtime.sendMessage({
+    type: "EXPORT_PROGRESS",
+    collected: lastLoadProgress,
+    ...progress,
+  }).catch(() => {
+    /* Progress is optional when the panel is closed. */
+  });
+}
 
 /**
  * Load the full conversation, paginating through all pages.
  * Deduplicates concurrent calls with a single-flight guard.
  */
-async function loadConversation(downloadImages: boolean): Promise<ConversationData> {
-  if (loadInFlight) return loadInFlight;
-  loadInFlight = doLoadConversation(downloadImages).finally(() => {
-    loadInFlight = null;
-  });
-  return loadInFlight;
+async function loadConversation(
+  downloadImages: boolean,
+  includeGeneratedImages: boolean,
+  fetchImages: boolean,
+  selectedMessageIds?: string[],
+): Promise<ConversationData> {
+  const selectedKey = selectedMessageIds
+    ? [...selectedMessageIds].sort().join(",")
+    : "all";
+  const key = `${location.pathname}:${downloadImages}:${includeGeneratedImages}:${fetchImages}:${selectedKey}`;
+  if (loadInFlight?.key === key) return loadInFlight.promise;
+  if (
+    cachedLoad?.key === key &&
+    Date.now() - cachedLoad.completedAt < CONVERSATION_CACHE_TTL_MS
+  ) {
+    return Promise.resolve(cachedLoad.data);
+  }
+
+  lastLoadProgress = 0;
+  const promise = doLoadConversation(
+    downloadImages,
+    includeGeneratedImages,
+    fetchImages,
+    selectedMessageIds ? new Set(selectedMessageIds) : null,
+  )
+    .then((data) => {
+      cachedLoad = { key, data, completedAt: Date.now() };
+      return data;
+    })
+    .finally(() => {
+      if (loadInFlight?.promise === promise) loadInFlight = null;
+    });
+  loadInFlight = { key, promise };
+  return promise;
 }
 
 async function doLoadConversation(
   downloadImages: boolean,
+  includeGeneratedImages: boolean,
+  fetchImages: boolean,
+  selectedMessageIds: ReadonlySet<string> | null,
 ): Promise<ConversationData> {
+  imageResourceCache = new WeakMap();
   await waitForBridge();
 
   const rawConvId = extractConversationId();
@@ -707,83 +1340,108 @@ async function doLoadConversation(
 
   devLog("Loading conversation", conversationId);
 
-  // ---- Paginate through all pages ----
-  const allById = new Map<string, ApiMessage>();
+  // ---- Paginate through all pages (reuse raw API data for export-time image downloads) ----
+  const rawCacheKey = location.pathname;
+  let allById: Map<string, ApiMessage>;
+  let currentNode: string | null;
 
-  async function fetchAndCollect(cursor: string | null): Promise<{
-    page: ApiConversationPage;
-    collected: number;
-  }> {
-    const page = await requestConversationPage(conversationId, cursor);
-    let collected = 0;
+  if (
+    cachedRawConversation?.key === rawCacheKey &&
+    Date.now() - cachedRawConversation.completedAt < CONVERSATION_CACHE_TTL_MS
+  ) {
+    allById = new Map(cachedRawConversation.messages);
+    currentNode = cachedRawConversation.currentNode;
+    lastLoadProgress = allById.size;
+    publishLoadProgress();
+    devLog(`Reusing ${allById.size} cached raw conversation messages`);
+  } else {
+    allById = new Map<string, ApiMessage>();
 
-    for (const msg of page.messages ?? []) {
-      const id = msg.id;
-      if (!id) continue;
+    async function fetchAndCollect(cursor: string | null): Promise<{
+      page: ApiConversationPage;
+      collected: number;
+    }> {
+      const page = await requestConversationPage(conversationId, cursor);
+      let collected = 0;
 
-      const existing = allById.get(id);
-      if (!existing) {
-        allById.set(id, msg);
-      } else {
-        // Merge: prefer non-null fields from the newer record
-        allById.set(id, {
-          ...existing,
-          ...msg,
-          metadata: { ...existing.metadata, ...msg.metadata },
-          children: msg.children ?? existing.children,
-        });
+      for (const msg of page.messages ?? []) {
+        const id = msg.id;
+        if (!id) continue;
+
+        const existing = allById.get(id);
+        if (!existing) {
+          allById.set(id, msg);
+        } else {
+          // Merge: prefer non-null fields from the newer record
+          allById.set(id, {
+            ...existing,
+            ...msg,
+            metadata: { ...existing.metadata, ...msg.metadata },
+            children: msg.children ?? existing.children,
+          });
+        }
+
+        if (isExportable(
+          allById.get(id)!,
+          downloadImages,
+          includeGeneratedImages,
+        )) {
+          collected++;
+        }
       }
 
-      if (isExportable(allById.get(id)!, downloadImages)) {
-        collected++;
+      return { page, collected };
+    }
+
+    let { page, collected } = await fetchAndCollect(null);
+    lastLoadProgress = collected;
+    publishLoadProgress();
+
+    currentNode = page.current_node ?? null;
+    const seenCursors = new Set<string>();
+    let pageNum = 1;
+
+    devLog(`Page ${pageNum}: ${collected} exportable messages`);
+
+    while (page.page_info?.has_previous_page === true) {
+      const cursor = page.page_info.start_cursor;
+
+      if (!cursor) {
+        throw new Error(
+          "ChatGPT reported more pages but provided no cursor.",
+        );
       }
+
+      if (seenCursors.has(cursor)) {
+        throw new Error("Received a duplicate pagination cursor. Stopping.");
+      }
+
+      seenCursors.add(cursor);
+      pageNum++;
+
+      const result = await fetchAndCollect(cursor);
+      page = result.page;
+      collected = result.collected;
+      lastLoadProgress = collected;
+
+      devLog(`Page ${pageNum}: ${collected} exportable messages so far`);
+
+      publishLoadProgress();
     }
 
-    return { page, collected };
-  }
-
-  let { page, collected } = await fetchAndCollect(null);
-
-  const currentNode = page.current_node ?? null;
-  const seenCursors = new Set<string>();
-  let pageNum = 1;
-
-  devLog(`Page ${pageNum}: ${collected} exportable messages`);
-
-  while (page.page_info?.has_previous_page === true) {
-    const cursor = page.page_info.start_cursor;
-
-    if (!cursor) {
-      throw new Error(
-        "ChatGPT reported more pages but provided no cursor.",
-      );
-    }
-
-    if (seenCursors.has(cursor)) {
-      throw new Error("Received a duplicate pagination cursor. Stopping.");
-    }
-
-    seenCursors.add(cursor);
-    pageNum++;
-
-    const result = await fetchAndCollect(cursor);
-    page = result.page;
-    collected = result.collected;
-
-    devLog(`Page ${pageNum}: ${collected} exportable messages so far`);
-
-    try {
-      chrome.runtime.sendMessage({ type: "EXPORT_PROGRESS", collected });
-    } catch {
-      /* progress notifications never break export */
-    }
+    cachedRawConversation = {
+      key: rawCacheKey,
+      messages: new Map(allById),
+      currentNode,
+      completedAt: Date.now(),
+    };
   }
 
   devLog(`Pagination complete. Raw messages: ${allById.size}`);
 
   // ---- Resolve the active branch ----
   const exportableAll = Array.from(allById.values()).filter((m) =>
-    isExportable(m, downloadImages),
+    isExportable(m, downloadImages, includeGeneratedImages),
   );
 
   let orderedMessages: ApiMessage[];
@@ -792,7 +1450,7 @@ async function doLoadConversation(
   if (currentNode) {
     activeBranchNodes = walkActiveBranchNodes(allById, currentNode);
     const branch = activeBranchNodes?.filter((message) =>
-      isExportable(message, downloadImages),
+      isExportable(message, downloadImages, includeGeneratedImages),
     );
     if (branch && branch.length > 0) {
       orderedMessages = branch;
@@ -801,22 +1459,26 @@ async function doLoadConversation(
       );
     } else {
       devWarn("Branch walk failed; falling back to chronological pairing");
-      orderedMessages = buildChronologicalMessages(exportableAll, downloadImages);
+      orderedMessages = buildChronologicalMessages(
+        exportableAll,
+        downloadImages,
+        includeGeneratedImages,
+      );
     }
   } else {
     devWarn("No current_node; using chronological pairing");
-    orderedMessages = buildChronologicalMessages(exportableAll, downloadImages);
+    orderedMessages = buildChronologicalMessages(
+      exportableAll,
+      downloadImages,
+      includeGeneratedImages,
+    );
   }
 
-  if (downloadImages) {
-    const activeIds = new Set(
-      (activeBranchNodes ?? orderedMessages).flatMap((message) =>
-        message.id ? [message.id] : [],
-      ),
-    );
+  if (downloadImages && includeGeneratedImages) {
     const generatedMessages = getUnattachedRenderedGeneratedImages(
       orderedMessages,
-      activeIds,
+      activeBranchNodes,
+      allById,
     );
 
     for (const generated of generatedMessages) {
@@ -844,15 +1506,36 @@ async function doLoadConversation(
 
   // ---- Download images ----
   const imageCache = new Map<string, Promise<ExportImageFile>>();
+  const imageFilesByFingerprint = new Map<string, ExportImageFile>();
+  const imageResourcesToDownload = new Map<string, ImageResource>();
+  if (fetchImages) {
+    for (const msg of orderedMessages) {
+      if (!msg.id) continue;
+      if (!isSelectedForImageDownload(msg.id, selectedMessageIds)) continue;
+      const role = msg.author?.role;
+      if (role !== "user" && !(role === "assistant" && includeGeneratedImages)) {
+        continue;
+      }
+      for (const resource of getImageResources(msg)) {
+        imageResourcesToDownload.set(resource.key, resource);
+      }
+    }
+  }
+  const totalImageDownloads = imageResourcesToDownload.size;
+  let completedImageDownloads = 0;
+  if (totalImageDownloads > 0) {
+    publishLoadProgress({ stage: "images", completed: 0, total: totalImageDownloads });
+  }
+
   let nextImageIdx = 1;
   let totalImageBytes = 0;
 
-  // Simple concurrency limiter (max 2 parallel downloads)
+  // Bound parallel image fetches to keep the panel responsive and memory use sane.
   let activeDownloads = 0;
   const downloadQueue: Array<() => void> = [];
 
   async function limitedDownload<T>(fn: () => Promise<T>): Promise<T> {
-    if (activeDownloads >= 2) {
+    if (activeDownloads >= MAX_CONCURRENT_IMAGE_DOWNLOADS) {
       await new Promise<void>((r) => downloadQueue.push(r));
     }
     activeDownloads++;
@@ -862,6 +1545,18 @@ async function doLoadConversation(
       activeDownloads--;
       downloadQueue.shift()?.();
     }
+  }
+
+  function isSelectedForImageDownload(
+    messageId: string,
+    selectedIds: ReadonlySet<string> | null,
+  ): boolean {
+    if (!selectedIds) return true;
+    if (selectedIds.has(messageId)) return true;
+    const generatedSourceId = messageId.startsWith("rendered-generated-image:")
+      ? messageId.slice("rendered-generated-image:".length)
+      : null;
+    return generatedSourceId !== null && selectedIds.has(generatedSourceId);
   }
 
   // ---- Convert to ExportMessage ----
@@ -874,75 +1569,290 @@ async function doLoadConversation(
 
       const text = extractText(msg);
       const imagePaths: string[] = [];
+      const renderedDiagramPaths: string[] = [];
+      const localImagePathsByFilename = new Map<string, string>();
+      const renderedAttachmentPaths: string[] = [];
       let failedImageCount = 0;
+      const failedImageDetails: string[] = [];
 
-      if (downloadImages) {
+      const mayIncludeImages = downloadImages &&
+        (role !== "assistant" || includeGeneratedImages);
+      const hasImageResource = mayIncludeImages && getImageResources(msg).length > 0;
+      const mayDownloadImages = fetchImages && mayIncludeImages &&
+        isSelectedForImageDownload(msg.id, selectedMessageIds);
+      if (mayDownloadImages) {
         const imageResources = getImageResources(msg);
 
-        for (const resource of imageResources) {
+        const downloadedResults = await Promise.all(imageResources.map(async (resource) => {
           if (!imageCache.has(resource.key)) {
-            const imgIdx = nextImageIdx++;
             imageCache.set(
               resource.key,
               limitedDownload(async () => {
-                const downloaded = await requestImage(resource, conversationId);
+                try {
+                  const inlineSvgBase64 = resource.inlineSvgDataUrl
+                    ? await renderSvgDataUrlToPngBase64(resource.inlineSvgDataUrl)
+                    : null;
+                  if (resource.inlineSvgDataUrl && !inlineSvgBase64) {
+                    throw new Error("Could not render ChatGPT's SVG diagram.");
+                  }
+                  const downloaded = resource.inlineImageDataUrl
+                    ? decodeRenderedImageDataUrl(resource.inlineImageDataUrl)
+                    : inlineSvgBase64
+                    ? {
+                        base64: inlineSvgBase64,
+                        mimeType: "image/png",
+                        sizeBytes: estimateBase64Size(inlineSvgBase64),
+                      }
+                    : await requestImage(resource, conversationId);
+                  const fingerprint = await fingerprintImage(downloaded.base64);
+                  const existingImage = imageFilesByFingerprint.get(fingerprint);
+                  if (existingImage) return existingImage;
 
-                if (totalImageBytes + downloaded.sizeBytes > MAX_IMAGE_BYTES) {
-                  throw new Error(
-                    "Images exceed the 20 MB export limit.",
-                  );
+                  if (totalImageBytes + downloaded.sizeBytes > MAX_IMAGE_BYTES) {
+                    throw new Error(
+                      "Images exceed the 20 MB export limit.",
+                    );
+                  }
+                  totalImageBytes += downloaded.sizeBytes;
+
+                  const ext = mimeToExtension(downloaded.mimeType) ?? "png";
+                  const imgIdx = nextImageIdx++;
+                  const path = `images/image-${String(imgIdx).padStart(3, "0")}.${ext}`;
+
+                  const imageFile = {
+                    path,
+                    mimeType: downloaded.mimeType,
+                    base64: downloaded.base64,
+                    sizeBytes: downloaded.sizeBytes,
+                  };
+                  imageFilesByFingerprint.set(fingerprint, imageFile);
+                  return imageFile;
+                } finally {
+                  completedImageDownloads++;
+                  publishLoadProgress({
+                    stage: "images",
+                    completed: completedImageDownloads,
+                    total: totalImageDownloads,
+                  });
                 }
-                totalImageBytes += downloaded.sizeBytes;
-
-                const ext = mimeToExtension(downloaded.mimeType) ?? "png";
-                const path = `images/image-${String(imgIdx).padStart(3, "0")}.${ext}`;
-
-                return {
-                  path,
-                  mimeType: downloaded.mimeType,
-                  base64: downloaded.base64,
-                  sizeBytes: downloaded.sizeBytes,
-                };
               }),
             );
           }
 
           try {
             const imgFile = await imageCache.get(resource.key)!;
-            imagePaths.push(imgFile.path);
+            return {
+              path: imgFile.path,
+              renderedSvg: Boolean(resource.inlineSvgDataUrl),
+              filename: resource.filename,
+              renderedFromDom: Boolean(resource.renderedFromDom),
+            };
           } catch (err) {
             failedImageCount++;
+            const filename = resource.filename?.replace(/[\r\n\]]/g, " ").trim();
+            const reason = (err instanceof Error ? err.message : String(err))
+              .replace(/https?:\/\/\S+/g, "[image URL]")
+              .replace(/[\r\n\]]/g, " ")
+              .replace(/\s+/g, " ")
+              .trim()
+              .slice(0, 140);
+            failedImageDetails.push(
+              [filename, reason].filter(Boolean).join(": ") || "unknown download error",
+            );
             devWarn("Image download failed:", resource.key, err);
+            return null;
+          }
+        }));
+        const successfulDownloads = downloadedResults.flatMap((result) =>
+          result ? [result] : [],
+        );
+        imagePaths.push(...new Set(successfulDownloads.map((result) => result.path)));
+        renderedDiagramPaths.push(...new Set(successfulDownloads
+          .filter((result) => result.renderedSvg)
+          .map((result) => result.path)));
+        for (const result of successfulDownloads) {
+          if (result.filename) {
+            localImagePathsByFilename.set(
+              result.filename.toLocaleLowerCase(),
+              result.path,
+            );
+          }
+          if (result.renderedFromDom && !result.renderedSvg) {
+            renderedAttachmentPaths.push(result.path);
           }
         }
       }
 
-      if (!text && imagePaths.length === 0 && failedImageCount === 0) return null;
+      if (
+        !text &&
+        imagePaths.length === 0 &&
+        failedImageCount === 0 &&
+        !hasImageResource
+      ) return null;
 
-      const content = failedImageCount > 0
-        ? `${text}${text ? "\n\n" : ""}[${failedImageCount} image${failedImageCount === 1 ? "" : "s"} could not be downloaded]`
-        : text;
+      const imageMarkdownText = replaceSandboxImageLinks(
+        text,
+        localImagePathsByFilename,
+        renderedAttachmentPaths,
+        true,
+      );
+      const failureNotice = failedImageCount > 0
+        ? `[${failedImageCount} image${failedImageCount === 1 ? "" : "s"} could not be downloaded: ${failedImageDetails.join("; ")}]`
+        : "";
+      const content = `${text}${text && failureNotice ? "\n\n" : ""}${failureNotice}`;
+      const imageMarkdownContent = `${imageMarkdownText}${imageMarkdownText && failureNotice ? "\n\n" : ""}${failureNotice}`;
 
       return {
         id: msg.id,
         role,
         content,
+        ...(imageMarkdownContent !== content ? { imageMarkdownContent } : {}),
+        ...(renderedAttachmentPaths.length > 0
+          ? { renderedImageFallbackPaths: [...new Set(renderedAttachmentPaths)] }
+          : {}),
+        ...(localImagePathsByFilename.size > 0
+          ? { imagePathsByFilename: Object.fromEntries(localImagePathsByFilename) }
+          : {}),
         index: idx,
         imagePaths,
+        ...(renderedDiagramPaths.length > 0 ? { renderedDiagramPaths } : {}),
         timestamp: msg.create_time ?? undefined,
       };
     }),
   );
 
-  const messages = converted
+  let messages = converted
     .filter((m): m is ExportMessage => m !== null)
     .map((m, i) => ({ ...m, index: i }));
 
+  // A rendered generated-image card may be recovered as a synthetic message
+  // because ChatGPT's API omits its bytes. Attach it to the corresponding
+  // visible assistant response so its sandbox link and image file become one
+  // Markdown image instead of two separate Assistant entries.
+  const generatedImageMessages = messages.filter((message) =>
+    message.id.startsWith("rendered-generated-image:"),
+  );
+  const generatedImagesByTarget = new Map<string, ExportMessage[]>();
+  const syntheticIdsToMerge = new Set<string>();
+
+  for (const generated of generatedImageMessages) {
+    const sourceId = generated.id.slice("rendered-generated-image:".length);
+    let sourceNode = allById.get(sourceId);
+    let target = messages.find((message) =>
+      message.id === sourceId && message.role === "assistant",
+    );
+    const visitedParents = new Set<string>();
+
+    while (!target && sourceNode) {
+      const parentId = getMessageParentId(sourceNode);
+      if (!parentId || visitedParents.has(parentId)) break;
+      visitedParents.add(parentId);
+      target = messages.find((message) =>
+        message.id === parentId && message.role === "assistant",
+      );
+      sourceNode = allById.get(parentId);
+    }
+
+    if (!target) {
+      const syntheticIndex = messages.indexOf(generated);
+      target = messages.slice(syntheticIndex + 1).find((message) =>
+        message.role === "assistant" &&
+        !message.id.startsWith("rendered-generated-image:"),
+      ) ?? messages.slice(0, syntheticIndex).reverse().find((message) =>
+        message.role === "assistant" &&
+        !message.id.startsWith("rendered-generated-image:"),
+      );
+    }
+
+    if (!target) continue;
+    syntheticIdsToMerge.add(generated.id);
+    const group = generatedImagesByTarget.get(target.id) ?? [];
+    group.push(generated);
+    generatedImagesByTarget.set(target.id, group);
+  }
+
+  for (const [targetId, generatedImages] of generatedImagesByTarget) {
+    const target = messages.find((message) => message.id === targetId);
+    if (!target) continue;
+
+    const generatedPaths = generatedImages.flatMap((message) => message.imagePaths);
+    target.imagePaths = [...new Set([...target.imagePaths, ...generatedPaths])];
+    const renderedImageFallbackPaths = [...new Set([
+      ...(target.renderedImageFallbackPaths ?? []),
+      ...generatedPaths,
+    ])];
+    if (renderedImageFallbackPaths.length > 0) {
+      target.renderedImageFallbackPaths = renderedImageFallbackPaths;
+    }
+    const imagePathsByFilename = new Map(
+      Object.entries(target.imagePathsByFilename ?? {}),
+    );
+    for (const generatedImage of generatedImages) {
+      Object.entries(generatedImage.imagePathsByFilename ?? {}).forEach(([filename, path]) => {
+        imagePathsByFilename.set(filename, path);
+      });
+    }
+    if (imagePathsByFilename.size > 0) {
+      target.imagePathsByFilename = Object.fromEntries(imagePathsByFilename);
+    }
+    const generatedDiagramPaths = generatedImages.flatMap((message) =>
+      message.renderedDiagramPaths ?? [],
+    );
+    if (generatedDiagramPaths.length > 0) {
+      target.renderedDiagramPaths = [...new Set([
+        ...(target.renderedDiagramPaths ?? []),
+        ...generatedDiagramPaths,
+      ])];
+    }
+
+    const sourceContent = target.imageMarkdownContent ?? target.content;
+    const imageMarkdownContent = replaceSandboxImageLinks(
+      sourceContent,
+      new Map(imagePathsByFilename),
+      renderedImageFallbackPaths,
+      true,
+    );
+    if (imageMarkdownContent !== target.content) {
+      target.imageMarkdownContent = imageMarkdownContent;
+    }
+  }
+
+  if (syntheticIdsToMerge.size > 0) {
+    messages = messages.filter((message) => !syntheticIdsToMerge.has(message.id));
+    messages.forEach((message, index) => {
+      message.index = index;
+    });
+  }
+
+  // Resolve any remaining sandbox references after all recovered image paths
+  // have been associated with their visible assistant messages.
+  if (fetchImages) {
+    for (const message of messages) {
+      const sourceContent = message.imageMarkdownContent ?? message.content;
+      const imageMarkdownContent = replaceSandboxImageLinks(
+        sourceContent,
+        new Map(Object.entries(message.imagePathsByFilename ?? {})),
+        message.renderedImageFallbackPaths ?? [],
+      );
+      if (imageMarkdownContent !== message.content) {
+        message.imageMarkdownContent = imageMarkdownContent;
+      } else {
+        delete message.imageMarkdownContent;
+      }
+      delete message.renderedImageFallbackPaths;
+      delete message.imagePathsByFilename;
+    }
+  }
+
   // Collect settled image files
   const settled = await Promise.allSettled(imageCache.values());
-  const images: ExportImageFile[] = settled.flatMap((r) =>
-    r.status === "fulfilled" ? [r.value] : [],
-  );
+  const imagesByPath = new Map<string, ExportImageFile>();
+  for (const result of settled) {
+    if (result.status === "fulfilled") {
+      imagesByPath.set(result.value.path, result.value);
+    }
+  }
+  const images = [...imagesByPath.values()];
 
   devLog(`Export ready: ${messages.length} messages, ${images.length} images`);
 
@@ -1156,7 +2066,15 @@ function showExportSuccess(message: string): void {
 
 chrome.runtime.onMessage.addListener(
   (
-    message: { type: string; downloadImages?: boolean; text?: string; message?: string },
+    message: {
+      type: string;
+      downloadImages?: boolean;
+      includeGeneratedImages?: boolean;
+      fetchImages?: boolean;
+      selectedMessageIds?: string[];
+      text?: string;
+      message?: string;
+    },
     _sender,
     sendResponse,
   ) => {
@@ -1181,7 +2099,13 @@ chrome.runtime.onMessage.addListener(
     }
 
     if (message.type === "LOAD_CONVERSATION") {
-      void loadConversation(message.downloadImages === true)
+      if (loadInFlight) publishLoadProgress();
+      void loadConversation(
+        message.downloadImages === true,
+        message.includeGeneratedImages === true,
+        message.fetchImages ?? message.downloadImages === true,
+        message.selectedMessageIds,
+      )
         .then((data) => sendResponse({ success: true, data }))
         .catch((err: unknown) =>
           sendResponse({
@@ -1190,6 +2114,11 @@ chrome.runtime.onMessage.addListener(
           }),
         );
       return true; // Keep channel open for async response
+    }
+
+    if (message.type === "CHATSCRIBE_PING") {
+      sendResponse({ ready: true });
+      return false;
     }
 
     if (message.type === "SHOW_EXPORT_SUCCESS") {

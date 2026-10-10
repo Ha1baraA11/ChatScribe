@@ -37,7 +37,100 @@ const devError = (...args: unknown[]): void => {
 const chromeCapabilities = chrome as unknown as {
   offscreen?: { createDocument?: unknown };
   runtime: { getContexts?: unknown };
+  sidePanel?: {
+    open?: (options: { windowId: number }) => Promise<void>;
+    setPanelBehavior?: (behavior: {
+      openPanelOnActionClick: boolean;
+    }) => Promise<void>;
+  };
+  sidebarAction?: { open?: () => Promise<void> };
+  action?: {
+    onClicked?: {
+      addListener: (listener: (tab: chrome.tabs.Tab) => void) => void;
+    };
+    setPopup?: (details: { popup: string }) => Promise<void> | void;
+  };
+  scripting?: {
+    executeScript: (details: {
+      target: { tabId: number };
+      files: string[];
+    }) => Promise<unknown[]>;
+  };
 };
+
+type PanelMode = "popup" | "sidebar";
+
+function isPanelMode(value: unknown): value is PanelMode {
+  return value === "popup" || value === "sidebar";
+}
+
+// Keep the popup as the default. The selected sidebar mode removes the action
+// popup so the toolbar click can open the browser's persistent panel instead.
+async function applyPanelMode(mode: PanelMode): Promise<void> {
+  const setPopup = chromeCapabilities.action?.setPopup;
+  if (setPopup) {
+    await Promise.resolve(setPopup({
+      popup: mode === "sidebar" ? "" : "popup.html",
+    }));
+  }
+
+  // Older Chrome versions can open the configured side panel natively, but do
+  // not expose sidePanel.open().
+  if (!chromeCapabilities.sidePanel?.open && chromeCapabilities.sidePanel?.setPanelBehavior) {
+    await chromeCapabilities.sidePanel.setPanelBehavior({
+      openPanelOnActionClick: mode === "sidebar",
+    });
+  }
+}
+
+function readAndApplyPanelMode(): void {
+  void chrome.storage.sync.get("panelMode")
+    .then(({ panelMode }) => applyPanelMode(isPanelMode(panelMode) ? panelMode : "popup"))
+    .catch((error: unknown) => devError("Could not load the panel setting:", error));
+}
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== "sync" || !changes.panelMode) return;
+  void applyPanelMode(
+    isPanelMode(changes.panelMode.newValue) ? changes.panelMode.newValue : "popup",
+  ).catch((error: unknown) => devError("Could not apply the panel setting:", error));
+});
+
+readAndApplyPanelMode();
+chrome.runtime.onStartup.addListener(readAndApplyPanelMode);
+chrome.runtime.onInstalled.addListener(readAndApplyPanelMode);
+
+// Keep the export UI open while users switch tabs. Chrome and Firefox expose
+// different persistent panel APIs, so each browser uses its native surface.
+function rememberPanelTarget(tabId: number | undefined): void {
+  if (tabId === undefined) return;
+  void chrome.storage.local.set({ chatscribePanelTargetTabId: tabId })
+    .then(() => chrome.runtime.sendMessage({
+      type: "PANEL_TARGET_TAB_REQUESTED",
+      tabId,
+    }).catch(() => {
+      /* The panel may not have opened yet; it reads the saved tab on startup. */
+    }))
+    .catch((error: unknown) => devError("Could not save the panel tab:", error));
+}
+
+if (chromeCapabilities.action?.onClicked) {
+  chromeCapabilities.action.onClicked.addListener((tab) => {
+    // The browser only dispatches this event when no action popup is configured.
+    // That makes the browser's current click surface authoritative even after
+    // the MV3 service worker has been suspended and restarted.
+    if (chromeCapabilities.sidePanel?.open) {
+      if (tab.windowId === undefined) return;
+      void chromeCapabilities.sidePanel.open({ windowId: tab.windowId })
+        .catch((error: unknown) => devError("Could not open the side panel:", error));
+    } else if (chromeCapabilities.sidebarAction?.open) {
+      void Promise.resolve(chromeCapabilities.sidebarAction.open())
+        .catch((error: unknown) => devError("Could not open the sidebar:", error));
+    }
+
+    rememberPanelTarget(tab.id);
+  });
+}
 
 // -----------------------------------------------------------------------
 // SENDER VALIDATION
@@ -133,6 +226,63 @@ function isValidContent(v: unknown): v is string {
 // -----------------------------------------------------------------------
 // MESSAGE HANDLERS
 // -----------------------------------------------------------------------
+
+// --- ENSURE CONTENT SCRIPT ---
+// A page may have been open before ChatScribe was installed or updated. Inject
+// only after a ping confirms that its isolated-world listener is absent.
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type !== "ENSURE_CONTENT_SCRIPT") return false;
+  if (!isOwnExtension(sender)) return false;
+
+  const tabId = message.tabId;
+  if (!Number.isInteger(tabId)) {
+    sendResponse({ success: false, error: "Invalid ChatGPT tab." });
+    return false;
+  }
+
+  (async () => {
+    try {
+      const tab = await chrome.tabs.get(tabId as number);
+      if (!tab.url?.startsWith("https://chatgpt.com/")) {
+        throw new Error("Open a ChatGPT conversation before exporting.");
+      }
+
+      try {
+        const ping = await chrome.tabs.sendMessage(tab.id!, {
+          type: "CHATSCRIBE_PING",
+        }) as { ready?: boolean } | undefined;
+        if (ping?.ready) {
+          sendResponse({ success: true });
+          return;
+        }
+      } catch {
+        // The content script is not present in this tab yet.
+      }
+
+      if (!chromeCapabilities.scripting?.executeScript) {
+        throw new Error("This browser cannot reconnect ChatScribe without reloading the page.");
+      }
+
+      await chromeCapabilities.scripting.executeScript({
+        target: { tabId: tab.id! },
+        files: ["content.js"],
+      });
+
+      const ping = await chrome.tabs.sendMessage(tab.id!, {
+        type: "CHATSCRIBE_PING",
+      }) as { ready?: boolean } | undefined;
+      if (!ping?.ready) throw new Error("ChatScribe could not reconnect to this tab.");
+      sendResponse({ success: true });
+    } catch (error) {
+      sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  })();
+
+  return true;
+});
 
 // --- CLIPBOARD COPY ---
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

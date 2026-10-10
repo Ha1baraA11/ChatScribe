@@ -5,7 +5,6 @@ export default defineConfig({
     rollupOptions: {
       input: {
         bridge: "src/bridge.ts",
-        content: "src/content.ts",
         background: "src/background.ts",
         popup: "src/popup.ts",
         options: "src/options.ts",

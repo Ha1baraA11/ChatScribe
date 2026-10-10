@@ -1,11 +1,46 @@
 import { describe, expect, it } from "vitest";
 import {
   findBranchInsertionIndex,
+  isMessageLinkedToActiveMessage,
   walkActiveBranchNodes,
 } from "../src/conversation-branch.ts";
 import type { ApiMessage } from "../src/types.ts";
 
 describe("active conversation branch", () => {
+  it("links a generated-image tool node to its active user turn when current_node is incomplete", () => {
+    const byId = new Map<string, ApiMessage>([
+      ["user-1", { id: "user-1", author: { role: "user" } }],
+      [
+        "image-tool",
+        {
+          id: "image-tool",
+          parent: "user-1",
+          author: { role: "tool" },
+          content: {
+            content_type: "multimodal_text",
+            parts: [{ content_type: "image_asset_pointer" }],
+          },
+        },
+      ],
+      ["orphaned-reasoning", { id: "orphaned-reasoning", parent: "missing-node" }],
+    ]);
+
+    expect(
+      isMessageLinkedToActiveMessage(
+        "image-tool",
+        byId,
+        new Set(["user-1"]),
+      ),
+    ).toBe(true);
+    expect(
+      isMessageLinkedToActiveMessage(
+        "orphaned-reasoning",
+        byId,
+        new Set(["user-1"]),
+      ),
+    ).toBe(false);
+  });
+
   it("keeps non-exportable image-only nodes in the active branch path", () => {
     const byId = new Map<string, ApiMessage>([
       ["root", { id: "root", parent: null }],

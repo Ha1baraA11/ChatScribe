@@ -1,11 +1,11 @@
 /**
- * popup.ts — ChatScribe
+ * popup.ts — ChatScribe's persistent browser panel
  *
- * Popup UI logic.
+ * Shared Chrome Side Panel / Firefox Sidebar UI logic.
  *
  * Flow:
  *  1. On open, load settings and messages from the active ChatGPT tab.
- *  2. Show a loading overlay while messages are fetching.
+ *  2. Keep the panel and its progress visible while users switch tabs.
  *  3. On success, make full-copy, latest-answer, and message-selection actions available.
  *  4. Copy the conversation or latest answer, or choose a subset to copy/export.
  *  5. Export → open the selector, let user pick messages + format, download.
@@ -26,6 +26,8 @@ import {
 import { buildZipBlob, blobToBase64 } from "./zip.ts";
 import type { ConversationData, ExportMessage, ExportImageFile } from "./types.ts";
 import {
+  normalizeChatGptComponents,
+  replaceSvgTemplatesWithRenderedImages,
   renderSvgTemplatesAsMarkdown,
   type SvgDiagramMode,
 } from "./svg-template.ts";
@@ -134,6 +136,48 @@ const ALL_BUTTONS = [
 let conversationData: ConversationData | null = null;
 let settings: Settings | null = null;
 let pageTitle = "ChatGPT Conversation";
+let sourceTabId: number | null = null;
+let loadSequence = 0;
+let githubReturnSelection: Set<string> | null = null;
+const PANEL_TARGET_TAB_KEY = "chatscribePanelTargetTabId";
+
+function isMissingReceiver(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /receiving end does not exist|no receiver|could not establish connection/i
+    .test(message);
+}
+
+async function requestConversation(
+  tabId: number,
+  downloadImages: boolean,
+  includeGeneratedImages: boolean,
+  fetchImages = downloadImages,
+  selectedMessageIds?: string[],
+): Promise<{ success: boolean; data?: ConversationData; error?: string }> {
+  const request = {
+    type: "LOAD_CONVERSATION",
+    downloadImages,
+    includeGeneratedImages,
+    fetchImages,
+    selectedMessageIds,
+  };
+
+  try {
+    return await chrome.tabs.sendMessage(tabId, request);
+  } catch (error) {
+    if (!isMissingReceiver(error)) throw error;
+
+    const ensured = await chrome.runtime.sendMessage({
+      type: "ENSURE_CONTENT_SCRIPT",
+      tabId,
+    }) as { success?: boolean; error?: string } | undefined;
+    if (!ensured?.success) {
+      throw new Error(ensured?.error ?? "ChatScribe could not reconnect to this tab.");
+    }
+
+    return chrome.tabs.sendMessage(tabId, request);
+  }
+}
 
 // -----------------------------------------------------------------------
 // TOAST
@@ -182,53 +226,40 @@ optionsLink.addEventListener("click", (event) => {
 // INITIALISE: get active tab + load conversation
 // -----------------------------------------------------------------------
 
-async function init(): Promise<void> {
-  settings = await loadSettings();
-  applyTheme(settings.theme);
-
+async function loadConversationForTab(tabId: number): Promise<void> {
+  const requestId = ++loadSequence;
+  if (!settings) {
+    settings = await loadSettings();
+    applyTheme(settings.theme);
+  }
+  if (requestId !== loadSequence) return;
+  sourceTabId = tabId;
+  conversationData = null;
+  closeSelector();
   showLoading(t("popup.loading"));
 
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-
-  if (!tab?.id) {
-    hideLoading();
-    showToast(t("popup.error.noTab"), 4000);
-    return;
-  }
-
-  if (!tab.url?.includes("chatgpt.com")) {
-    hideLoading();
-    showToast(t("popup.error.notChatGpt"), 4000);
-    return;
-  }
-
-  pageTitle = tab.title ?? "ChatGPT Conversation";
-
-  // Forward progress updates to loading message
-  const progressListener = (msg: { type?: string; collected?: number }): void => {
-    if (msg.type === "EXPORT_PROGRESS" && typeof msg.collected === "number") {
-      loadingMessage.textContent = `${t("popup.loading")} (${msg.collected})`;
-    }
-  };
-  chrome.runtime.onMessage.addListener(progressListener);
-
   try {
-    const response = await chrome.tabs.sendMessage<unknown, {
-      success: boolean;
-      data?: ConversationData;
-      error?: string;
-    }>(tab.id, {
-      type: "LOAD_CONVERSATION",
-      downloadImages: settings.downloadImages,
-    });
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab.url?.includes("chatgpt.com")) {
+      throw new Error(t("popup.error.notChatGpt"));
+    }
+
+    pageTitle = tab.title ?? "ChatGPT Conversation";
+    const response = await requestConversation(
+      tabId,
+      settings?.downloadImages ?? false,
+      settings?.includeGeneratedImages ?? true,
+      false,
+    );
 
     if (!response?.success || !response.data) {
       throw new Error(response?.error ?? t("popup.error.loadFailed"));
     }
 
+    if (requestId !== loadSequence) return;
+
     const loaded = response.data;
     conversationData = loaded;
-
     if (loaded.messages.length === 0) {
       throw new Error(t("popup.error.noMessages"));
     }
@@ -237,14 +268,16 @@ async function init(): Promise<void> {
 
     hideLoading();
   } catch (err) {
+    if (requestId !== loadSequence) return;
     devError("Failed to load conversation:", err);
     hideLoading();
     const errorMessage = err instanceof Error ? err.message : "";
-    const isContentScriptUnavailable =
-      /receiving end does not exist|no receiver|could not establish connection/i
-        .test(errorMessage);
+    const isContentScriptUnavailable = isMissingReceiver(err) ||
+      /could not reconnect to this tab/i.test(errorMessage);
     const isChatGptConnectionNotReady =
-      errorMessage === "CHATGPT_CONNECTION_NOT_READY";
+      errorMessage === "CHATGPT_CONNECTION_NOT_READY" ||
+      /ChatScribe bridge did not start/i.test(errorMessage);
+
     showToast(
       isChatGptConnectionNotReady
         ? t("popup.error.chatGptConnectionNotReady")
@@ -253,11 +286,66 @@ async function init(): Promise<void> {
           : errorMessage || t("popup.error.loadFailed"),
       5000,
     );
-    return;
   } finally {
-    chrome.runtime.onMessage.removeListener(progressListener);
+    if (requestId === loadSequence) hideLoading();
   }
 }
+
+async function init(): Promise<void> {
+  settings = await loadSettings();
+  applyTheme(settings.theme);
+
+  const storedTarget = await chrome.storage.local.get(PANEL_TARGET_TAB_KEY);
+  const requestedTabId = storedTarget[PANEL_TARGET_TAB_KEY];
+  if (Number.isInteger(requestedTabId)) {
+    await chrome.storage.local.remove(PANEL_TARGET_TAB_KEY);
+    await loadConversationForTab(requestedTabId as number);
+    return;
+  }
+
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id) {
+    hideLoading();
+    showToast(t("popup.error.noTab"), 4000);
+    return;
+  }
+  await loadConversationForTab(tab.id);
+}
+
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (
+    message.type === "PANEL_TARGET_TAB_REQUESTED" &&
+    Number.isInteger(message.tabId)
+  ) {
+    void chrome.storage.local.remove(PANEL_TARGET_TAB_KEY);
+    void loadConversationForTab(message.tabId as number);
+    return false;
+  }
+
+  if (
+    message.type === "EXPORT_PROGRESS" &&
+    typeof message.collected === "number" &&
+    sender.tab?.id === sourceTabId
+  ) {
+    if (message.stage === "images") {
+      const completed = typeof message.completed === "number" ? message.completed : 0;
+      const total = typeof message.total === "number" ? message.total : 0;
+      loadingMessage.textContent = total > 0
+        ? `${t("popup.loadingImages")} (${completed}/${total})`
+        : t("popup.loadingImages");
+    } else {
+      loadingMessage.textContent = `${t("popup.loading")} (${message.collected})`;
+    }
+  }
+
+  if (message.type === "DOWNLOAD_COMPLETE") {
+    void sendToPage({
+      type: "SHOW_EXPORT_SUCCESS",
+      message: t("popup.toast.exported"),
+    });
+  }
+  return false;
+});
 
 void init();
 
@@ -265,19 +353,9 @@ void init();
 // DOWNLOAD COMPLETE → show a brief success toast on the page
 // -----------------------------------------------------------------------
 
-chrome.runtime.onMessage.addListener((msg: { type?: string }) => {
-  if (msg.type === "DOWNLOAD_COMPLETE") {
-    void sendToPage({
-      type: "SHOW_EXPORT_SUCCESS",
-      message: t("popup.toast.exported"),
-    });
-  }
-});
-
 async function sendToPage(message: object): Promise<void> {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab?.id) return;
-  chrome.tabs.sendMessage(tab.id, message).catch(() => { /* tab may be gone */ });
+  if (sourceTabId === null) return;
+  chrome.tabs.sendMessage(sourceTabId, message).catch(() => { /* tab may be gone */ });
 }
 
 // -----------------------------------------------------------------------
@@ -316,7 +394,7 @@ copyLatestBtn.addEventListener("click", () => {
     showToast(t("popup.error.noAssistantAnswer"));
     return;
   }
-  void copyMessages([latestAnswer]);
+  void copyMessages([latestAnswer], { includeRoleHeadings: false });
 });
 
 copySelectBtn.addEventListener("click", () => {
@@ -325,7 +403,7 @@ copySelectBtn.addEventListener("click", () => {
     showToast(t("popup.error.loadFailed"));
     return;
   }
-  openSelector();
+  openSelector(false);
 });
 
 function closeCopyOptions(): void {
@@ -351,17 +429,20 @@ exportBtn.addEventListener("click", () => {
     showToast(t("popup.error.loadFailed"));
     return;
   }
-  openSelector();
+  openSelector(true);
 });
 
 // -----------------------------------------------------------------------
 // SELECTOR LOGIC
 // -----------------------------------------------------------------------
 
-function openSelector(): void {
+function openSelector(
+  selectAll = false,
+  selectedIds?: ReadonlySet<string>,
+): void {
   if (!conversationData) return;
   closeCopyOptions();
-  populateSelector(conversationData.messages);
+  populateSelector(conversationData.messages, selectAll, selectedIds);
   document.body.classList.add("overlay-open");
   selectorOverlay.classList.add("open");
   updateSelectorCount();
@@ -401,7 +482,11 @@ function updateSelectorCount(): void {
   selGithubBtn.disabled = checked === 0;
 }
 
-function populateSelector(messages: ExportMessage[]): void {
+function populateSelector(
+  messages: ExportMessage[],
+  selectAll: boolean,
+  selectedIds?: ReadonlySet<string>,
+): void {
   selList.innerHTML = "";
   const expanded = selExpandToggle.checked;
   selList.classList.toggle("expanded", expanded);
@@ -413,7 +498,7 @@ function populateSelector(messages: ExportMessage[]): void {
 
     const cb = document.createElement("input");
     cb.type = "checkbox";
-    cb.checked = false;
+    cb.checked = selectedIds ? selectedIds.has(msg.id) : selectAll;
     cb.dataset.id = msg.id;
     cb.dataset.role = msg.role;
     cb.addEventListener("change", updateSelectorCount);
@@ -490,10 +575,40 @@ function getSelectedMessages(): ExportMessage[] {
   return conversationData.messages.filter((m) => ids.has(m.id));
 }
 
-function getSelectedImages(messages: ExportMessage[]): ExportImageFile[] {
-  if (!conversationData) return [];
-  const paths = new Set(messages.flatMap((m) => m.imagePaths));
-  return conversationData.images.filter((img) => paths.has(img.path));
+async function hydrateSelectedImages(
+  messages: ExportMessage[],
+): Promise<{ messages: ExportMessage[]; images: ExportImageFile[] }> {
+  if (!settings?.downloadImages || sourceTabId === null) {
+    return { messages, images: [] };
+  }
+
+  showLoading(t("popup.loadingImages"));
+  try {
+    const response = await requestConversation(
+      sourceTabId,
+      true,
+      settings.includeGeneratedImages,
+      true,
+      messages.map((message) => message.id),
+    );
+    if (!response?.success || !response.data) {
+      throw new Error(response?.error ?? t("popup.error.loadFailed"));
+    }
+
+    const selectedIds = new Set(messages.map((message) => message.id));
+    const hydratedMessages = response.data.messages.filter((message) =>
+      selectedIds.has(message.id),
+    );
+    const selectedPaths = new Set(
+      hydratedMessages.flatMap((message) => message.imagePaths),
+    );
+    return {
+      messages: hydratedMessages,
+      images: response.data.images.filter((image) => selectedPaths.has(image.path)),
+    };
+  } finally {
+    hideLoading();
+  }
 }
 
 async function prepareDiagramMessages(
@@ -506,12 +621,27 @@ async function prepareDiagramMessages(
   const assets: ExportImageFile[] = [];
 
   for (const message of messages) {
-    const rendered = await renderSvgTemplatesAsMarkdown(
-      message.content,
-      mode,
-      assets.length + 1,
-    );
-    prepared.push({ ...message, content: rendered.markdown });
+    const sourceContent = mode === "assets"
+      ? message.imageMarkdownContent ?? message.content
+      : message.content;
+    const pageRendered = message.renderedDiagramPaths?.length
+      ? replaceSvgTemplatesWithRenderedImages(
+          sourceContent,
+          message.renderedDiagramPaths,
+          mode,
+        )
+      : null;
+    const rendered = pageRendered !== null
+      ? { markdown: pageRendered, assets: [] }
+      : await renderSvgTemplatesAsMarkdown(
+          sourceContent,
+          mode,
+          assets.length + 1,
+        );
+    prepared.push({
+      ...message,
+      content: normalizeChatGptComponents(rendered.markdown),
+    });
     assets.push(...rendered.assets);
   }
 
@@ -525,7 +655,7 @@ async function prepareDiagramMessages(
 async function exportSelected(): Promise<void> {
   if (!settings || !conversationData) return;
 
-  const chosen = getSelectedMessages();
+  let chosen = getSelectedMessages();
   if (chosen.length === 0) return;
 
   setBusy(true);
@@ -535,9 +665,17 @@ async function exportSelected(): Promise<void> {
     const fmt = selFormatSelect.value as ExportFormat;
     const diagramMode: SvgDiagramMode =
       fmt === "md" ? "assets" : fmt === "txt" ? "text" : "none";
+
+    let selectedImages: ExportImageFile[] = [];
+    if (fmt === "md" && settings.downloadImages && sourceTabId !== null) {
+      const hydrated = await hydrateSelectedImages(chosen);
+      chosen = hydrated.messages;
+      selectedImages = hydrated.images;
+    }
+
     const prepared = await prepareDiagramMessages(chosen, diagramMode);
     const exportMessages = prepared.messages;
-    const images = [...getSelectedImages(chosen), ...prepared.assets];
+    const images = [...selectedImages, ...prepared.assets];
     const hasImages = images.length > 0;
 
     let filename: string;
@@ -597,6 +735,7 @@ async function exportSelected(): Promise<void> {
     // Revoke object URL after a delay
     window.setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
   } catch (err) {
+    hideLoading();
     devError("Export failed:", err);
     showToast(t("popup.toast.downloadFailed"), 3500);
   } finally {
@@ -607,13 +746,16 @@ async function exportSelected(): Promise<void> {
 async function copySelected(): Promise<void> {
   if (!settings || !conversationData) return;
 
-  const chosen = getSelectedMessages();
+  let chosen = getSelectedMessages();
   if (chosen.length === 0) return;
 
   await copyMessages(chosen);
 }
 
-async function copyMessages(messages: ExportMessage[]): Promise<void> {
+async function copyMessages(
+  messages: ExportMessage[],
+  options: { includeRoleHeadings?: boolean } = {},
+): Promise<void> {
   if (!settings || messages.length === 0) return;
 
   setBusy(true);
@@ -621,7 +763,7 @@ async function copyMessages(messages: ExportMessage[]): Promise<void> {
 
   try {
     const prepared = await prepareDiagramMessages(messages, "text");
-    const markdown = formatMarkdown(prepared.messages, settings);
+    const markdown = formatMarkdown(prepared.messages, settings, options);
     await writeClipboard(markdown);
     showToast(t("popup.toast.copied"));
   } catch (err) {
@@ -647,6 +789,7 @@ selExportBtn.addEventListener("click", () => {
 selGithubBtn.addEventListener("click", () => {
   const chosen = getSelectedMessages();
   if (chosen.length === 0) return;
+  githubReturnSelection = new Set(getCheckedIds());
   closeSelector();
   void openGithubPanel();
 });
@@ -706,7 +849,8 @@ async function openGithubPanel(): Promise<void> {
 
 githubPanelCancel.addEventListener("click", () => {
   githubPanel.classList.remove("open");
-  openSelector();
+  openSelector(false, githubReturnSelection ?? new Set());
+  githubReturnSelection = null;
 });
 
 githubPanelSave.addEventListener("click", () => {
@@ -735,15 +879,17 @@ async function saveToGitHub(): Promise<void> {
   const fullName = githubRepoSelect.value;
   if (!fullName) return;
 
-  const chosen = getSelectedMessages();
+  let chosen = getSelectedMessages();
   if (chosen.length === 0) return;
 
   setBusy(true);
   githubPanelSave.textContent = t("popup.github.saving");
 
   try {
+    const hydrated = await hydrateSelectedImages(chosen);
+    chosen = hydrated.messages;
     const prepared = await prepareDiagramMessages(chosen, "assets");
-    const images = [...getSelectedImages(chosen), ...prepared.assets];
+    const images = [...hydrated.images, ...prepared.assets];
     const hasImages = images.length > 0;
 
     const md = formatMarkdown(prepared.messages, settings);

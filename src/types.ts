@@ -14,10 +14,18 @@ export interface ExportMessage {
   role: "user" | "assistant";
   /** Markdown text content. */
   content: string;
+  /** Markdown-only content with temporary ChatGPT image links rewritten to bundled paths. */
+  imageMarkdownContent?: string;
+  /** Rendered page images without filenames, kept for sandbox-link matching. */
+  renderedImageFallbackPaths?: string[];
+  /** Resource filenames mapped to their bundled relative image paths. */
+  imagePathsByFilename?: Record<string, string>;
   /** Sequential position (0-based). */
   index: number;
   /** Paths to bundled image files (relative, e.g. "images/image-001.png"). */
   imagePaths: string[];
+  /** Image paths corresponding to SVG diagrams already rendered by ChatGPT. */
+  renderedDiagramPaths?: string[];
   /** Unix timestamp in seconds, if available. */
   timestamp?: number;
 }
@@ -112,6 +120,7 @@ export interface ApiConversationPage {
 export type HeadingStyle = "h2" | "bold" | "none";
 export type SeparatorStyle = "single" | "double" | "rule";
 export type ThemeStyle = "system" | "light" | "dark";
+export type PanelMode = "popup" | "sidebar";
 export type LanguageCode = "auto" | "en" | "zh" | "es" | "fr" | "de" | "ru";
 
 export interface Settings {
@@ -120,7 +129,9 @@ export interface Settings {
   includeTimestamp: boolean;
   promptToSave: boolean;
   downloadImages: boolean;
+  includeGeneratedImages: boolean;
   theme: ThemeStyle;
+  panelMode: PanelMode;
   language: LanguageCode;
 }
 
@@ -130,7 +141,9 @@ export const DEFAULT_SETTINGS: Settings = {
   includeTimestamp: false,
   promptToSave: true,
   downloadImages: false,
+  includeGeneratedImages: true,
   theme: "system",
+  panelMode: "popup",
   language: "auto",
 };
 
@@ -145,7 +158,13 @@ export const SEPARATOR_MAP: Record<SeparatorStyle, string> = {
 // -----------------------------------------------------------------------
 
 export type ChromeMessage =
-  | { type: "LOAD_CONVERSATION"; downloadImages: boolean }
+  | {
+      type: "LOAD_CONVERSATION";
+      downloadImages: boolean;
+      includeGeneratedImages: boolean;
+      fetchImages?: boolean;
+      selectedMessageIds?: string[];
+    }
   | { type: "COPY_TO_CLIPBOARD"; text: string }
   | { type: "SHOW_EXPORT_SUCCESS"; message: string }
   | { type: "EXPORT_PROGRESS"; collected: number }

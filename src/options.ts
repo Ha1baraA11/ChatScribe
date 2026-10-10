@@ -44,8 +44,10 @@ const $id = <T extends HTMLElement>(id: string) =>
 // Form inputs
 const promptToSaveInput = $id<HTMLInputElement>("promptToSave");
 const downloadImagesInput = $id<HTMLInputElement>("downloadImages");
+const includeGeneratedImagesInput = $id<HTMLInputElement>("includeGeneratedImages");
 const includeTimestampInput = $id<HTMLInputElement>("includeTimestamp");
 const themeSelect = $id<HTMLSelectElement>("theme-select");
+const panelModeSelect = $id<HTMLSelectElement>("panelMode");
 const languageSelect = $id<HTMLSelectElement>("language-select");
 const downloadsSettingsLink = $id<HTMLAnchorElement>("downloads-settings-link");
 
@@ -97,9 +99,11 @@ function populateForm(settings: Settings): void {
 
   promptToSaveInput.checked = settings.promptToSave;
   downloadImagesInput.checked = settings.downloadImages;
+  includeGeneratedImagesInput.checked = settings.includeGeneratedImages;
   includeTimestampInput.checked = settings.includeTimestamp;
 
   themeSelect.value = settings.theme;
+  panelModeSelect.value = settings.panelMode;
   applyTheme(settings.theme);
 
   languageSelect.value = settings.language;
@@ -114,8 +118,10 @@ function gatherSettings(): Settings {
     ),
     promptToSave: promptToSaveInput.checked,
     downloadImages: downloadImagesInput.checked,
+    includeGeneratedImages: includeGeneratedImagesInput.checked,
     includeTimestamp: includeTimestampInput.checked,
     theme: themeSelect.value as Settings["theme"],
+    panelMode: panelModeSelect.value as Settings["panelMode"],
     language: languageSelect.value as Settings["language"],
   };
 }
