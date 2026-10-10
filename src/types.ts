@@ -163,6 +163,7 @@ export type ChromeMessage =
       downloadImages: boolean;
       includeGeneratedImages: boolean;
       fetchImages?: boolean;
+      forceRefresh?: boolean;
       selectedMessageIds?: string[];
     }
   | { type: "COPY_TO_CLIPBOARD"; text: string }

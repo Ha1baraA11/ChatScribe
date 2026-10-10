@@ -153,6 +153,7 @@ async function requestConversation(
   includeGeneratedImages: boolean,
   fetchImages = downloadImages,
   selectedMessageIds?: string[],
+  forceRefresh = false,
 ): Promise<{ success: boolean; data?: ConversationData; error?: string }> {
   const request = {
     type: "LOAD_CONVERSATION",
@@ -160,6 +161,7 @@ async function requestConversation(
     includeGeneratedImages,
     fetchImages,
     selectedMessageIds,
+    forceRefresh,
   };
 
   try {
@@ -425,12 +427,47 @@ document.addEventListener("keydown", (event) => {
 
 exportBtn.addEventListener("click", () => {
   closeCopyOptions();
-  if (!conversationData) {
+  if (!conversationData || !settings || sourceTabId === null) {
     showToast(t("popup.error.loadFailed"));
     return;
   }
-  openSelector(true);
+  void refreshConversationForExport();
 });
+
+async function refreshConversationForExport(): Promise<void> {
+  if (!settings || sourceTabId === null) return;
+
+  setBusy(true);
+  showLoading(t("popup.loading"));
+  try {
+    const response = await requestConversation(
+      sourceTabId,
+      settings.downloadImages,
+      settings.includeGeneratedImages,
+      false,
+      undefined,
+      true,
+    );
+    if (!response?.success || !response.data) {
+      throw new Error(response?.error ?? t("popup.error.loadFailed"));
+    }
+    if (response.data.messages.length === 0) {
+      throw new Error(t("popup.error.noMessages"));
+    }
+
+    conversationData = response.data;
+    const tab = await chrome.tabs.get(sourceTabId);
+    pageTitle = tab.title ?? pageTitle;
+    openSelector(true);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    devError("Failed to refresh conversation for export:", error);
+    showToast(message || t("popup.error.loadFailed"), 5000);
+  } finally {
+    hideLoading();
+    setBusy(false);
+  }
+}
 
 // -----------------------------------------------------------------------
 // SELECTOR LOGIC

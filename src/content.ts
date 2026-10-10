@@ -796,13 +796,7 @@ function getRenderedImagePartsForMessage(
   for (const element of document.querySelectorAll<HTMLElement>(
     "[data-dil-message-id], [data-message-id], [data-chatgpt-search-message-ids]",
   )) {
-    const ids = [
-      element.dataset.dilMessageId,
-      element.dataset.messageId,
-      element.dataset.chatgptSearchMessageIds,
-    ]
-      .filter((id): id is string => Boolean(id))
-      .flatMap((id) => id.split(/[\s,]+/));
+    const ids = getRenderedMessageIds(element);
 
     if (!ids.includes(messageId)) continue;
 
@@ -995,6 +989,36 @@ function replaceSandboxImageLinks(
   return rewritten.replace(/\n{3,}/g, "\n\n");
 }
 
+function getRenderedMessageIds(element: Element): string[] {
+  return [
+    element.getAttribute("data-dil-message-id"),
+    element.getAttribute("data-message-id"),
+    element.getAttribute("data-chatgpt-search-message-ids"),
+  ]
+    .filter((id): id is string => Boolean(id))
+    .flatMap((id) => id.split(/[\s,]+/));
+}
+
+function isRenderedImageInActiveTurn(
+  element: Element,
+  candidateId: string,
+  activeMessageIds: ReadonlySet<string>,
+): boolean {
+  let current: Element | null = element;
+  for (let depth = 0; current && depth < 10; depth++, current = current.parentElement) {
+    const ids = new Set([
+      ...getRenderedMessageIds(current),
+      ...Array.from(current.querySelectorAll<HTMLElement>(
+        "[data-dil-message-id], [data-message-id], [data-chatgpt-search-message-ids]",
+      )).flatMap(getRenderedMessageIds),
+    ]);
+    if (ids.has(candidateId) && [...ids].some((id) => activeMessageIds.has(id))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function getUnattachedRenderedGeneratedImages(
   existingMessages: ApiMessage[],
   branchNodes: ApiMessage[] | null,
@@ -1026,14 +1050,24 @@ function getUnattachedRenderedGeneratedImages(
       .flatMap((id) => id.split(/[\s,]+/));
     if (ids.length === 0) continue;
 
+    const generatedImages = Array.from(
+      element.querySelectorAll<HTMLImageElement>("img"),
+    ).filter((image) => /generated image/i.test(image.alt));
+
     const candidateIds = [...new Set(ids)].filter((id) => {
-      if (!allMessagesById.has(id)) return false;
-      if (resolvedBranchIds) return resolvedBranchIds.has(id);
-      return isMessageLinkedToActiveMessage(
+      if (resolvedBranchIds?.has(id)) return true;
+      if (allMessagesById.has(id) && isMessageLinkedToActiveMessage(
         id,
         allMessagesById,
         activeMessageIds,
-      );
+      )) return true;
+      // The rendered image can have its own DOM message ID that is absent from
+      // the paginated API response. Recover it only when the same visible
+      // ChatGPT turn also contains an API ID on the active branch.
+      if (generatedImages.length > 0) {
+        return isRenderedImageInActiveTurn(element, id, activeMessageIds);
+      }
+      return false;
     });
     if (candidateIds.length === 0) continue;
 
@@ -1063,9 +1097,6 @@ function getUnattachedRenderedGeneratedImages(
         return getSandboxImageFilenames(extractText(message));
       }),
     )];
-    const generatedImages = Array.from(
-      element.querySelectorAll<HTMLImageElement>("img"),
-    ).filter((image) => /generated image/i.test(image.alt));
     if (generatedImages.length === 0 && sandboxFilenames.length === 0) continue;
     // ChatGPT's generated-image cards sometimes render with an empty alt, so
     // use the message's own image nodes when its text provides a sandbox name.
@@ -1133,9 +1164,7 @@ function getUnattachedRenderedGeneratedImages(
       continue;
     }
 
-    let renderedParts = sourceMessage
-      ? getRenderedImagePartsForMessage(sourceId)
-      : [];
+    let renderedParts = getRenderedImagePartsForMessage(sourceId);
     if (renderedParts.length === 0) {
       let svgIndex = 0;
       const fallbackParts: Array<Record<string, string | number>> = [];
@@ -1190,7 +1219,7 @@ function getUnattachedRenderedGeneratedImages(
       renderedResources.forEach((resource) => recoveredKeys.add(resource.key));
       generatedBySource.set(sourceId, {
         id: `rendered-generated-image:${sourceId}`,
-        parent: sourceId,
+        parent: sourceMessage ? sourceId : null,
         author: { role: "assistant" },
         create_time: sourceMessage?.create_time ?? Date.now() / 1000,
         end_turn: true,
@@ -1290,13 +1319,15 @@ async function loadConversation(
   includeGeneratedImages: boolean,
   fetchImages: boolean,
   selectedMessageIds?: string[],
+  forceRefresh = false,
 ): Promise<ConversationData> {
   const selectedKey = selectedMessageIds
     ? [...selectedMessageIds].sort().join(",")
     : "all";
-  const key = `${location.pathname}:${downloadImages}:${includeGeneratedImages}:${fetchImages}:${selectedKey}`;
+  const key = `${location.pathname}:${downloadImages}:${includeGeneratedImages}:${fetchImages}:${selectedKey}:${forceRefresh}`;
   if (loadInFlight?.key === key) return loadInFlight.promise;
   if (
+    !forceRefresh &&
     cachedLoad?.key === key &&
     Date.now() - cachedLoad.completedAt < CONVERSATION_CACHE_TTL_MS
   ) {
@@ -1309,6 +1340,7 @@ async function loadConversation(
     includeGeneratedImages,
     fetchImages,
     selectedMessageIds ? new Set(selectedMessageIds) : null,
+    forceRefresh,
   )
     .then((data) => {
       cachedLoad = { key, data, completedAt: Date.now() };
@@ -1326,6 +1358,7 @@ async function doLoadConversation(
   includeGeneratedImages: boolean,
   fetchImages: boolean,
   selectedMessageIds: ReadonlySet<string> | null,
+  forceRefresh: boolean,
 ): Promise<ConversationData> {
   imageResourceCache = new WeakMap();
   await waitForBridge();
@@ -1346,6 +1379,7 @@ async function doLoadConversation(
   let currentNode: string | null;
 
   if (
+    !forceRefresh &&
     cachedRawConversation?.key === rawCacheKey &&
     Date.now() - cachedRawConversation.completedAt < CONVERSATION_CACHE_TTL_MS
   ) {
@@ -1744,6 +1778,10 @@ async function doLoadConversation(
     const visitedParents = new Set<string>();
 
     while (!target && sourceNode) {
+      // Stop at the user turn. An image-only assistant response should remain
+      // its own answer instead of being attached to an assistant from an
+      // earlier turn in the conversation.
+      if (sourceNode.author?.role === "user") break;
       const parentId = getMessageParentId(sourceNode);
       if (!parentId || visitedParents.has(parentId)) break;
       visitedParents.add(parentId);
@@ -1751,17 +1789,6 @@ async function doLoadConversation(
         message.id === parentId && message.role === "assistant",
       );
       sourceNode = allById.get(parentId);
-    }
-
-    if (!target) {
-      const syntheticIndex = messages.indexOf(generated);
-      target = messages.slice(syntheticIndex + 1).find((message) =>
-        message.role === "assistant" &&
-        !message.id.startsWith("rendered-generated-image:"),
-      ) ?? messages.slice(0, syntheticIndex).reverse().find((message) =>
-        message.role === "assistant" &&
-        !message.id.startsWith("rendered-generated-image:"),
-      );
     }
 
     if (!target) continue;
@@ -2071,6 +2098,7 @@ chrome.runtime.onMessage.addListener(
       downloadImages?: boolean;
       includeGeneratedImages?: boolean;
       fetchImages?: boolean;
+      forceRefresh?: boolean;
       selectedMessageIds?: string[];
       text?: string;
       message?: string;
@@ -2105,6 +2133,7 @@ chrome.runtime.onMessage.addListener(
         message.includeGeneratedImages === true,
         message.fetchImages ?? message.downloadImages === true,
         message.selectedMessageIds,
+        message.forceRefresh === true,
       )
         .then((data) => sendResponse({ success: true, data }))
         .catch((err: unknown) =>
