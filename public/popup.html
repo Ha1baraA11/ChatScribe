@@ -256,6 +256,11 @@
         transition: transform 150ms ease;
       }
 
+      #copy-menu-toggle[aria-disabled="true"] {
+        opacity: 1;
+        cursor: default;
+      }
+
       #copy-control.open #copy-menu-toggle svg {
         transform: rotate(180deg);
       }

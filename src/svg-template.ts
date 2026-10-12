@@ -352,23 +352,53 @@ export function replaceSvgTemplatesWithRenderedImages(
   return restoreCodeBlocks(output.join(""), placeholderPrefix, codeBlocks);
 }
 
+function getDarkSvgBackgroundColor(value?: string): string {
+  if (!value) return "#ffffff";
+  const match = value.match(
+    /^rgb\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)$/i,
+  );
+  if (!match) return "#ffffff";
+
+  const [red, green, blue] = match.slice(1).map(Number);
+  if ([red, green, blue].some((channel) => channel > 255)) return "#ffffff";
+  const linearize = (channel: number): number => {
+    const normalized = channel / 255;
+    return normalized <= 0.04045
+      ? normalized / 12.92
+      : ((normalized + 0.055) / 1.055) ** 2.4;
+  };
+  const luminance =
+    0.2126 * linearize(red) +
+    0.7152 * linearize(green) +
+    0.0722 * linearize(blue);
+  return luminance < 0.4 ? `rgb(${red}, ${green}, ${blue})` : "#ffffff";
+}
+
 /** Render an image/svg+xml data URI from a ChatGPT message as a safe PNG. */
 export async function renderSvgDataUrlToPngBase64(
   dataUrl: string,
+  backgroundColor?: string,
 ): Promise<string | null> {
   const svg = decodeSvgDataUrl(dataUrl);
   if (!svg || svg.length > MAX_TEMPLATE_LENGTH) return null;
+  const canvasBackgroundColor = getDarkSvgBackgroundColor(backgroundColor);
 
   // ChatGPT's already-rendered SVGs can use safe SVG features outside the
   // exporter's sanitizer subset. Load those only as an image (never as
   // document markup), after rejecting active content and external references.
   if (isSafeSvgImageSource(svg)) {
-    const imageContextPng = await renderSvgImageDataUrlToPngBase64(dataUrl, svg);
+    const imageContextPng = await renderSvgImageDataUrlToPngBase64(
+      dataUrl,
+      svg,
+      canvasBackgroundColor,
+    );
     if (imageContextPng) return imageContextPng;
   }
 
-  const safeSvg = sanitizeStaticSvg(svg);
-  return safeSvg ? renderSvgToPngBase64(safeSvg) : null;
+  const safeSvg = sanitizeStaticSvg(svg, canvasBackgroundColor);
+  return safeSvg
+    ? renderSvgToPngBase64(safeSvg, canvasBackgroundColor)
+    : null;
 }
 
 /**
@@ -379,6 +409,7 @@ export async function renderSvgTemplatesAsMarkdown(
   markdown: string,
   mode: SvgDiagramMode,
   firstAssetIndex = 1,
+  backgroundColor?: string,
 ): Promise<SvgTemplateRenderResult> {
   if (mode === "none") {
     return { markdown, assets: [] };
@@ -426,14 +457,15 @@ export async function renderSvgTemplatesAsMarkdown(
     }
 
     try {
-      const staticSvg = compileStaticSvg(svgTemplate);
+      const canvasBackgroundColor = getDarkSvgBackgroundColor(backgroundColor);
+      const staticSvg = compileStaticSvg(svgTemplate, canvasBackgroundColor);
 
       if (!staticSvg) {
         output.push(svgToReadableFallback(svgTemplate));
         continue;
       }
 
-      const base64 = await renderSvgToPngBase64(staticSvg);
+      const base64 = await renderSvgToPngBase64(staticSvg, canvasBackgroundColor);
 
       if (!base64) {
         output.push(svgToReadableFallback(svgTemplate));
@@ -1105,7 +1137,10 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function compileStaticSvg(svgTemplate: string): string | null {
+function compileStaticSvg(
+  svgTemplate: string,
+  backgroundColor = "#ffffff",
+): string | null {
   if (svgTemplate.length > MAX_TEMPLATE_LENGTH) {
     return null;
   }
@@ -1134,7 +1169,10 @@ function compileStaticSvg(svgTemplate: string): string | null {
   }
 
   const openingTag = resolvedOpeningTag.replace(/\s+key="[^"]*"/g, "");
-  return sanitizeStaticSvg(`${openingTag}${resolvedBody}${rootMatch[3]}`);
+  return sanitizeStaticSvg(
+    `${openingTag}${resolvedBody}${rootMatch[3]}`,
+    backgroundColor,
+  );
 }
 
 /** Finds the closing brace for a Svelte-style expression, ignoring braces in strings. */
@@ -2096,7 +2134,7 @@ function decodeXmlEntities(value: string): string {
   );
 }
 
-function sanitizeStaticSvg(source: string): string | null {
+function sanitizeStaticSvg(source: string, backgroundColor = "#ffffff"): string | null {
   const tokens = tokenizeSvg(source);
 
   if (!tokens) return null;
@@ -2204,12 +2242,12 @@ function sanitizeStaticSvg(source: string): string | null {
   rootAttributes.set("xmlns", "http://www.w3.org/2000/svg");
   rootAttributes.set("width", String(viewBox.width));
   rootAttributes.set("height", String(viewBox.height));
-  rootAttributes.set("color", "#222222");
+  rootAttributes.set("color", backgroundColor === "#ffffff" ? "#222222" : "#f5f5f5");
 
   const rootAttributeText = [...rootAttributes]
     .map(([name, value]) => `${name}="${escapeXml(value)}"`)
     .join(" ");
-  const background = `<rect x="${viewBox.minX}" y="${viewBox.minY}" width="${viewBox.width}" height="${viewBox.height}" fill="#ffffff"/>`;
+  const background = `<rect x="${viewBox.minX}" y="${viewBox.minY}" width="${viewBox.width}" height="${viewBox.height}" fill="${escapeXml(backgroundColor)}"/>`;
 
   return `<svg ${rootAttributeText}>${background}${body.join("")}</svg>`;
 }
@@ -2384,6 +2422,7 @@ function isSafeInlineSvgStyle(style: string): boolean {
 function renderSvgImageDataUrlToPngBase64(
   dataUrl: string,
   source: string,
+  backgroundColor: string,
 ): Promise<string | null> {
   return new Promise((resolve) => {
     const image = new Image();
@@ -2426,7 +2465,7 @@ function renderSvgImageDataUrlToPngBase64(
           return;
         }
 
-        context.fillStyle = "#ffffff";
+        context.fillStyle = backgroundColor;
         context.fillRect(0, 0, canvas.width, canvas.height);
         context.drawImage(image, 0, 0, canvas.width, canvas.height);
         const data = canvas.toDataURL("image/png");
@@ -2466,7 +2505,10 @@ function parseViewBox(value: string): ViewBox | null {
   return { minX: parts[0], minY: parts[1], width: parts[2], height: parts[3] };
 }
 
-async function renderSvgToPngBase64(svg: string): Promise<string | null> {
+async function renderSvgToPngBase64(
+  svg: string,
+  backgroundColor = "#ffffff",
+): Promise<string | null> {
   const viewBoxMatch = svg.match(/\bviewBox="([^"]+)"/);
   const viewBox = viewBoxMatch ? parseViewBox(viewBoxMatch[1]) : null;
 
@@ -2489,7 +2531,7 @@ async function renderSvgToPngBase64(svg: string): Promise<string | null> {
 
   if (!context) return null;
 
-  context.fillStyle = "#ffffff";
+  context.fillStyle = backgroundColor;
   context.fillRect(0, 0, canvas.width, canvas.height);
 
   const objectUrl = URL.createObjectURL(

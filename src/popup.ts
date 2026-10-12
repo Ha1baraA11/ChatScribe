@@ -37,7 +37,10 @@ import {
 // -----------------------------------------------------------------------
 
 void loadSettings().then((s) => applyTheme(s.theme));
-void initI18n().then(() => applyTranslations());
+void initI18n().then(() => {
+  applyTranslations();
+  applyCopyOptionsPreference();
+});
 
 function applyTheme(theme: Settings["theme"]): void {
   if (theme === "system") {
@@ -230,9 +233,11 @@ optionsLink.addEventListener("click", (event) => {
 
 async function loadConversationForTab(tabId: number): Promise<void> {
   const requestId = ++loadSequence;
+  setBusy(false);
   if (!settings) {
     settings = await loadSettings();
     applyTheme(settings.theme);
+    applyCopyOptionsPreference();
   }
   if (requestId !== loadSequence) return;
   sourceTabId = tabId;
@@ -296,6 +301,7 @@ async function loadConversationForTab(tabId: number): Promise<void> {
 async function init(): Promise<void> {
   settings = await loadSettings();
   applyTheme(settings.theme);
+  applyCopyOptionsPreference();
 
   const storedTarget = await chrome.storage.local.get(PANEL_TARGET_TAB_KEY);
   const requestedTabId = storedTarget[PANEL_TARGET_TAB_KEY];
@@ -374,30 +380,79 @@ copyBtn.addEventListener("click", () => {
 });
 
 copyMenuToggle.addEventListener("click", () => {
+  if (settings?.keepCopyOptionsOpen) return;
   const open = copyMenuToggle.getAttribute("aria-expanded") !== "true";
-  copyOptions.hidden = !open;
-  copyControl.classList.toggle("open", open);
-  copyMenuToggle.setAttribute("aria-expanded", String(open));
+  setCopyOptionsExpanded(open);
 });
 
 copyLatestBtn.addEventListener("click", () => {
-  if (!conversationData || !settings) {
+  closeCopyOptions();
+  if (!settings?.keepCopyOptionsOpen) copyMenuToggle.focus();
+  void copyLatestAnswer();
+});
+
+async function copyLatestAnswer(): Promise<void> {
+  const tabId = sourceTabId;
+  const copySettings = settings;
+  const requestId = loadSequence;
+  if (tabId === null || !copySettings) {
     showToast(t("popup.error.loadFailed"));
     return;
   }
 
-  const latestAnswer = [...conversationData.messages]
-    .reverse()
-    .find((message) => message.role === "assistant");
+  setBusy(true);
+  showLoading(t("popup.loading"));
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab.url?.startsWith("https://chatgpt.com/")) {
+      throw new Error(t("popup.error.notChatGpt"));
+    }
 
-  closeCopyOptions();
-  copyMenuToggle.focus();
-  if (!latestAnswer) {
-    showToast(t("popup.error.noAssistantAnswer"));
-    return;
+    // Copying text does not need export-only image fallbacks. Excluding them
+    // also prevents an older unpaired generated image from appearing after
+    // the latest text answer and being mistaken for that answer.
+    const response = await requestConversation(
+      tabId,
+      false,
+      false,
+      false,
+      undefined,
+      true,
+    );
+    if (requestId !== loadSequence || sourceTabId !== tabId) return;
+    if (!response?.success || !response.data) {
+      throw new Error(response?.error ?? t("popup.error.loadFailed"));
+    }
+    if (response.data.messages.length === 0) {
+      throw new Error(t("popup.error.noMessages"));
+    }
+
+    conversationData = response.data;
+    pageTitle = tab.title ?? pageTitle;
+    const latestAnswer = [...response.data.messages]
+      .reverse()
+      .find((message) =>
+        message.role === "assistant" && message.content.trim().length > 0
+      );
+    if (!latestAnswer) {
+      showToast(t("popup.error.noAssistantAnswer"));
+      return;
+    }
+
+    hideLoading();
+    await copyMessages([latestAnswer], { includeRoleHeadings: false });
+  } catch (error) {
+    if (requestId !== loadSequence || sourceTabId !== tabId) return;
+    devError("Failed to refresh conversation for latest-answer copy:", error);
+    const message = error instanceof Error ? error.message : "";
+    showToast(message || t("popup.error.loadFailed"), 5000);
+  } finally {
+    if (requestId === loadSequence && sourceTabId === tabId) {
+      hideLoading();
+      setBusy(false);
+    }
   }
-  void copyMessages([latestAnswer], { includeRoleHeadings: false });
-});
+}
 
 copySelectBtn.addEventListener("click", () => {
   closeCopyOptions();
@@ -409,16 +464,48 @@ copySelectBtn.addEventListener("click", () => {
 });
 
 function closeCopyOptions(): void {
-  copyOptions.hidden = true;
-  copyControl.classList.remove("open");
-  copyMenuToggle.setAttribute("aria-expanded", "false");
+  setCopyOptionsExpanded(false);
+}
+
+function setCopyOptionsExpanded(expanded: boolean): void {
+  const keepExpanded = settings?.keepCopyOptionsOpen === true;
+  const isExpanded = keepExpanded || expanded;
+  copyOptions.hidden = !isExpanded;
+  copyControl.classList.toggle("open", isExpanded);
+  copyMenuToggle.setAttribute("aria-expanded", String(isExpanded));
+  const ariaLabelKey = keepExpanded
+    ? "popup.copyOptions.alwaysOpen"
+    : "popup.copyOptions.toggle";
+  copyMenuToggle.dataset.i18nAriaLabel = ariaLabelKey;
+  copyMenuToggle.setAttribute("aria-label", t(ariaLabelKey));
+  copyMenuToggle.setAttribute("aria-disabled", String(keepExpanded));
+}
+
+function applyCopyOptionsPreference(): void {
+  setCopyOptionsExpanded(
+    copyMenuToggle.getAttribute("aria-expanded") === "true",
+  );
 }
 
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !copyOptions.hidden) {
+  if (
+    event.key === "Escape" &&
+    !copyOptions.hidden &&
+    !settings?.keepCopyOptionsOpen
+  ) {
     closeCopyOptions();
     copyMenuToggle.focus();
   }
+});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== "sync" || !changes.keepCopyOptionsOpen || !settings) return;
+  const wasExpanded = !copyOptions.hidden;
+  settings = {
+    ...settings,
+    keepCopyOptionsOpen: changes.keepCopyOptionsOpen.newValue === true,
+  };
+  setCopyOptionsExpanded(wasExpanded);
 });
 
 // -----------------------------------------------------------------------
@@ -435,19 +522,23 @@ exportBtn.addEventListener("click", () => {
 });
 
 async function refreshConversationForExport(): Promise<void> {
-  if (!settings || sourceTabId === null) return;
+  const requestId = loadSequence;
+  const tabId = sourceTabId;
+  const exportSettings = settings;
+  if (!exportSettings || tabId === null) return;
 
   setBusy(true);
   showLoading(t("popup.loading"));
   try {
     const response = await requestConversation(
-      sourceTabId,
-      settings.downloadImages,
-      settings.includeGeneratedImages,
+      tabId,
+      exportSettings.downloadImages,
+      exportSettings.includeGeneratedImages,
       false,
       undefined,
       true,
     );
+    if (requestId !== loadSequence || sourceTabId !== tabId) return;
     if (!response?.success || !response.data) {
       throw new Error(response?.error ?? t("popup.error.loadFailed"));
     }
@@ -455,17 +546,21 @@ async function refreshConversationForExport(): Promise<void> {
       throw new Error(t("popup.error.noMessages"));
     }
 
+    const tab = await chrome.tabs.get(tabId);
+    if (requestId !== loadSequence || sourceTabId !== tabId) return;
     conversationData = response.data;
-    const tab = await chrome.tabs.get(sourceTabId);
     pageTitle = tab.title ?? pageTitle;
     openSelector(true);
   } catch (error) {
+    if (requestId !== loadSequence || sourceTabId !== tabId) return;
     const message = error instanceof Error ? error.message : "";
     devError("Failed to refresh conversation for export:", error);
     showToast(message || t("popup.error.loadFailed"), 5000);
   } finally {
-    hideLoading();
-    setBusy(false);
+    if (requestId === loadSequence && sourceTabId === tabId) {
+      hideLoading();
+      setBusy(false);
+    }
   }
 }
 
@@ -674,6 +769,7 @@ async function prepareDiagramMessages(
           sourceContent,
           mode,
           assets.length + 1,
+          message.svgBackgroundColor,
         );
     prepared.push({
       ...message,
@@ -801,6 +897,10 @@ async function copyMessages(
   try {
     const prepared = await prepareDiagramMessages(messages, "text");
     const markdown = formatMarkdown(prepared.messages, settings, options);
+    if (!markdown.trim()) {
+      showToast(t("popup.error.noCopyableContent"));
+      return;
+    }
     await writeClipboard(markdown);
     showToast(t("popup.toast.copied"));
   } catch (err) {
@@ -980,6 +1080,7 @@ async function writeClipboard(text: string): Promise<void> {
   const response = await chrome.runtime.sendMessage({
     type: "COPY_TO_CLIPBOARD",
     text,
+    tabId: sourceTabId ?? undefined,
   }) as { success?: boolean; error?: string } | undefined;
 
   if (!response?.success) {

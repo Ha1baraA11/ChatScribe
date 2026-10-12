@@ -55,7 +55,7 @@ const API_PAGE_TIMEOUT_MS = 30_000;
 const IMAGE_TIMEOUT_MS = 60_000;
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024; // 20 MB
 const CONVERSATION_CACHE_TTL_MS = 2 * 60_000;
-const MAX_CONCURRENT_IMAGE_DOWNLOADS = 4;
+const MAX_CONCURRENT_IMAGE_DOWNLOADS = 2;
 
 // -----------------------------------------------------------------------
 // BRIDGE STATE
@@ -146,6 +146,7 @@ interface ImageResource {
   fileId?: string;
   scheme?: "file-service" | "sediment";
   inlineSvgDataUrl?: string;
+  svgBackgroundColor?: string;
   inlineImageDataUrl?: string;
   filename?: string;
   renderedFromDom?: boolean;
@@ -187,7 +188,13 @@ function requestConversationPage(
         done = true;
         window.clearTimeout(timer);
         window.removeEventListener("message", handler);
-        resolve(normalizePage(d.data as ApiConversationPage));
+        try {
+          resolve(normalizePage(d.data));
+        } catch (error) {
+          reject(error instanceof Error
+            ? error
+            : new Error("ChatGPT returned an invalid conversation page."));
+        }
       }
     };
 
@@ -270,14 +277,24 @@ function requestImage(
 // NORMALIZE API PAGE (handle both flat and tree formats)
 // -----------------------------------------------------------------------
 
-function normalizePage(page: ApiConversationPage): ApiConversationPage {
-  if (page.mapping) {
+function normalizePage(value: unknown): ApiConversationPage {
+  if (!isRecord(value)) {
+    throw new Error("ChatGPT returned an invalid conversation page.");
+  }
+
+  const page = value as ApiConversationPage;
+  if (page.mapping !== undefined && isRecord(page.mapping)) {
     // Tree / mapping format — flatten into messages array
     const messages: ApiMessage[] = [];
 
-    for (const [nodeId, node] of Object.entries(
-      page.mapping as Record<string, ApiMappingNode>,
-    )) {
+    for (const [nodeId, rawNode] of Object.entries(page.mapping)) {
+      if (!isRecord(rawNode)) {
+        throw new Error("ChatGPT returned an invalid conversation node.");
+      }
+      const node = rawNode as ApiMappingNode;
+      if (node.message !== null && node.message !== undefined && !isRecord(node.message)) {
+        throw new Error("ChatGPT returned an invalid conversation message.");
+      }
       if (!node.message) {
         // Phantom node with no message (e.g. root placeholder)
         messages.push({
@@ -288,35 +305,50 @@ function normalizePage(page: ApiConversationPage): ApiConversationPage {
         continue;
       }
 
+      const message = node.message as ApiMessage;
       messages.push({
-        ...node.message,
-        id: node.message.id ?? nodeId,
-        parent: node.parent !== undefined ? node.parent : node.message.parent,
-        children: node.children ?? node.message.children ?? [],
+        ...message,
+        id: message.id ?? nodeId,
+        parent: node.parent !== undefined ? node.parent : message.parent,
+        children: node.children ?? message.children ?? [],
       });
     }
 
     return { ...page, messages };
   }
 
+  if (page.messages !== undefined && !Array.isArray(page.messages)) {
+    throw new Error("ChatGPT returned an invalid conversation message list.");
+  }
+
   // Some responses nest the actual message inside a "message" property
   const raw = page.messages ?? [];
+  if (!raw.every(isRecord)) {
+    throw new Error("ChatGPT returned an invalid conversation message.");
+  }
+  if (raw.some((node) =>
+    node.message !== null && node.message !== undefined && !isRecord(node.message)
+  )) {
+    throw new Error("ChatGPT returned an invalid nested conversation message.");
+  }
+
   const hasNested = raw.some(
     (m) => m.message !== null && m.message !== undefined,
   );
 
-  if (!hasNested) return page;
+  if (!hasNested) return { ...page, messages: raw as ApiMessage[] };
 
   const flat: ApiMessage[] = raw.map((node) => {
-    const inner = node.message ?? {};
+    const outer = node as unknown as ApiMappingNode;
+    const inner = (node.message as ApiMessage | null | undefined) ?? {};
     return {
       ...inner,
-      id: inner.id ?? node.id,
-      parent: (node as unknown as ApiMappingNode).parent !== undefined
-        ? (node as unknown as ApiMappingNode).parent
+      id: inner.id ?? outer.id,
+      parent: outer.parent !== undefined
+        ? outer.parent
         : inner.parent,
       children:
-        (node as unknown as ApiMappingNode).children ??
+        outer.children ??
         inner.children ??
         [],
     };
@@ -504,6 +536,9 @@ function getImageResources(
       mergeResource({
         key: inlineSvgKey,
         inlineSvgDataUrl,
+        svgBackgroundColor: getSafeRenderedSvgBackgroundColor(
+          value.rendered_svg_background_color,
+        ) ?? undefined,
         renderedFromDom: value.rendered_from_dom === true,
       });
     }
@@ -540,6 +575,7 @@ function getImageResources(
           ...existing,
           ...resource,
           imageUrl: resource.imageUrl ?? existing.imageUrl,
+          svgBackgroundColor: resource.svgBackgroundColor ?? existing.svgBackgroundColor,
           filename: resource.filename ?? existing.filename,
           renderedFromDom: resource.renderedFromDom || existing.renderedFromDom,
           downloadLink: resource.downloadLink || existing.downloadLink,
@@ -576,7 +612,25 @@ function getImageResources(
   }
 
   if (includeRenderedImageParts && msg.id) {
-    visit(getRenderedImagePartsForMessage(msg.id), 0);
+    const renderedParts = getRenderedImagePartsForMessage(msg.id);
+    visit(renderedParts, 0);
+
+    // The API resource and rendered DOM image can use different keys for the
+    // same SVG. Apply the page background to every SVG in this message so the
+    // API copy cannot be rasterized with a mismatched white backdrop.
+    const svgBackgroundColor = renderedParts
+      .map((part) => getSafeRenderedSvgBackgroundColor(
+        part.rendered_svg_background_color,
+      ))
+      .find((color): color is string => color !== null) ??
+      getRenderedMessageSvgBackgroundColor(msg.id);
+    if (svgBackgroundColor) {
+      for (const resource of resources.values()) {
+        if (resource.inlineSvgDataUrl && !resource.svgBackgroundColor) {
+          resource.svgBackgroundColor = svgBackgroundColor;
+        }
+      }
+    }
   }
 
   const result = deduplicateNamedImageResources([...resources.values()]);
@@ -688,6 +742,9 @@ function imageResourceToPart(
   if (resource.inlineSvgDataUrl) {
     part.rendered_svg_data_url = resource.inlineSvgDataUrl;
     part.rendered_svg_key = resource.key;
+    if (resource.svgBackgroundColor) {
+      part.rendered_svg_background_color = resource.svgBackgroundColor;
+    }
   }
   if (resource.inlineImageDataUrl) {
     part.inline_image_data_url = resource.inlineImageDataUrl;
@@ -776,6 +833,58 @@ function getSafeRenderedSvgDataUrl(value: unknown): string | null {
     : null;
 }
 
+function getSafeRenderedSvgBackgroundColor(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const match = value.match(
+    /^rgb\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)$/i,
+  );
+  if (!match) return null;
+
+  const [red, green, blue] = match.slice(1).map(Number);
+  if ([red, green, blue].some((channel) => channel > 255)) return null;
+  const linearize = (channel: number): number => {
+    const normalized = channel / 255;
+    return normalized <= 0.04045
+      ? normalized / 12.92
+      : ((normalized + 0.055) / 1.055) ** 2.4;
+  };
+  const luminance =
+    0.2126 * linearize(red) +
+    0.7152 * linearize(green) +
+    0.0722 * linearize(blue);
+  return luminance < 0.4 ? `rgb(${red}, ${green}, ${blue})` : null;
+}
+
+function getRenderedSvgBackgroundColor(element: Element): string | null {
+  let current: Element | null = element;
+  while (current) {
+    const backgroundColor = window.getComputedStyle(current).backgroundColor;
+    const match = backgroundColor.match(
+      /^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})(?:\s*,\s*([\d.]+))?\s*\)$/i,
+    );
+    if (match) {
+      const alpha = match[4] === undefined ? 1 : Number(match[4]);
+      if (alpha >= 0.999) {
+        return getSafeRenderedSvgBackgroundColor(
+          `rgb(${match[1]}, ${match[2]}, ${match[3]})`,
+        );
+      }
+    }
+    current = current.parentElement;
+  }
+  return null;
+}
+
+function getRenderedMessageSvgBackgroundColor(messageId: string): string | null {
+  for (const element of document.querySelectorAll<HTMLElement>(
+    "[data-dil-message-id], [data-message-id], [data-chatgpt-search-message-ids]",
+  )) {
+    if (!getRenderedMessageIds(element).includes(messageId)) continue;
+    return getRenderedSvgBackgroundColor(element);
+  }
+  return null;
+}
+
 function getImageUrlFromPart(part: Record<string, unknown>): string | null {
   const imageUrl = part.image_url ?? part.download_url ?? part.downloadUrl;
   if (typeof imageUrl === "string") {
@@ -805,9 +914,13 @@ function getRenderedImagePartsForMessage(
       const src = image.currentSrc || image.src;
       const filename = getRenderedImageFilename(image, element);
       if (image.dataset.dComponent === "svg" && getSafeRenderedSvgDataUrl(src)) {
+        const svgBackgroundColor = getRenderedSvgBackgroundColor(image);
         parts.push({
           rendered_svg_data_url: src,
           rendered_svg_key: `rendered-svg:${messageId}:${svgIndex++}`,
+          ...(svgBackgroundColor
+            ? { rendered_svg_background_color: svgBackgroundColor }
+            : {}),
           rendered_from_dom: 1,
           ...(filename ? { image_filename: filename } : {}),
         });
@@ -1172,9 +1285,13 @@ function getUnattachedRenderedGeneratedImages(
         const src = image.currentSrc || image.src;
         const filename = getRenderedImageFilename(image, element);
         if (image.dataset.dComponent === "svg" && getSafeRenderedSvgDataUrl(src)) {
+          const svgBackgroundColor = getRenderedSvgBackgroundColor(image);
           fallbackParts.push({
             rendered_svg_data_url: src,
             rendered_svg_key: `rendered-svg:${sourceId}:${svgIndex++}`,
+            ...(svgBackgroundColor
+              ? { rendered_svg_background_color: svgBackgroundColor }
+              : {}),
             rendered_from_dom: 1,
             ...(filename ? { image_filename: filename } : {}),
           });
@@ -1602,6 +1719,7 @@ async function doLoadConversation(
       if (role !== "user" && role !== "assistant") return null;
 
       const text = extractText(msg);
+      const svgBackgroundColor = getRenderedMessageSvgBackgroundColor(msg.id);
       const imagePaths: string[] = [];
       const renderedDiagramPaths: string[] = [];
       const localImagePathsByFilename = new Map<string, string>();
@@ -1624,7 +1742,10 @@ async function doLoadConversation(
               limitedDownload(async () => {
                 try {
                   const inlineSvgBase64 = resource.inlineSvgDataUrl
-                    ? await renderSvgDataUrlToPngBase64(resource.inlineSvgDataUrl)
+                    ? await renderSvgDataUrlToPngBase64(
+                        resource.inlineSvgDataUrl,
+                        resource.svgBackgroundColor,
+                      )
                     : null;
                   if (resource.inlineSvgDataUrl && !inlineSvgBase64) {
                     throw new Error("Could not render ChatGPT's SVG diagram.");
@@ -1740,6 +1861,7 @@ async function doLoadConversation(
         id: msg.id,
         role,
         content,
+        ...(svgBackgroundColor ? { svgBackgroundColor } : {}),
         ...(imageMarkdownContent !== content ? { imageMarkdownContent } : {}),
         ...(renderedAttachmentPaths.length > 0
           ? { renderedImageFallbackPaths: [...new Set(renderedAttachmentPaths)] }

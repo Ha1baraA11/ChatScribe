@@ -48,6 +48,9 @@ export async function loadSettings(): Promise<Settings> {
     includeGeneratedImages: typeof stored.includeGeneratedImages === "boolean"
       ? stored.includeGeneratedImages
       : defaults.includeGeneratedImages as boolean,
+    keepCopyOptionsOpen: typeof stored.keepCopyOptionsOpen === "boolean"
+      ? stored.keepCopyOptionsOpen
+      : defaults.keepCopyOptionsOpen as boolean,
     panelMode: isPanelMode(stored.panelMode)
       ? stored.panelMode
       : defaults.panelMode as Settings["panelMode"],

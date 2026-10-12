@@ -303,16 +303,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           text: message.text,
         });
       } else {
-        // Firefox does not expose Chrome's Offscreen API. Use the active
-        // ChatGPT content script's document clipboard instead.
-        const [tab] = await chrome.tabs.query({
-          active: true,
-          currentWindow: true,
-        });
-        if (tab?.id === undefined) {
-          throw new Error("No active tab is available for clipboard access.");
+        // Firefox does not expose Chrome's Offscreen API. Copy through the
+        // ChatGPT tab currently represented by the persistent panel, which
+        // may no longer be the browser's active tab.
+        const tabId = message.tabId;
+        if (!Number.isInteger(tabId)) {
+          throw new Error("No ChatGPT tab is available for clipboard access.");
         }
-        result = await chrome.tabs.sendMessage(tab.id, {
+        const tab = await chrome.tabs.get(tabId as number);
+        if (!tab.url?.startsWith("https://chatgpt.com/")) {
+          throw new Error("Open a ChatGPT conversation before copying.");
+        }
+        result = await chrome.tabs.sendMessage(tabId as number, {
           type: "COPY_TO_CLIPBOARD",
           text: message.text,
         });

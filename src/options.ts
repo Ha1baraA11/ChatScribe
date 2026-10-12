@@ -46,6 +46,7 @@ const promptToSaveInput = $id<HTMLInputElement>("promptToSave");
 const downloadImagesInput = $id<HTMLInputElement>("downloadImages");
 const includeGeneratedImagesInput = $id<HTMLInputElement>("includeGeneratedImages");
 const includeTimestampInput = $id<HTMLInputElement>("includeTimestamp");
+const keepCopyOptionsOpenInput = $id<HTMLInputElement>("keepCopyOptionsOpen");
 const themeSelect = $id<HTMLSelectElement>("theme-select");
 const panelModeSelect = $id<HTMLSelectElement>("panelMode");
 const languageSelect = $id<HTMLSelectElement>("language-select");
@@ -101,6 +102,7 @@ function populateForm(settings: Settings): void {
   downloadImagesInput.checked = settings.downloadImages;
   includeGeneratedImagesInput.checked = settings.includeGeneratedImages;
   includeTimestampInput.checked = settings.includeTimestamp;
+  keepCopyOptionsOpenInput.checked = settings.keepCopyOptionsOpen;
 
   themeSelect.value = settings.theme;
   panelModeSelect.value = settings.panelMode;
@@ -120,6 +122,7 @@ function gatherSettings(): Settings {
     downloadImages: downloadImagesInput.checked,
     includeGeneratedImages: includeGeneratedImagesInput.checked,
     includeTimestamp: includeTimestampInput.checked,
+    keepCopyOptionsOpen: keepCopyOptionsOpenInput.checked,
     theme: themeSelect.value as Settings["theme"],
     panelMode: panelModeSelect.value as Settings["panelMode"],
     language: languageSelect.value as Settings["language"],

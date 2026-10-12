@@ -30,6 +30,8 @@
     "oaiusercontent.com",
     "oaistatic.com",
   ]);
+  const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+  const MAX_RESOLVER_RESPONSE_BYTES = 64 * 1024;
 
   // Captured authentication headers from ChatGPT's own requests
   let capturedHeaders: Headers | null = null;
@@ -49,17 +51,24 @@
 
       const isConvRequest = CONV_API_RE.test(url);
 
-      if (isConvRequest && !capturedHeaders) {
-        const rawHeaders =
-          input instanceof Request ? new Headers(input.headers)
-          : init?.headers ? new Headers(init.headers as HeadersInit)
-          : null;
-
-        if (rawHeaders) {
-          capturedHeaders = rawHeaders;
-          // Notify content.ts that auth context is now available
-          window.postMessage({ source: SOURCE, type: "AUTH_READY" }, "*");
+      if (isConvRequest && (input instanceof Request || init?.headers !== undefined)) {
+        const requestHeaders = input instanceof Request
+          ? new Headers(input.headers)
+          : new Headers();
+        if (init?.headers !== undefined) {
+          new Headers(init.headers as HeadersInit).forEach((value, name) => {
+            requestHeaders.set(name, value);
+          });
         }
+
+        // ChatGPT can rotate authentication headers while a tab remains open.
+        // Refresh observed values on every conversation request, while keeping
+        // headers that the current request omitted but the bridge still needs.
+        const refreshedHeaders = new Headers(capturedHeaders ?? undefined);
+        requestHeaders.forEach((value, name) => refreshedHeaders.set(name, value));
+        capturedHeaders = refreshedHeaders;
+        // Notify content.ts that auth context is now available.
+        window.postMessage({ source: SOURCE, type: "AUTH_READY" }, "*");
       }
     } catch {
       // Never break the real fetch
@@ -233,8 +242,24 @@
       if (resolverDepth >= 2) {
         throw new Error("Image resolver returned too many redirects.");
       }
-      const payload = await response.json() as Record<string, unknown>;
-      const resolvedUrl = getSafeImageUrl(payload.download_url ?? payload.url);
+      const resolverBytes = await readBoundedResponseBytes(
+        response,
+        MAX_RESOLVER_RESPONSE_BYTES,
+        "Image resolver response exceeds the size limit.",
+      );
+      let payload: unknown;
+      try {
+        payload = JSON.parse(new TextDecoder().decode(resolverBytes));
+      } catch {
+        throw new Error("Image resolver returned invalid JSON.");
+      }
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new Error("Image resolver returned invalid data.");
+      }
+      const resolverData = payload as Record<string, unknown>;
+      const resolvedUrl = getSafeImageUrl(
+        resolverData.download_url ?? resolverData.url,
+      );
       if (!resolvedUrl) throw new Error("Image resolver returned an unsafe URL.");
       return fetchImageUrl(resolvedUrl, resolverDepth + 1);
     }
@@ -248,21 +273,82 @@
       throw new Error("ChatGPT returned a non-image attachment.");
     }
 
-    const blob = await response.blob();
-    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const bytes = await readBoundedResponseBytes(
+      response,
+      MAX_IMAGE_BYTES,
+      "Image exceeds the 20 MB export limit.",
+    );
     if (bytes.length === 0) throw new Error("ChatGPT returned an empty image.");
 
-    const CHUNK = 8192;
-    let binary = "";
-    for (let i = 0; i < bytes.length; i += CHUNK) {
-      binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-    }
-
     return {
-      base64: btoa(binary),
+      base64: bytesToBase64(bytes),
       mimeType: mimeType || "image/png",
       sizeBytes: bytes.length,
     };
+  }
+
+  function bytesToBase64(bytes: Uint8Array): string {
+    // Keep the temporary binary string small. Chunk sizes are multiples of 3
+    // so concatenating the Base64 segments does not introduce mid-stream padding.
+    const chunkSize = 3 * 8192;
+    let base64 = "";
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      const chunk = bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length));
+      let binary = "";
+      for (let index = 0; index < chunk.length; index += 8192) {
+        binary += String.fromCharCode(...chunk.subarray(index, index + 8192));
+      }
+      base64 += btoa(binary);
+    }
+    return base64;
+  }
+
+  async function readBoundedResponseBytes(
+    response: Response,
+    maxBytes: number,
+    limitError: string,
+  ): Promise<Uint8Array> {
+    const contentLength = response.headers.get("content-length");
+    if (contentLength) {
+      const declaredSize = Number(contentLength);
+      if (Number.isFinite(declaredSize) && declaredSize > maxBytes) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new Error(limitError);
+      }
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) {
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      if (bytes.length > maxBytes) throw new Error(limitError);
+      return bytes;
+    }
+
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        totalBytes += value.byteLength;
+        if (totalBytes > maxBytes) {
+          await reader.cancel().catch(() => undefined);
+          throw new Error(limitError);
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    const bytes = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    chunks.length = 0;
+    return bytes;
   }
 
   async function fetchImageUrl(value: string, resolverDepth = 0): Promise<{

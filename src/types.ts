@@ -14,6 +14,8 @@ export interface ExportMessage {
   role: "user" | "assistant";
   /** Markdown text content. */
   content: string;
+  /** Dark page background used to preserve contrast when exporting SVG diagrams. */
+  svgBackgroundColor?: string;
   /** Markdown-only content with temporary ChatGPT image links rewritten to bundled paths. */
   imageMarkdownContent?: string;
   /** Rendered page images without filenames, kept for sandbox-link matching. */
@@ -130,6 +132,7 @@ export interface Settings {
   promptToSave: boolean;
   downloadImages: boolean;
   includeGeneratedImages: boolean;
+  keepCopyOptionsOpen: boolean;
   theme: ThemeStyle;
   panelMode: PanelMode;
   language: LanguageCode;
@@ -142,6 +145,7 @@ export const DEFAULT_SETTINGS: Settings = {
   promptToSave: true,
   downloadImages: false,
   includeGeneratedImages: true,
+  keepCopyOptionsOpen: false,
   theme: "system",
   panelMode: "popup",
   language: "auto",
@@ -166,7 +170,7 @@ export type ChromeMessage =
       forceRefresh?: boolean;
       selectedMessageIds?: string[];
     }
-  | { type: "COPY_TO_CLIPBOARD"; text: string }
+  | { type: "COPY_TO_CLIPBOARD"; text: string; tabId?: number }
   | { type: "SHOW_EXPORT_SUCCESS"; message: string }
   | { type: "EXPORT_PROGRESS"; collected: number }
   | { type: "DOWNLOAD_COMPLETE" }
