@@ -69,12 +69,12 @@ describe("SVG diagram export", () => {
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:svg");
   });
 
-  it("keeps unsafe SVG markup intact instead of exporting it", async () => {
+  it("replaces unsafe SVG markup with a text fallback", async () => {
     const unsafeDiagram =
       '<box><svg viewBox="0 0 10 10"><script>alert(1)</script></svg></box>';
     const result = await renderSvgTemplatesAsMarkdown(unsafeDiagram, "assets");
 
-    expect(result.markdown).toBe(unsafeDiagram);
+    expect(result.markdown).toBe("[Diagram could not be rendered]");
     expect(result.assets).toEqual([]);
   });
 

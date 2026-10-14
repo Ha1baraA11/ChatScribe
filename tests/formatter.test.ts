@@ -34,7 +34,7 @@ describe("formatter", () => {
   it("formats markdown with h2 headings", () => {
     const output = formatMarkdown(sampleMessages, DEFAULT_SETTINGS);
     expect(output).toContain("## User\n\nHello, write a simple Python function.");
-    expect(output).toContain("## Assistant\n\nHere is your function:");
+    expect(output).toContain("**Assistant:**\n\nHere is your function:");
   });
 
   it("formats markdown with bold labels", () => {
