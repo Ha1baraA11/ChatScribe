@@ -4,6 +4,7 @@
   <p><strong>複製或匯出 chatgpt.com 上的對話。</strong><br />
   可複製整段對話、最近一則回答，或自行選取的訊息。</p>
   <p>支援 Markdown、純文字、JSON 和 CSV，也可將 Markdown 匯出內容儲存至 GitHub。</p>
+  <p><a href="https://chrome.google.com/webstore/detail/aapnhkibnnhppanchcfngalkkojjfcmf">在 Chrome 線上應用程式商店取得 ChatScribe</a></p>
   <p><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README_ja.md">日本語</a> · <a href="README_ko.md">한국어</a> · <a href="README_es.md">Español</a> · <a href="README_pt-BR.md">Português (Brasil)</a> · <a href="README_ru.md">Русский</a> · <a href="README_fr.md">Français</a> · <a href="README_de.md">Deutsch</a></p>
 </div>
 

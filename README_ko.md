@@ -4,6 +4,7 @@
   <p><strong>chatgpt.com 대화를 복사하거나 내보내세요.</strong><br />
   전체 대화, 최신 답변 또는 선택한 메시지만 복사할 수 있습니다.</p>
   <p>Markdown, 텍스트, JSON, CSV로 저장하거나 Markdown 내보내기를 GitHub에 저장할 수 있습니다.</p>
+  <p><a href="https://chrome.google.com/webstore/detail/aapnhkibnnhppanchcfngalkkojjfcmf">Chrome 웹 스토어에서 ChatScribe 설치</a></p>
   <p><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README_ja.md">日本語</a> · <a href="README_ko.md">한국어</a> · <a href="README_es.md">Español</a> · <a href="README_pt-BR.md">Português (Brasil)</a> · <a href="README_ru.md">Русский</a> · <a href="README_fr.md">Français</a> · <a href="README_de.md">Deutsch</a></p>
 </div>
 

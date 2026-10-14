@@ -4,6 +4,7 @@
   <p><strong>Copia o exporta conversaciones de chatgpt.com.</strong><br />
   Copia la conversación completa, la respuesta más reciente o los mensajes que elijas.</p>
   <p>Descarga en Markdown, texto, JSON o CSV, o guarda una exportación Markdown en GitHub.</p>
+  <p><a href="https://chrome.google.com/webstore/detail/aapnhkibnnhppanchcfngalkkojjfcmf">Instala ChatScribe desde Chrome Web Store</a></p>
   <p><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README_ja.md">日本語</a> · <a href="README_ko.md">한국어</a> · <a href="README_es.md">Español</a> · <a href="README_pt-BR.md">Português (Brasil)</a> · <a href="README_ru.md">Русский</a> · <a href="README_fr.md">Français</a> · <a href="README_de.md">Deutsch</a></p>
 </div>
 

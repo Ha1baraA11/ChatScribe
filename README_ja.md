@@ -4,6 +4,7 @@
   <p><strong>chatgpt.com の会話をコピーまたはエクスポートできます。</strong><br />
   会話全体、最新の回答、または選択したメッセージをコピーできます。</p>
   <p>Markdown、テキスト、JSON、CSV で保存でき、Markdown は GitHub にも保存できます。</p>
+  <p><a href="https://chrome.google.com/webstore/detail/aapnhkibnnhppanchcfngalkkojjfcmf">Chrome ウェブストアから ChatScribe を入手</a></p>
   <p><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README_ja.md">日本語</a> · <a href="README_ko.md">한국어</a> · <a href="README_es.md">Español</a> · <a href="README_pt-BR.md">Português (Brasil)</a> · <a href="README_ru.md">Русский</a> · <a href="README_fr.md">Français</a> · <a href="README_de.md">Deutsch</a></p>
 </div>
 

@@ -4,6 +4,7 @@
   <p><strong>Копируйте и экспортируйте переписки с chatgpt.com.</strong><br />
   Можно скопировать всю переписку, последний ответ или выбранные сообщения.</p>
   <p>Скачивайте переписку в Markdown, текстовом формате, JSON или CSV либо сохраняйте Markdown в GitHub.</p>
+  <p><a href="https://chrome.google.com/webstore/detail/aapnhkibnnhppanchcfngalkkojjfcmf">Установить ChatScribe из Интернет-магазина Chrome</a></p>
   <p><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README_ja.md">日本語</a> · <a href="README_ko.md">한국어</a> · <a href="README_es.md">Español</a> · <a href="README_pt-BR.md">Português (Brasil)</a> · <a href="README_ru.md">Русский</a> · <a href="README_fr.md">Français</a> · <a href="README_de.md">Deutsch</a></p>
 </div>
 
