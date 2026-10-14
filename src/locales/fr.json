@@ -64,6 +64,8 @@
   "popup.error.githubFailed": "Impossible d'enregistrer sur GitHub",
   "options.title": "Paramètres de ChatScribe",
   "options.subtitle": "Personnalisez l’apparence et le comportement d’exportation de ChatScribe.",
+  "options.preferences.legend": "Préférences",
+  "options.formatting.legend": "Format des messages",
   "options.headings.legend": "En-têtes des messages",
   "options.headings.h2": "Regrouper chaque échange sous un titre User",
   "options.headings.bold": "Étiquette en gras (**Utilisateur:**)",

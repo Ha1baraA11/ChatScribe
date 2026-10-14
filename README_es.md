@@ -20,7 +20,7 @@
 - Guarda una exportación Markdown en el directorio `exports/` del repositorio de GitHub que elijas. Si incluye imágenes, se guarda como ZIP.
 - Configura el tema, el idioma de la interfaz, los encabezados y el espacio entre mensajes, las marcas de tiempo, la confirmación de descarga y el empaquetado de imágenes.
 
-La interfaz está disponible en inglés, chino, alemán, español, francés y ruso. Detecta automáticamente un idioma compatible del navegador; si no lo está, usa inglés.
+La interfaz está disponible en inglés, chino simplificado y tradicional, alemán, español, francés, japonés, coreano, portugués de Brasil y ruso. Detecta automáticamente un idioma compatible del navegador; si no lo está, usa inglés.
 
 ## Instalación desde el código fuente
 

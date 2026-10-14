@@ -64,6 +64,8 @@
   "popup.error.githubFailed": "无法保存到 GitHub",
   "options.title": "ChatScribe 设置",
   "options.subtitle": "自定义 ChatScribe 的显示方式和导出行为。",
+  "options.preferences.legend": "偏好设置",
+  "options.formatting.legend": "消息格式",
   "options.headings.legend": "消息标题",
   "options.headings.h2": "按 User 标题分组每轮问答",
   "options.headings.bold": "粗体标签 (**User:**)",

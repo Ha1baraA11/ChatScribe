@@ -16,9 +16,23 @@ import es from "./locales/es.json";
 import fr from "./locales/fr.json";
 import de from "./locales/de.json";
 import ru from "./locales/ru.json";
+import ja from "./locales/ja.json";
+import ko from "./locales/ko.json";
+import ptBR from "./locales/pt-BR.json";
+import zhTW from "./locales/zh-TW.json";
 
 type LocaleBundle = Record<string, string>;
-type SupportedLocale = "en" | "zh" | "es" | "fr" | "de" | "ru";
+type SupportedLocale =
+  | "en"
+  | "zh"
+  | "zh-TW"
+  | "es"
+  | "fr"
+  | "de"
+  | "ru"
+  | "ja"
+  | "ko"
+  | "pt-BR";
 
 const BUNDLES: Record<SupportedLocale, LocaleBundle> = {
   en,
@@ -27,6 +41,10 @@ const BUNDLES: Record<SupportedLocale, LocaleBundle> = {
   fr,
   de,
   ru,
+  ja,
+  ko,
+  "pt-BR": ptBR,
+  "zh-TW": zhTW,
 };
 
 const SUPPORTED = new Set<string>(Object.keys(BUNDLES));
@@ -72,6 +90,22 @@ function isSupportedLocale(v: string): v is SupportedLocale {
   return SUPPORTED.has(v);
 }
 
+function localeForBrowserTag(tag: string): SupportedLocale | undefined {
+  const normalized = tag.trim().replaceAll("_", "-").toLowerCase();
+  const [language, ...subtags] = normalized.split("-");
+
+  if (language === "zh") {
+    return subtags.some((part) => ["tw", "hk", "mo", "hant"].includes(part))
+      ? "zh-TW"
+      : "zh";
+  }
+
+  if (language === "pt") {
+    return subtags.length === 0 || subtags.includes("br") ? "pt-BR" : undefined;
+  }
+  return isSupportedLocale(language) ? language : undefined;
+}
+
 function detectBrowserLocale(): SupportedLocale {
   const candidates: string[] = [];
 
@@ -86,11 +120,16 @@ function detectBrowserLocale(): SupportedLocale {
 
   for (const c of candidates) {
     if (!c) continue;
-    const short = c.slice(0, 2).toLowerCase();
-    if (isSupportedLocale(short)) return short;
+    const locale = localeForBrowserTag(c);
+    if (locale) return locale;
   }
 
   return "en";
+}
+
+/** Use the browser language immediately, without reading the saved preference. */
+export function setLocaleFromBrowser(): void {
+  activeLocale = detectBrowserLocale();
 }
 
 /**
@@ -102,7 +141,7 @@ export async function initI18n(): Promise<void> {
   const pref = String(stored.language ?? "auto");
 
   if (pref === "auto") {
-    activeLocale = detectBrowserLocale();
+    setLocaleFromBrowser();
   } else if (isSupportedLocale(pref)) {
     activeLocale = pref;
   } else {

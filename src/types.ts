@@ -123,7 +123,18 @@ export type HeadingStyle = "h2" | "bold" | "none";
 export type SeparatorStyle = "single" | "double" | "rule";
 export type ThemeStyle = "system" | "light" | "dark";
 export type PanelMode = "popup" | "sidebar";
-export type LanguageCode = "auto" | "en" | "zh" | "es" | "fr" | "de" | "ru";
+export type LanguageCode =
+  | "auto"
+  | "en"
+  | "zh"
+  | "zh-TW"
+  | "es"
+  | "fr"
+  | "de"
+  | "ru"
+  | "ja"
+  | "ko"
+  | "pt-BR";
 
 export interface Settings {
   headingStyle: HeadingStyle;

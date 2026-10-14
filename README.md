@@ -20,7 +20,7 @@
 - Save a Markdown export to the `exports/` directory of a GitHub repository you choose. Exports with images are saved as a ZIP.
 - Set the theme, interface language, message headings and spacing, export timestamps, download prompts, and image bundling.
 
-The interface is available in English, Chinese, German, Spanish, French, and Russian. It can detect a supported browser language and falls back to English otherwise.
+The interface is available in English, Simplified Chinese, Traditional Chinese, German, Spanish, French, Japanese, Korean, Brazilian Portuguese, and Russian. It detects a supported browser language automatically and falls back to English otherwise.
 
 ## Install from source
 

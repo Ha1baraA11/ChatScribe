@@ -64,6 +64,8 @@
   "popup.error.githubFailed": "Could not save to GitHub",
   "options.title": "ChatScribe Settings",
   "options.subtitle": "Customize ChatScribe's appearance and export behavior.",
+  "options.preferences.legend": "Preferences",
+  "options.formatting.legend": "Message formatting",
   "options.headings.legend": "Message Headings",
   "options.headings.h2": "Group each exchange under a User heading",
   "options.headings.bold": "Bold label (**User:**)",

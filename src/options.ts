@@ -9,7 +9,7 @@
  *  - Downloads: prompt to save, bundle images into ZIP
  *  - Timestamps: include export date/time
  *  - Appearance: theme (system, light, dark)
- *  - Language: interface locale (auto, en, zh, es, fr, de, ru)
+ *  - Language: interface locale (auto, en, zh, zh-TW, es, fr, de, ru, ja, ko, pt-BR)
  *  - GitHub connection: Device Flow authentication and status
  */
 
@@ -19,7 +19,13 @@ import {
   loadSettings,
   saveSettings,
 } from "./settings.ts";
-import { initI18n, applyTranslations, setLocale, t } from "./i18n.ts";
+import {
+  initI18n,
+  applyTranslations,
+  setLocale,
+  setLocaleFromBrowser,
+  t,
+} from "./i18n.ts";
 
 const devError = (...args: unknown[]): void => {
   if (import.meta.env.DEV) {
@@ -258,7 +264,8 @@ themeSelect.addEventListener("change", () => {
 
 languageSelect.addEventListener("change", () => {
   if (languageSelect.value === "auto") {
-    void initI18n().then(() => applyTranslations());
+    setLocaleFromBrowser();
+    applyTranslations();
   } else {
     setLocale(languageSelect.value);
     applyTranslations();

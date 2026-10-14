@@ -64,6 +64,8 @@
   "popup.error.githubFailed": "Auf GitHub konnte nicht gespeichert werden",
   "options.title": "ChatScribe-Einstellungen",
   "options.subtitle": "Passen Sie Darstellung und Exportverhalten von ChatScribe an.",
+  "options.preferences.legend": "Einstellungen",
+  "options.formatting.legend": "Nachrichtenformat",
   "options.headings.legend": "Nachrichtenüberschriften",
   "options.headings.h2": "Jeden Austausch unter einer User-Überschrift gruppieren",
   "options.headings.bold": "Fette Beschriftung (**Benutzer:**)",

@@ -20,7 +20,7 @@
 - Einen Markdown-Export im Verzeichnis `exports/` eines GitHub-Repositories deiner Wahl speichern. Enthält der Export Bilder, wird er als ZIP gespeichert.
 - Design, Oberflächensprache, Nachrichtenüberschriften und -abstände, Zeitstempel, Download-Abfrage und Bildpakete konfigurieren.
 
-Die Oberfläche ist auf Englisch, Chinesisch, Deutsch, Spanisch, Französisch und Russisch verfügbar. Die Browsersprache wird automatisch erkannt; bei nicht unterstützten Sprachen wird Englisch verwendet.
+Die Oberfläche ist auf Englisch, vereinfachtem und traditionellem Chinesisch, Deutsch, Spanisch, Französisch, Japanisch, Koreanisch, brasilianischem Portugiesisch und Russisch verfügbar. Die Browsersprache wird automatisch erkannt; bei nicht unterstützten Sprachen wird Englisch verwendet.
 
 ## Installation aus dem Quellcode
 

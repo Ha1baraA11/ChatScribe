@@ -64,6 +64,8 @@
   "popup.error.githubFailed": "Не удалось сохранить на GitHub",
   "options.title": "Настройки ChatScribe",
   "options.subtitle": "Настройте внешний вид ChatScribe и параметры экспорта.",
+  "options.preferences.legend": "Настройки",
+  "options.formatting.legend": "Формат сообщений",
   "options.headings.legend": "Заголовки сообщений",
   "options.headings.h2": "Группировать диалоги под заголовком User",
   "options.headings.bold": "Жирная метка (**Пользователь:**)",
