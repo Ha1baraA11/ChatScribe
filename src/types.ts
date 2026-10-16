@@ -119,7 +119,7 @@ export interface ApiConversationPage {
 // SETTINGS
 // -----------------------------------------------------------------------
 
-export type HeadingStyle = "h2" | "bold" | "none";
+export type HeadingStyle = "transcript" | "bold" | "none";
 export type SeparatorStyle = "single" | "double" | "rule";
 export type ThemeStyle = "system" | "light" | "dark";
 export type PanelMode = "popup" | "sidebar";
@@ -150,7 +150,7 @@ export interface Settings {
 }
 
 export const DEFAULT_SETTINGS: Settings = {
-  headingStyle: "h2",
+  headingStyle: "transcript",
   separatorStyle: "double",
   includeTimestamp: false,
   promptToSave: true,

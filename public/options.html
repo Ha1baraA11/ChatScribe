@@ -784,25 +784,15 @@
         <fieldset>
           <legend data-i18n="options.headings.legend">Message headings</legend>
           <label>
-            <input type="radio" name="headingStyle" value="h2" />
-            <span data-i18n-html="options.headings.h2"
-              >Markdown heading (<code>## User</code>)</span
-            >
-          </label>
-          <label>
-            <input type="radio" name="headingStyle" value="bold" />
-            <span data-i18n-html="options.headings.bold"
-              >Bold label (<code>**User:**</code>)</span
-            >
+            <input type="radio" name="headingStyle" value="transcript" />
+            <span data-i18n="options.headings.transcript">Conversation transcript with speaker labels (recommended)</span>
           </label>
           <label>
             <input type="radio" name="headingStyle" value="none" />
-            <span data-i18n="options.headings.none">No heading</span>
+            <span data-i18n="options.headings.none">No speaker labels</span>
           </label>
           <p class="hint" data-i18n="options.headings.groupHint">
-            Each exchange starts with a User heading. User and Assistant
-            messages stay together in that exchange, and headings inside
-            message content are nested below it in the document outline.
+            Each Q&A group gets one numbered Question entry in the outline. Original headings stay bold in the answer text.
           </p>
         </fieldset>
 
@@ -824,6 +814,9 @@
               >Horizontal rule (<code>---</code>)</span
             >
           </label>
+          <p class="hint" data-i18n="options.separator.groupHint">
+            Each question and its answers form a group. Two horizontal rules separate groups.
+          </p>
         </fieldset>
 
         <fieldset>

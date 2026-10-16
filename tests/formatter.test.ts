@@ -31,10 +31,11 @@ const sampleMessages: ExportMessage[] = [
 ];
 
 describe("formatter", () => {
-  it("formats markdown with h2 headings", () => {
+  it("formats markdown as a clean transcript", () => {
     const output = formatMarkdown(sampleMessages, DEFAULT_SETTINGS);
-    expect(output).toContain("## User\n\nHello, write a simple Python function.");
+    expect(output).toContain("**User:**\n\nHello, write a simple Python function.");
     expect(output).toContain("**Assistant:**\n\nHere is your function:");
+    expect(output).not.toContain("## User");
   });
 
   it("formats markdown with bold labels", () => {
@@ -44,9 +45,26 @@ describe("formatter", () => {
     expect(output).toContain("**Assistant:**\n\nHere");
   });
 
+  it("constrains exported attachments to ChatGPT-like reading width", () => {
+    const messages: ExportMessage[] = [
+      {
+        ...sampleMessages[0],
+        imagePaths: ["images/image-001.png"],
+      },
+    ];
+
+    const output = formatMarkdown(messages, DEFAULT_SETTINGS);
+
+    expect(output).toContain(
+      '<img src="images/image-001.png" alt="Image 1" width="860">',
+    );
+  });
+
   it("formats plain text correctly", () => {
     const output = formatPlainText(sampleMessages, DEFAULT_SETTINGS);
-    expect(output).toContain("User\n\nHello, write a simple Python function.");
+    expect(output).toContain(
+      "Question 1\n\nUser:\n\nHello, write a simple Python function.",
+    );
     expect(output).toContain("def add(a, b):");
     expect(output).not.toContain("```python");
   });

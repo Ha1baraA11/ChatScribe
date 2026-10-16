@@ -14,6 +14,10 @@ function isSeparatorStyle(value: unknown): value is Settings["separatorStyle"] {
   return value === "single" || value === "double" || value === "rule";
 }
 
+function isHeadingStyle(value: unknown): value is Settings["headingStyle"] {
+  return value === "transcript" || value === "bold" || value === "none";
+}
+
 function isPanelMode(value: unknown): value is Settings["panelMode"] {
   return value === "popup" || value === "sidebar";
 }
@@ -30,6 +34,16 @@ export async function loadSettings(): Promise<Settings> {
     ...DEFAULT_SETTINGS,
     ...defaults,
     ...stored,
+    // Older saved settings kept every message and source heading in Obsidian's
+    // outline. Migrate them to the readable transcript so old installs receive
+    // the same clean default as new installs.
+    headingStyle: stored.headingStyle === "h2" ||
+        stored.headingStyle === "outline" ||
+        stored.headingStyle === "bold"
+      ? "transcript"
+      : isHeadingStyle(stored.headingStyle)
+        ? stored.headingStyle
+        : defaults.headingStyle as Settings["headingStyle"],
     separatorStyle: isSeparatorStyle(stored.separatorStyle)
       ? stored.separatorStyle
       : isSeparatorStyle(stored.messageSeparator)

@@ -17,6 +17,129 @@ const EXPORT_MIME_TYPES: Record<ExportFormat, string> = {
   csv: "text/csv;charset=utf-8",
 };
 
+const MARKDOWN_IMAGE_WIDTH_PX = 860;
+const ANSWER_GROUP_SEPARATOR = "\n\n---\n\n---\n\n";
+const DATAVIEW_SAFE_CODE_STYLE =
+  "font-family: var(--font-monospace, monospace); background-color: rgba(135, 131, 120, 0.15); padding: 0 0.25em; border-radius: 3px;";
+
+function formatMarkdownImage(path: string, index: number): string {
+  const safePath = path
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  return `<img src="${safePath}" alt="Image ${index + 1}" width="${MARKDOWN_IMAGE_WIDTH_PX}">`;
+}
+
+function formatDataviewSafeCode(encodedContent: string): string {
+  return `<span class="chatscribe-inline-code" style="${DATAVIEW_SAFE_CODE_STYLE}">${encodedContent}</span>`;
+}
+
+/**
+ * Dataview treats code spans beginning with `=` as inline queries. Render
+ * standalone equality operators as inline math and other such code spans as
+ * HTML spans, neither of which Dataview's inline-query processor evaluates.
+ */
+function protectDataviewInlineCodeOperators(markdown: string): string {
+  const lines = markdown.split("\n");
+  const output: string[] = [];
+  let fence: { marker: string; length: number } | null = null;
+
+  for (const line of lines) {
+    const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})/);
+    if (fence) {
+      output.push(line);
+      if (
+        fenceMatch &&
+        fenceMatch[1][0] === fence.marker &&
+        fenceMatch[1].length >= fence.length &&
+        line.slice(fenceMatch[0].length).trim() === ""
+      ) {
+        fence = null;
+      }
+      continue;
+    }
+
+    if (fenceMatch) {
+      fence = { marker: fenceMatch[1][0], length: fenceMatch[1].length };
+      output.push(line);
+      continue;
+    }
+
+    output.push(protectDataviewTableEqualityCells(protectLine(line)));
+  }
+
+  return output.join("\n");
+
+  function protectDataviewTableEqualityCells(line: string): string {
+    const pipeCount = line.replace(/\\\|/g, "").match(/\|/g)?.length ?? 0;
+    if (pipeCount < 2) return line;
+
+    return line.replace(
+      /(^|\|)([ \t]*)(=+)([ \t]*)(?=\||$)/g,
+      (_match, boundary: string, before: string, operator: string, after: string) =>
+        `${boundary}${before}$\\mathtt{${operator}}$${after}`,
+    );
+  }
+
+  function protectLine(line: string): string {
+    let result = "";
+    let cursor = 0;
+
+    while (cursor < line.length) {
+      const open = line.indexOf("`", cursor);
+      if (open < 0) return result + line.slice(cursor);
+
+      let openEnd = open + 1;
+      while (line[openEnd] === "`") openEnd++;
+      const delimiterLength = openEnd - open;
+      const precedingSlashes = line.slice(0, open).match(/\\*$/)?.[0].length ?? 0;
+      if (precedingSlashes % 2 === 1) {
+        result += line.slice(cursor, openEnd);
+        cursor = openEnd;
+        continue;
+      }
+
+      let close = openEnd;
+      let closeEnd = -1;
+      while (close < line.length) {
+        close = line.indexOf("`", close);
+        if (close < 0) break;
+        let runEnd = close + 1;
+        while (line[runEnd] === "`") runEnd++;
+        if (runEnd - close === delimiterLength) {
+          closeEnd = runEnd;
+          break;
+        }
+        close = runEnd;
+      }
+
+      if (closeEnd < 0) {
+        result += line.slice(cursor, openEnd);
+        cursor = openEnd;
+        continue;
+      }
+
+      const span = line.slice(openEnd, close);
+      if (!span.trimStart().startsWith("=")) {
+        result += line.slice(cursor, closeEnd);
+      } else if (/^=+$/.test(span.trim())) {
+        result += line.slice(cursor, open) + `$\\mathtt{${span.trim()}}$`;
+      } else {
+        const safeCode = span
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/=/g, "&#61;");
+        result += line.slice(cursor, open) + formatDataviewSafeCode(safeCode);
+      }
+      cursor = closeEnd;
+    }
+
+    return result;
+  }
+}
+
 export function getExportMimeType(format: ExportFormat): string {
   return EXPORT_MIME_TYPES[format];
 }
@@ -29,8 +152,7 @@ function makeHeading(role: "user" | "assistant", style: Settings["headingStyle"]
   const label = role === "user" ? "User" : "Assistant";
 
   switch (style) {
-    case "h2":
-      return `## ${label}\n\n`;
+    case "transcript":
     case "bold":
       return `**${label}:**\n\n`;
     case "none":
@@ -39,18 +161,19 @@ function makeHeading(role: "user" | "assistant", style: Settings["headingStyle"]
 }
 
 /**
- * Nest headings from a message below its question-and-answer heading.
- * Fenced code examples are left untouched, and the relative heading levels are
- * preserved while ensuring message headings start at level 3 or deeper.
+ * Keep source headings visible in the answer body. The export adds one clean
+ * outline entry per Q&A group instead of promoting the source's mixed heading
+ * levels into a noisy outline.
  */
-function nestMessageHeadings(content: string): string {
+function formatMessageHeadingsAsText(content: string): string {
   const lines = content.split("\n");
-  const headingLevels: number[] = [];
+  const output: string[] = [];
   let fence: { marker: string; length: number } | null = null;
 
   for (const line of lines) {
     const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
     if (fence) {
+      output.push(line);
       if (
         fenceMatch &&
         fenceMatch[1][0] === fence.marker &&
@@ -64,47 +187,47 @@ function nestMessageHeadings(content: string): string {
 
     if (fenceMatch) {
       fence = { marker: fenceMatch[1][0], length: fenceMatch[1].length };
+      output.push(line);
       continue;
     }
 
-    const headingMatch = line.match(/^( {0,3})(#{1,6})(?:[ \t]+.*)?[ \t]*$/);
-    if (headingMatch) headingLevels.push(headingMatch[2].length);
+    const atxHeading = line.match(
+      /^( {0,3}(?:(?:> ?)*))(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$/,
+    );
+    if (atxHeading) {
+      output.push(formatHeadingLine(atxHeading[1], atxHeading[3]));
+      continue;
+    }
+
+    // Setext headings have an underline on the next line. Leave table rows
+    // and their separators untouched, especially pipe based Markdown tables.
+    if (/^ {0,3}(?:=+|-+)\s*$/.test(line)) {
+      const previous = output.at(-1);
+      if (
+        previous?.trim() &&
+        !/^ {0,3}(?:[-*_]\s*){3,}$/.test(previous) &&
+        !previous.includes("|") &&
+        !line.includes("|")
+      ) {
+        output[output.length - 1] = formatHeadingLine("", previous.trim());
+        continue;
+      }
+    }
+
+    output.push(line);
   }
 
-  if (headingLevels.length === 0) return content;
+  return output.join("\n");
+}
 
-  const minimumLevel = Math.min(...headingLevels);
-  const levelOffset = Math.max(0, 3 - minimumLevel);
-  if (levelOffset === 0) return content;
+function formatHeadingLine(prefix: string, title: string): string {
+  const trimmed = title.trim();
+  const alreadyBold = /^\*\*.*\*\*$/.test(trimmed) || /^__.*__$/.test(trimmed);
+  return `${prefix}${alreadyBold ? trimmed : `**${trimmed}**`}`;
+}
 
-  fence = null;
-  return lines
-    .map((line) => {
-      const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
-      if (fence) {
-        if (
-          fenceMatch &&
-          fenceMatch[1][0] === fence.marker &&
-          fenceMatch[1].length >= fence.length &&
-          fenceMatch[2].trim() === ""
-        ) {
-          fence = null;
-        }
-        return line;
-      }
-
-      if (fenceMatch) {
-        fence = { marker: fenceMatch[1][0], length: fenceMatch[1].length };
-        return line;
-      }
-
-      return line.replace(
-        /^( {0,3})(#{1,6})(?=[ \t]|$)/,
-        (_match, indentation: string, hashes: string) =>
-          `${indentation}${"#".repeat(Math.min(6, hashes.length + levelOffset))}`,
-      );
-    })
-    .join("\n");
+function formatQuestionGroup(messages: string[], number: number, separator: string): string {
+  return `## Question ${number}\n\n${messages.join(separator)}`;
 }
 
 /**
@@ -174,10 +297,6 @@ function formatQuotedRequestLabels(content: string): string {
   ].join("\n");
 }
 
-function makeExchangeHeading(): string {
-  return "## User\n\n";
-}
-
 // -----------------------------------------------------------------------
 // TIMESTAMP HEADER
 // -----------------------------------------------------------------------
@@ -187,6 +306,16 @@ function makeTimestampHeader(): string {
   return `*Exported: ${now.toLocaleString()}*\n\n`;
 }
 
+function makeDocumentTitle(title?: string): string {
+  const normalized = title?.replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+
+  const escaped = normalized
+    .replace(/\\/g, "\\\\")
+    .replace(/([`*_{}\[\]<>#+.!|])/g, "\\$1");
+  return `# ${escaped}\n\n`;
+}
+
 // -----------------------------------------------------------------------
 // MARKDOWN
 // -----------------------------------------------------------------------
@@ -194,20 +323,27 @@ function makeTimestampHeader(): string {
 export function formatMarkdown(
   messages: ExportMessage[],
   settings: Settings,
-  options: { includeRoleHeadings?: boolean } = {},
+  options: { includeRoleHeadings?: boolean; title?: string } = {},
 ): string {
   const includeRoleHeadings = options.includeRoleHeadings ?? true;
   const sep = SEPARATOR_MAP[settings.separatorStyle];
   const parts: string[] = [];
+  const groups: string[] = [];
+  let currentGroup: string[] = [];
+
+  const documentTitle = makeDocumentTitle(options.title);
+  if (documentTitle) parts.push(documentTitle);
 
   if (settings.includeTimestamp) {
     parts.push(makeTimestampHeader());
   }
 
-  let exchangeOpen = false;
-  let assistantHasStarted = false;
-
   for (const msg of messages) {
+    if (msg.role === "user" && currentGroup.length > 0) {
+      groups.push(formatQuestionGroup(currentGroup, groups.length + 1, sep));
+      currentGroup = [];
+    }
+
     let body = msg.content;
     let heading = includeRoleHeadings
       ? makeHeading(msg.role, settings.headingStyle)
@@ -215,40 +351,27 @@ export function formatMarkdown(
 
     if (msg.role === "user") body = formatQuotedRequestLabels(body);
 
-    if (settings.headingStyle === "h2" && includeRoleHeadings) {
-      body = nestMessageHeadings(body);
-
-      if (msg.role === "user") {
-        if (!exchangeOpen || assistantHasStarted) {
-          heading = makeExchangeHeading();
-          exchangeOpen = true;
-          assistantHasStarted = false;
-        } else {
-          heading = "**User:**\n\n";
-        }
-      } else if (exchangeOpen) {
-        heading = "**Assistant:**\n\n";
-        assistantHasStarted = true;
-      } else {
-        heading = "## Assistant\n\n";
-        exchangeOpen = true;
-        assistantHasStarted = true;
-      }
-    }
+    body = formatMessageHeadingsAsText(body);
 
     // Append image links
     if (msg.imagePaths.length > 0) {
       const imageLinks = msg.imagePaths
         .filter((path) => !body.includes(`](${path})`))
-        .map((p, i) => `![Image ${i + 1}](${p})`)
-        .join("\n");
+        .map(formatMarkdownImage)
+        .join("\n\n");
       if (imageLinks) body = body ? `${body}\n\n${imageLinks}` : imageLinks;
     }
 
-    parts.push(`${heading}${body}`);
+    currentGroup.push(`${heading}${body}`);
   }
 
-  return parts.join(sep).trimEnd() + "\n";
+  if (currentGroup.length > 0) {
+    groups.push(formatQuestionGroup(currentGroup, groups.length + 1, sep));
+  }
+  if (groups.length > 0) parts.push(groups.join(ANSWER_GROUP_SEPARATOR));
+
+  const markdown = parts.join(sep).trimEnd() + "\n";
+  return protectDataviewInlineCodeOperators(markdown);
 }
 
 // -----------------------------------------------------------------------
@@ -270,6 +393,15 @@ export function stripMarkdown(md: string): string {
 
   // Inline code
   t = t.replace(/`([^`]+)`/g, "$1");
+  t = t.replace(
+    /<span class="chatscribe-inline-code"[^>]*>([\s\S]*?)<\/span>/g,
+    (_match, code: string) => code
+      .replace(/&#61;/g, "=")
+      .replace(/&gt;/g, ">")
+      .replace(/&lt;/g, "<")
+      .replace(/&amp;/g, "&"),
+  );
+  t = t.replace(/\$\\mathtt\{(=+)\}\$/g, "$1");
 
   // Bold then italic (order matters)
   t = t.replace(/\*\*([^*]+)\*\*/g, "$1");

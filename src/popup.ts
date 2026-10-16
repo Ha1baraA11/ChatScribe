@@ -376,7 +376,7 @@ copyBtn.addEventListener("click", () => {
     return;
   }
   closeCopyOptions();
-  void copyMessages(conversationData.messages);
+  void copyMessages(conversationData.messages, { title: pageTitle });
 });
 
 copyMenuToggle.addEventListener("click", () => {
@@ -747,7 +747,18 @@ async function prepareDiagramMessages(
   messages: ExportMessage[],
   mode: SvgDiagramMode,
 ): Promise<{ messages: ExportMessage[]; assets: ExportImageFile[] }> {
-  if (mode === "none") return { messages, assets: [] };
+  if (mode === "none") {
+    // Even when diagram rendering is disabled, normalize ChatGPT component
+    // markup so unsupported widgets such as <LearningViz .../> do not leak
+    // into the exported Markdown as broken pseudo-code.
+    return {
+      messages: messages.map((message) => ({
+        ...message,
+        content: normalizeChatGptComponents(message.content),
+      })),
+      assets: [],
+    };
+  }
 
   const prepared: ExportMessage[] = [];
   const assets: ExportImageFile[] = [];
@@ -816,7 +827,7 @@ async function exportSelected(): Promise<void> {
 
     if (fmt === "md" && hasImages) {
       // Bundle Markdown + images into ZIP
-      const md = formatMarkdown(exportMessages, settings);
+      const md = formatMarkdown(exportMessages, settings, { title: pageTitle });
       const mdFilename = buildFilename(pageTitle, "md");
       filename = buildFilename(pageTitle, "zip");
       blob = buildZipBlob(md, mdFilename, images);
@@ -826,7 +837,7 @@ async function exportSelected(): Promise<void> {
 
       switch (fmt) {
         case "md":
-          text = formatMarkdown(exportMessages, settings);
+          text = formatMarkdown(exportMessages, settings, { title: pageTitle });
           ext = "md";
           break;
         case "txt":
@@ -842,7 +853,7 @@ async function exportSelected(): Promise<void> {
           ext = "csv";
           break;
         default:
-          text = formatMarkdown(chosen, settings);
+          text = formatMarkdown(chosen, settings, { title: pageTitle });
           ext = "md";
       }
 
@@ -882,12 +893,12 @@ async function copySelected(): Promise<void> {
   let chosen = getSelectedMessages();
   if (chosen.length === 0) return;
 
-  await copyMessages(chosen);
+  await copyMessages(chosen, { title: pageTitle });
 }
 
 async function copyMessages(
   messages: ExportMessage[],
-  options: { includeRoleHeadings?: boolean } = {},
+  options: { includeRoleHeadings?: boolean; title?: string } = {},
 ): Promise<void> {
   if (!settings || messages.length === 0) return;
 
@@ -1029,7 +1040,7 @@ async function saveToGitHub(): Promise<void> {
     const images = [...hydrated.images, ...prepared.assets];
     const hasImages = images.length > 0;
 
-    const md = formatMarkdown(prepared.messages, settings);
+    const md = formatMarkdown(prepared.messages, settings, { title: pageTitle });
     const mdFilename = buildFilename(pageTitle, "md");
 
     let filename: string;
