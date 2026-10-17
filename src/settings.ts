@@ -54,6 +54,12 @@ export async function loadSettings(): Promise<Settings> {
       : typeof stored.askWhereToSave === "boolean"
         ? stored.askWhereToSave
         : defaults.promptToSave as boolean,
+    filenameTemplate: typeof stored.filenameTemplate === "string"
+      ? stored.filenameTemplate
+      : defaults.filenameTemplate as string,
+    downloadSubfolder: typeof stored.downloadSubfolder === "string"
+      ? stored.downloadSubfolder
+      : defaults.downloadSubfolder as string,
     downloadImages: typeof stored.downloadImages === "boolean"
       ? stored.downloadImages
       : typeof stored.downloadImagesLocally === "boolean"

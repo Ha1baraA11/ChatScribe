@@ -498,19 +498,66 @@ export function formatCsv(messages: ExportMessage[]): string {
 export function buildFilename(
   title: string,
   ext: string,
+  template = "{title}_{datetime}",
+  now = new Date(),
 ): string {
-  // Sanitize title: replace disallowed characters, collapse spaces
-  const sanitized = title
+  const sanitize = (value: string): string => value
     .replace(/[<>:"/\\|?*\x00-\x1f]/g, " ")
     .replace(/\s+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, 80);
+    .replace(/^[_ .]+|[_ .]+$/g, "");
 
-  const timestamp = new Date()
+  const timestamp = now
     .toISOString()
     .replace(/:/g, "-")
     .replace(/\..+$/, "");
+  const date = timestamp.slice(0, 10);
+  const time = timestamp.slice(11);
+  const values: Record<string, string> = {
+    // Keep titles bounded while leaving room for date/time tokens that follow them.
+    title: sanitize(title).slice(0, 80),
+    date,
+    time,
+    datetime: timestamp,
+  };
+  const effectiveTemplate = template.trim() || "{title}_{datetime}";
+  const rendered = effectiveTemplate.replace(/\{(title|date|time|datetime)\}/gi, (match, token: string) =>
+    values[token.toLowerCase()] ?? match,
+  );
+  const sanitized = sanitize(rendered);
 
-  const base = sanitized || "chatgpt-export";
-  return `${base}_${timestamp}.${ext}`;
+  return `${sanitized || "chatgpt-export"}.${ext}`;
+}
+
+export function isValidFilenameTemplate(template: string): boolean {
+  const remaining = template.replace(/\{(title|date|time|datetime)\}/gi, "");
+  return !/[{}]/.test(remaining);
+}
+
+export function normalizeDownloadSubfolder(path: string): string {
+  const trimmed = path.trim();
+  if (!trimmed) return "";
+
+  const normalized = trimmed.replace(/\\/g, "/");
+  if (normalized.startsWith("/") || /^[a-z]:/i.test(normalized)) {
+    throw new Error("Download subfolder must be relative to Downloads.");
+  }
+
+  const segments = normalized.split("/").filter(Boolean);
+  if (
+    segments.length === 0 ||
+    segments.some((segment) =>
+      segment === "." || segment === ".." ||
+      segment.startsWith(".") || segment.endsWith(".") ||
+      /[<>:"|?*\x00-\x1f]/.test(segment)
+    )
+  ) {
+    throw new Error("Download subfolder contains an invalid path segment.");
+  }
+
+  return segments.join("/");
+}
+
+export function buildDownloadPath(filename: string, subfolder: string): string {
+  const normalized = normalizeDownloadSubfolder(subfolder);
+  return normalized ? `${normalized}/${filename}` : filename;
 }

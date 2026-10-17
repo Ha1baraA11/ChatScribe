@@ -20,6 +20,7 @@ import {
   formatJson,
   formatCsv,
   buildFilename,
+  buildDownloadPath,
   getExportMimeType,
   type ExportFormat,
 } from "./formatter.ts";
@@ -821,6 +822,7 @@ async function exportSelected(): Promise<void> {
     const exportMessages = prepared.messages;
     const images = [...selectedImages, ...prepared.assets];
     const hasImages = images.length > 0;
+    const exportTime = new Date();
 
     let filename: string;
     let blob: Blob;
@@ -828,8 +830,8 @@ async function exportSelected(): Promise<void> {
     if (fmt === "md" && hasImages) {
       // Bundle Markdown + images into ZIP
       const md = formatMarkdown(exportMessages, settings, { title: pageTitle });
-      const mdFilename = buildFilename(pageTitle, "md");
-      filename = buildFilename(pageTitle, "zip");
+      const mdFilename = buildFilename(pageTitle, "md", settings.filenameTemplate, exportTime);
+      filename = buildFilename(pageTitle, "zip", settings.filenameTemplate, exportTime);
       blob = buildZipBlob(md, mdFilename, images);
     } else {
       let text: string;
@@ -857,7 +859,7 @@ async function exportSelected(): Promise<void> {
           ext = "md";
       }
 
-      filename = buildFilename(pageTitle, ext);
+      filename = buildFilename(pageTitle, ext, settings.filenameTemplate, exportTime);
       blob = new Blob([text], { type: getExportMimeType(fmt) });
     }
 
@@ -866,7 +868,9 @@ async function exportSelected(): Promise<void> {
     const dlResponse = await chrome.runtime.sendMessage({
       type: "TRACKED_DOWNLOAD",
       url: objectUrl,
-      filename,
+      filename: settings.promptToSave
+        ? filename
+        : buildDownloadPath(filename, settings.downloadSubfolder),
       saveAs: settings.promptToSave,
     }) as { success: boolean } | undefined;
 
@@ -1039,16 +1043,17 @@ async function saveToGitHub(): Promise<void> {
     const prepared = await prepareDiagramMessages(chosen, "assets");
     const images = [...hydrated.images, ...prepared.assets];
     const hasImages = images.length > 0;
+    const exportTime = new Date();
 
     const md = formatMarkdown(prepared.messages, settings, { title: pageTitle });
-    const mdFilename = buildFilename(pageTitle, "md");
+    const mdFilename = buildFilename(pageTitle, "md", settings.filenameTemplate, exportTime);
 
     let filename: string;
     let content: string;
     let isBinary = false;
 
     if (hasImages) {
-      filename = buildFilename(pageTitle, "zip");
+      filename = buildFilename(pageTitle, "zip", settings.filenameTemplate, exportTime);
       const zipBlob = buildZipBlob(md, mdFilename, images);
       content = await blobToBase64(zipBlob);
       isBinary = true;

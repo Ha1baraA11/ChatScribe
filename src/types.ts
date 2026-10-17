@@ -141,6 +141,8 @@ export interface Settings {
   separatorStyle: SeparatorStyle;
   includeTimestamp: boolean;
   promptToSave: boolean;
+  filenameTemplate: string;
+  downloadSubfolder: string;
   downloadImages: boolean;
   includeGeneratedImages: boolean;
   keepCopyOptionsOpen: boolean;
@@ -154,6 +156,8 @@ export const DEFAULT_SETTINGS: Settings = {
   separatorStyle: "double",
   includeTimestamp: false,
   promptToSave: true,
+  filenameTemplate: "{title}_{datetime}",
+  downloadSubfolder: "",
   downloadImages: false,
   includeGeneratedImages: true,
   keepCopyOptionsOpen: false,

@@ -215,6 +215,12 @@
         flex-basis: 270px;
       }
 
+      .select-control-full {
+        width: 100%;
+        max-width: none;
+        flex: none;
+      }
+
       .select-chevron {
         position: absolute;
         top: 50%;
@@ -259,6 +265,35 @@
       select:focus-visible {
         border-color: var(--accent);
         outline-offset: 1px;
+      }
+
+      .download-text-input {
+        display: block;
+        width: 100%;
+        min-width: 0;
+        padding: 8px 12px;
+        border: 1px solid var(--border);
+        border-radius: 9px;
+        background: var(--surface);
+        color: var(--text);
+        font: inherit;
+        font-size: 13px;
+        line-height: 1.4;
+        transition: border-color 0.16s ease;
+      }
+
+      .download-text-input:hover {
+        border-color: var(--text-muted);
+      }
+
+      .download-text-input:focus-visible {
+        border-color: var(--accent);
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+      }
+
+      .download-text-input[aria-invalid="true"] {
+        border-color: var(--danger);
       }
 
       button {
@@ -358,6 +393,39 @@
 
       .download-option .hint {
         margin-left: 27px;
+      }
+
+      .download-option .field-label {
+        display: block;
+        padding: 0;
+        margin: 0 0 6px;
+        font-weight: 600;
+        cursor: text;
+      }
+
+      .download-option .hint.field-hint {
+        margin: 6px 0 0;
+      }
+
+      .download-option .field-error {
+        color: var(--danger);
+      }
+
+      .download-option .custom-template-option {
+        margin-top: 12px;
+      }
+
+      .download-option .custom-template-option[hidden] {
+        display: none;
+      }
+
+      .download-option #filename-preview {
+        color: var(--text);
+        overflow-wrap: anywhere;
+      }
+
+      .download-option[hidden] {
+        display: none;
       }
 
       .repository-link {
@@ -762,6 +830,69 @@
               >
                 Applies when image bundling is enabled. Turn off to omit images
                 generated in ChatGPT answers.
+              </p>
+            </div>
+            <div class="download-option">
+              <label class="field-label" for="filenamePreset" data-i18n="options.downloads.filenameFormatLabel">
+                Filename style
+              </label>
+              <span class="select-control select-control-full">
+                <select id="filenamePreset" aria-describedby="filename-format-hint filename-preview">
+                  <option value="title" data-i18n="options.downloads.filenamePreset.titleOnly">Conversation title</option>
+                  <option value="title-date" data-i18n="options.downloads.filenamePreset.titleDate">Conversation title + date</option>
+                  <option value="date-title" data-i18n="options.downloads.filenamePreset.dateTitle">Date + conversation title</option>
+                  <option value="title-datetime" data-i18n="options.downloads.filenamePreset.titleDateTime">Conversation title + date and time</option>
+                  <option value="datetime-title" data-i18n="options.downloads.filenamePreset.dateTimeTitle">Date and time + conversation title</option>
+                  <option value="custom" data-i18n="options.downloads.filenamePreset.custom">Custom (advanced)</option>
+                </select>
+                <svg class="select-chevron" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="m7 10 5 5 5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </span>
+              <p class="hint field-hint" id="filename-format-hint" data-i18n="options.downloads.filenameFormatHint">
+                Choose a ready-made style. The example updates immediately.
+              </p>
+
+              <div class="custom-template-option" id="custom-template-option" hidden>
+                <label class="field-label" for="filenameTemplate" data-i18n="options.downloads.filenameTemplateLabel">
+                  Custom filename template
+                </label>
+                <input
+                  class="download-text-input"
+                  type="text"
+                  id="filenameTemplate"
+                  spellcheck="false"
+                  aria-describedby="filename-template-hint filename-template-error"
+                />
+                <p class="hint field-hint" id="filename-template-hint" data-i18n="options.downloads.filenameTemplateHint">
+                  Use {title}, {date}, {time}, or {datetime}. The extension is added automatically.
+                </p>
+                <p class="hint field-hint field-error" id="filename-template-error" role="alert" hidden data-i18n="options.downloads.filenameTemplateError">
+                  Use only {title}, {date}, {time}, or {datetime}.
+                </p>
+              </div>
+
+              <p class="hint field-hint" id="filename-preview" aria-live="polite">
+                Preview: conversation-title_2026-10-17T00-00-00.md
+              </p>
+            </div>
+            <div class="download-option" id="download-subfolder-option">
+              <label class="field-label" for="downloadSubfolder" data-i18n="options.downloads.subfolderLabel">
+                Subfolder under Downloads
+              </label>
+              <input
+                class="download-text-input"
+                type="text"
+                id="downloadSubfolder"
+                placeholder="ChatScribe/Study"
+                spellcheck="false"
+                aria-describedby="download-subfolder-hint download-subfolder-error"
+              />
+              <p class="hint field-hint" id="download-subfolder-hint" data-i18n="options.downloads.subfolderHint">
+                Relative to the browser's Downloads folder, for example ChatScribe/Study. Leave blank to use Downloads.
+              </p>
+              <p class="hint field-hint field-error" id="download-subfolder-error" role="alert" hidden data-i18n="options.downloads.subfolderError">
+                Enter a relative path under Downloads without a leading slash, dot path segments, or reserved characters.
               </p>
             </div>
           </div>

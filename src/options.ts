@@ -26,6 +26,11 @@ import {
   setLocaleFromBrowser,
   t,
 } from "./i18n.ts";
+import {
+  buildDownloadPath,
+  buildFilename,
+  isValidFilenameTemplate,
+} from "./formatter.ts";
 
 const devError = (...args: unknown[]): void => {
   if (import.meta.env.DEV) {
@@ -49,6 +54,14 @@ const $id = <T extends HTMLElement>(id: string) =>
 
 // Form inputs
 const promptToSaveInput = $id<HTMLInputElement>("promptToSave");
+const filenameTemplateInput = $id<HTMLInputElement>("filenameTemplate");
+const filenamePresetSelect = $id<HTMLSelectElement>("filenamePreset");
+const customTemplateOption = $id<HTMLDivElement>("custom-template-option");
+const downloadSubfolderInput = $id<HTMLInputElement>("downloadSubfolder");
+const downloadSubfolderOption = $id<HTMLDivElement>("download-subfolder-option");
+const filenameTemplateError = $id<HTMLParagraphElement>("filename-template-error");
+const downloadSubfolderError = $id<HTMLParagraphElement>("download-subfolder-error");
+const filenamePreview = $id<HTMLParagraphElement>("filename-preview");
 const downloadImagesInput = $id<HTMLInputElement>("downloadImages");
 const includeGeneratedImagesInput = $id<HTMLInputElement>("includeGeneratedImages");
 const includeTimestampInput = $id<HTMLInputElement>("includeTimestamp");
@@ -57,6 +70,14 @@ const themeSelect = $id<HTMLSelectElement>("theme-select");
 const panelModeSelect = $id<HTMLSelectElement>("panelMode");
 const languageSelect = $id<HTMLSelectElement>("language-select");
 const downloadsSettingsLink = $id<HTMLAnchorElement>("downloads-settings-link");
+
+const FILENAME_PRESETS: Record<string, string> = {
+  title: "{title}",
+  "title-date": "{title}_{date}",
+  "date-title": "{date}_{title}",
+  "title-datetime": "{title}_{datetime}",
+  "datetime-title": "{datetime}_{title}",
+};
 
 // Save UI
 const saveBtn = $id<HTMLButtonElement>("save-btn");
@@ -105,6 +126,14 @@ function populateForm(settings: Settings): void {
   setRadioValue("separatorStyle", settings.separatorStyle);
 
   promptToSaveInput.checked = settings.promptToSave;
+  const storedTemplate = settings.filenameTemplate.trim()
+    ? settings.filenameTemplate
+    : DEFAULT_SETTINGS.filenameTemplate;
+  filenameTemplateInput.value = storedTemplate;
+  filenamePresetSelect.value = Object.entries(FILENAME_PRESETS).find(
+    ([, template]) => template === storedTemplate,
+  )?.[0] ?? "custom";
+  downloadSubfolderInput.value = settings.downloadSubfolder;
   downloadImagesInput.checked = settings.downloadImages;
   includeGeneratedImagesInput.checked = settings.includeGeneratedImages;
   includeTimestampInput.checked = settings.includeTimestamp;
@@ -115,6 +144,15 @@ function populateForm(settings: Settings): void {
   applyTheme(settings.theme);
 
   languageSelect.value = settings.language;
+  updateDownloadLocationControls();
+  updateFilenameControls();
+  updateExportPreview();
+}
+
+function getFilenameTemplate(): string {
+  return filenamePresetSelect.value === "custom"
+    ? filenameTemplateInput.value.trim()
+    : FILENAME_PRESETS[filenamePresetSelect.value] ?? DEFAULT_SETTINGS.filenameTemplate;
 }
 
 function gatherSettings(): Settings {
@@ -125,6 +163,8 @@ function gatherSettings(): Settings {
       DEFAULT_SETTINGS.separatorStyle,
     ),
     promptToSave: promptToSaveInput.checked,
+    filenameTemplate: getFilenameTemplate(),
+    downloadSubfolder: downloadSubfolderInput.value.trim(),
     downloadImages: downloadImagesInput.checked,
     includeGeneratedImages: includeGeneratedImagesInput.checked,
     includeTimestamp: includeTimestampInput.checked,
@@ -133,6 +173,48 @@ function gatherSettings(): Settings {
     panelMode: panelModeSelect.value as Settings["panelMode"],
     language: languageSelect.value as Settings["language"],
   };
+}
+
+function updateDownloadLocationControls(): void {
+  downloadSubfolderOption.hidden = promptToSaveInput.checked;
+}
+
+function updateFilenameControls(): void {
+  customTemplateOption.hidden = filenamePresetSelect.value !== "custom";
+}
+
+function updateExportPreview(): boolean {
+  const usingCustomTemplate = filenamePresetSelect.value === "custom";
+  const template = getFilenameTemplate();
+  const templateIsValid = isValidFilenameTemplate(template);
+  filenameTemplateInput.setAttribute(
+    "aria-invalid",
+    String(usingCustomTemplate && !templateIsValid),
+  );
+  filenameTemplateError.hidden = !usingCustomTemplate || templateIsValid;
+
+  let pathIsValid = true;
+  let filename = "";
+  try {
+    filename = buildFilename(
+      t("options.downloads.previewTitle"),
+      "md",
+      template,
+    );
+    if (!promptToSaveInput.checked) {
+      filename = buildDownloadPath(filename, downloadSubfolderInput.value);
+    }
+  } catch {
+    pathIsValid = false;
+  }
+
+  downloadSubfolderInput.setAttribute("aria-invalid", String(!pathIsValid));
+  downloadSubfolderError.hidden = pathIsValid || promptToSaveInput.checked;
+  filenamePreview.textContent = t("options.downloads.filenamePreview", {
+    filename: pathIsValid ? filename : "",
+  });
+
+  return templateIsValid && (pathIsValid || promptToSaveInput.checked);
 }
 
 // -----------------------------------------------------------------------
@@ -270,10 +352,41 @@ languageSelect.addEventListener("change", () => {
     setLocale(languageSelect.value);
     applyTranslations();
   }
+  updateExportPreview();
   void refreshGitHubStatus();
 });
 
+promptToSaveInput.addEventListener("change", () => {
+  updateDownloadLocationControls();
+  updateExportPreview();
+});
+
+filenamePresetSelect.addEventListener("change", () => {
+  updateFilenameControls();
+  updateExportPreview();
+});
+
+filenameTemplateInput.addEventListener("input", () => {
+  updateExportPreview();
+});
+
+downloadSubfolderInput.addEventListener("input", () => {
+  updateExportPreview();
+});
+
 saveBtn.addEventListener("click", async () => {
+  if (!updateExportPreview()) {
+    if (
+      filenamePresetSelect.value === "custom" &&
+      !isValidFilenameTemplate(filenameTemplateInput.value)
+    ) {
+      filenameTemplateInput.focus();
+    } else {
+      downloadSubfolderInput.focus();
+    }
+    return;
+  }
+
   const current = gatherSettings();
   await saveSettings(current);
 

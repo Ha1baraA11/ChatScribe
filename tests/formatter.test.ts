@@ -6,6 +6,7 @@ import {
   formatCsv,
   stripMarkdown,
   buildFilename,
+  buildDownloadPath,
   getExportMimeType,
 } from "../src/formatter.ts";
 import type { ExportMessage, Settings } from "../src/types.ts";
@@ -105,5 +106,25 @@ describe("formatter", () => {
     expect(filename).not.toContain(":");
     expect(filename).not.toContain("/");
     expect(filename).not.toContain("?");
+  });
+
+  it("applies a filename preset and keeps its date after a long title", () => {
+    const exportTime = new Date("2026-10-17T01:34:50.000Z");
+    const filename = buildFilename(
+      "A".repeat(100),
+      "md",
+      "{title}_{datetime}",
+      exportTime,
+    );
+
+    expect(filename).toBe(`${"A".repeat(80)}_2026-10-17T01-34-50.md`);
+  });
+
+  it("normalizes a configured download subfolder", () => {
+    expect(buildDownloadPath("conversation.md", "ChatScribe\\Study")).toBe(
+      "ChatScribe/Study/conversation.md",
+    );
+    expect(() => buildDownloadPath("conversation.md", "../outside")).toThrow();
+    expect(() => buildDownloadPath("conversation.md", "/outside")).toThrow();
   });
 });
