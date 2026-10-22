@@ -4,6 +4,8 @@
  * Shared type definitions used across content.ts, popup.ts, etc.
  */
 
+import type { CONTENT_LOAD_TYPE } from "./content-protocol.ts";
+
 // -----------------------------------------------------------------------
 // EXPORT TYPES
 // -----------------------------------------------------------------------
@@ -18,8 +20,6 @@ export interface ExportMessage {
   svgBackgroundColor?: string;
   /** Markdown-only content with temporary ChatGPT image links rewritten to bundled paths. */
   imageMarkdownContent?: string;
-  /** Rendered page images without filenames, kept for sandbox-link matching. */
-  renderedImageFallbackPaths?: string[];
   /** Resource filenames mapped to their bundled relative image paths. */
   imagePathsByFilename?: Record<string, string>;
   /** Sequential position (0-based). */
@@ -42,10 +42,77 @@ export interface ExportImageFile {
   sizeBytes: number;
 }
 
+/** A privacy-safe checkpoint captured during generated-image export. */
+export interface ImageExportDiagnosticEvent {
+  elapsedMs: number;
+  stage: string;
+  details: Record<string, unknown>;
+}
+
+/** Per-message image discovery and download result; message text and URLs are omitted. */
+export interface ImageExportDiagnosticMessage {
+  questionNumber: number | null;
+  role: string;
+  origin: "conversation-api" | "rendered-image-recovery";
+  includedBySettings: boolean;
+  imageResourceCount: number;
+  imageResourceKinds: string[];
+  sandboxReferenceCount: number;
+  downloadAttemptedCount: number;
+  downloadedPaths: string[];
+  downloadFailures: string[];
+}
+
+/** Debug trace included beside Markdown in a troubleshooting ZIP export. */
+export interface ImageExportDiagnostics {
+  schemaVersion: 1;
+  buildId?: string;
+  startedAt: string;
+  failure?: {
+    stage: string;
+    reason: string;
+  };
+  settings: {
+    bundleImages: boolean;
+    includeGeneratedImages: boolean;
+    fetchImages: boolean;
+    selectedMessagesOnly: boolean;
+  };
+  events: ImageExportDiagnosticEvent[];
+  messages: ImageExportDiagnosticMessage[];
+  archive?: {
+    questionCount: number;
+    questions: Array<{
+      exportQuestionNumber: number;
+      sourceQuestionNumbers: number[];
+      userImageResourcesDetected: number;
+      assistantImageResourcesDetected: number;
+      imageDownloadAttempts: number;
+      imageDownloadFailures: string[];
+      downloadedImagePaths: string[];
+      exportedImagePaths: string[];
+      sandboxReferenceCount: number;
+      downloadFailureNoticeCount: number;
+      notBundledNoticeCount: number;
+    }>;
+    markdownImageReferenceCount: number;
+    markdownImagePaths: string[];
+    missingReferencedImagePaths: string[];
+    unreferencedBundledImagePaths: string[];
+    unresolvedSandboxReferenceCount: number;
+    downloadFailureNoticeCount: number;
+    notBundledNoticeCount: number;
+    bundledImages: Array<{ path: string; mimeType: string; sizeBytes: number }>;
+  };
+}
+
 /** The full result of loading a conversation. */
 export interface ConversationData {
   messages: ExportMessage[];
   images: ExportImageFile[];
+  imageDiagnostics?: ImageExportDiagnostics;
+  /** Runtime-only map used to align selected exports with full-conversation question numbers. */
+  messageQuestionNumbersById?: Record<string, number>;
 }
 
 // -----------------------------------------------------------------------
@@ -178,7 +245,7 @@ export const SEPARATOR_MAP: Record<SeparatorStyle, string> = {
 
 export type ChromeMessage =
   | {
-      type: "LOAD_CONVERSATION";
+      type: typeof CONTENT_LOAD_TYPE;
       downloadImages: boolean;
       includeGeneratedImages: boolean;
       fetchImages?: boolean;

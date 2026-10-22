@@ -25,7 +25,14 @@ import {
   type ExportFormat,
 } from "./formatter.ts";
 import { buildZipBlob, blobToBase64 } from "./zip.ts";
-import type { ConversationData, ExportMessage, ExportImageFile } from "./types.ts";
+import { selectHydratedExport } from "./export-selection.ts";
+import { CONTENT_LOAD_TYPE } from "./content-protocol.ts";
+import type {
+  ConversationData,
+  ExportMessage,
+  ExportImageFile,
+  ImageExportDiagnostics,
+} from "./types.ts";
 import {
   normalizeChatGptComponents,
   replaceSvgTemplatesWithRenderedImages,
@@ -158,9 +165,14 @@ async function requestConversation(
   fetchImages = downloadImages,
   selectedMessageIds?: string[],
   forceRefresh = false,
-): Promise<{ success: boolean; data?: ConversationData; error?: string }> {
+): Promise<{
+  success: boolean;
+  data?: ConversationData;
+  error?: string;
+  imageDiagnostics?: ImageExportDiagnostics;
+}> {
   const request = {
-    type: "LOAD_CONVERSATION",
+    type: CONTENT_LOAD_TYPE,
     downloadImages,
     includeGeneratedImages,
     fetchImages,
@@ -168,20 +180,79 @@ async function requestConversation(
     forceRefresh,
   };
 
+  // Ensure both the isolated content script and MAIN-world bridge. The content
+  // listener can still be alive after an extension reload even when its bridge
+  // has disappeared, so a successful content ping alone is not sufficient.
+  const ensured = await chrome.runtime.sendMessage({
+    type: "ENSURE_CONTENT_SCRIPT",
+    tabId,
+  }) as { success?: boolean; error?: string } | undefined;
+  if (!ensured?.success) {
+    throw new Error(ensured?.error ?? "ChatScribe could not reconnect to this tab.");
+  }
+
   try {
     return await chrome.tabs.sendMessage(tabId, request);
   } catch (error) {
-    if (!isMissingReceiver(error)) throw error;
-
-    const ensured = await chrome.runtime.sendMessage({
-      type: "ENSURE_CONTENT_SCRIPT",
-      tabId,
-    }) as { success?: boolean; error?: string } | undefined;
-    if (!ensured?.success) {
-      throw new Error(ensured?.error ?? "ChatScribe could not reconnect to this tab.");
+    if (isMissingReceiver(error)) {
+      throw new Error("ChatScribe could not reconnect to this tab.");
     }
+    throw error;
+  }
+}
 
-    return chrome.tabs.sendMessage(tabId, request);
+class ImageExportFailure extends Error {
+  readonly imageDiagnostics?: ImageExportDiagnostics;
+  readonly stage: string;
+
+  constructor(
+    message: string,
+    imageDiagnostics?: ImageExportDiagnostics,
+    stage = "image-export",
+  ) {
+    super(message);
+    this.name = "ImageExportFailure";
+    this.imageDiagnostics = imageDiagnostics;
+    this.stage = stage;
+  }
+}
+
+function safeImageExportFailure(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message
+    .replace(/(?:https?|blob|data):\/\/\S+/gi, "[url]")
+    .replace(/data:image\/[^\s;,]+;base64,[^\s)]+/gi, "[inline image]")
+    .replace(/[\r\n\]]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 500);
+}
+
+async function downloadImageDiagnostics(
+  diagnostics: ImageExportDiagnostics,
+): Promise<string> {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const filename = `ChatScribe-image-diagnostics-${timestamp}.json`;
+  const blob = new Blob([JSON.stringify(diagnostics, null, 2)], {
+    type: "application/json",
+  });
+  const objectUrl = URL.createObjectURL(blob);
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "TRACKED_DOWNLOAD",
+      url: objectUrl,
+      // Keep the diagnostic report in Downloads root so a bad configured
+      // subfolder cannot prevent the failure report from being saved too.
+      filename,
+      saveAs: false,
+    }) as { success?: boolean; error?: string } | undefined;
+    if (!response?.success) {
+      throw new Error(response?.error ?? "Chrome did not start the diagnostic download.");
+    }
+    return filename;
+  } finally {
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
   }
 }
 
@@ -525,12 +596,14 @@ exportBtn.addEventListener("click", () => {
 async function refreshConversationForExport(): Promise<void> {
   const requestId = loadSequence;
   const tabId = sourceTabId;
-  const exportSettings = settings;
-  if (!exportSettings || tabId === null) return;
+  if (!settings || tabId === null) return;
 
   setBusy(true);
   showLoading(t("popup.loading"));
   try {
+    const exportSettings = await loadSettings();
+    if (requestId !== loadSequence || sourceTabId !== tabId) return;
+    settings = exportSettings;
     const response = await requestConversation(
       tabId,
       exportSettings.downloadImages,
@@ -710,7 +783,12 @@ function getSelectedMessages(): ExportMessage[] {
 
 async function hydrateSelectedImages(
   messages: ExportMessage[],
-): Promise<{ messages: ExportMessage[]; images: ExportImageFile[] }> {
+): Promise<{
+  messages: ExportMessage[];
+  images: ExportImageFile[];
+  imageDiagnostics?: ImageExportDiagnostics;
+  messageQuestionNumbersById?: Record<string, number>;
+}> {
   if (!settings?.downloadImages || sourceTabId === null) {
     return { messages, images: [] };
   }
@@ -725,23 +803,163 @@ async function hydrateSelectedImages(
       messages.map((message) => message.id),
     );
     if (!response?.success || !response.data) {
-      throw new Error(response?.error ?? t("popup.error.loadFailed"));
+      const reason = response?.error ?? t("popup.error.loadFailed");
+      if (response?.imageDiagnostics) {
+        throw new ImageExportFailure(
+          reason,
+          response.imageDiagnostics,
+          response.imageDiagnostics.failure?.stage ?? "conversation-image-load",
+        );
+      }
+      throw new Error(reason);
     }
 
-    const selectedIds = new Set(messages.map((message) => message.id));
-    const hydratedMessages = response.data.messages.filter((message) =>
-      selectedIds.has(message.id),
+    return selectHydratedExport(
+      response.data,
+      new Set(messages.map((message) => message.id)),
     );
-    const selectedPaths = new Set(
-      hydratedMessages.flatMap((message) => message.imagePaths),
-    );
-    return {
-      messages: hydratedMessages,
-      images: response.data.images.filter((image) => selectedPaths.has(image.path)),
-    };
   } finally {
     hideLoading();
   }
+}
+
+function buildImageExportDiagnosticsForArchive(
+  source: ImageExportDiagnostics | undefined,
+  markdown: string,
+  images: ExportImageFile[],
+  messages: ExportMessage[],
+  messageQuestionNumbersById?: Record<string, number>,
+): ImageExportDiagnostics | undefined {
+  if (!source) return undefined;
+
+  const diagnostics: ImageExportDiagnostics = {
+    ...source,
+    events: [...source.events],
+    messages: source.messages.map((message) => ({
+      ...message,
+      imageResourceKinds: [...message.imageResourceKinds],
+      downloadedPaths: [...message.downloadedPaths],
+      downloadFailures: [...message.downloadFailures],
+    })),
+  };
+  const markdownImageReferences = [
+    ...[...markdown.matchAll(/<img\b[^>]*\bsrc=["']([^"']+)["']/gi)]
+      .map((match) => match[1])
+      .filter((path) => path.startsWith("images/")),
+    ...[...markdown.matchAll(/!\[[^\]]*\]\((images\/[^)\s]+)\)/gi)]
+      .map((match) => match[1]),
+  ];
+  const markdownImagePaths = [...new Set(markdownImageReferences)];
+  const referencedPaths = new Set(markdownImagePaths);
+  const bundledPaths = new Set(images.map((image) => image.path));
+  const missingReferencedImagePaths = markdownImagePaths.filter((path) =>
+    !bundledPaths.has(path)
+  );
+  const unreferencedBundledImagePaths = images
+    .map((image) => image.path)
+    .filter((path) => !referencedPaths.has(path));
+  const unresolvedSandboxReferenceCount =
+    [...markdown.matchAll(/sandbox:\/mnt\/data\//gi)].length;
+  const downloadFailureNoticeCount =
+    [...markdown.matchAll(/\[\d+ images? could not be downloaded:/gi)].length;
+  const notBundledNoticeCount = [...markdown.matchAll(/\[Image not bundled:/gi)].length;
+  const questionCount = [...markdown.matchAll(/^## Question \d+\s*$/gm)].length;
+  const questionMessages = new Map<number, ExportMessage[]>();
+  const sourceQuestionsByExportQuestion = new Map<number, Set<number>>();
+  let exportQuestionNumber = 0;
+  for (const message of messages) {
+    if (message.role === "user") exportQuestionNumber++;
+    if (exportQuestionNumber === 0) exportQuestionNumber = 1;
+    const group = questionMessages.get(exportQuestionNumber) ?? [];
+    group.push(message);
+    questionMessages.set(exportQuestionNumber, group);
+    const sourceQuestionNumber = messageQuestionNumbersById?.[message.id];
+    if (sourceQuestionNumber !== undefined) {
+      const sourceQuestions = sourceQuestionsByExportQuestion.get(exportQuestionNumber) ??
+        new Set<number>();
+      sourceQuestions.add(sourceQuestionNumber);
+      sourceQuestionsByExportQuestion.set(exportQuestionNumber, sourceQuestions);
+    }
+  }
+  const questions = [...questionMessages].map(([number, exportMessages]) => {
+    const sourceQuestionNumbers = [...(sourceQuestionsByExportQuestion.get(number) ?? [])]
+      .sort((a, b) => a - b);
+    const sourceQuestions = new Set(sourceQuestionNumbers);
+    const scannedMessages = diagnostics.messages.filter((message) =>
+      message.questionNumber !== null && sourceQuestions.has(message.questionNumber)
+    );
+    const uniquePaths = (paths: string[]): string[] => [...new Set(paths)];
+    return {
+      exportQuestionNumber: number,
+      sourceQuestionNumbers,
+      userImageResourcesDetected: scannedMessages
+        .filter((message) => message.role === "user")
+        .reduce((sum, message) => sum + message.imageResourceCount, 0),
+      assistantImageResourcesDetected: scannedMessages
+        .filter((message) => message.role === "assistant" || message.role === "tool")
+        .reduce((sum, message) => sum + message.imageResourceCount, 0),
+      imageDownloadAttempts: scannedMessages.reduce(
+        (sum, message) => sum + message.downloadAttemptedCount,
+        0,
+      ),
+      imageDownloadFailures: scannedMessages.flatMap((message) =>
+        message.downloadFailures.map((reason) => `${message.role}: ${reason}`)
+      ),
+      downloadedImagePaths: uniquePaths(scannedMessages.flatMap((message) =>
+        message.downloadedPaths
+      )),
+      exportedImagePaths: uniquePaths(exportMessages.flatMap((message) =>
+        message.imagePaths
+      )),
+      sandboxReferenceCount: scannedMessages.reduce(
+        (sum, message) => sum + message.sandboxReferenceCount,
+        0,
+      ),
+      downloadFailureNoticeCount: exportMessages.reduce(
+        (sum, message) => sum + [...message.content.matchAll(
+          /\[\d+ images? could not be downloaded:/gi,
+        )].length,
+        0,
+      ),
+      notBundledNoticeCount: exportMessages.reduce(
+        (sum, message) => sum + [...message.content.matchAll(/\[Image not bundled:/gi)].length,
+        0,
+      ),
+    };
+  });
+  const archive = {
+    questionCount,
+    questions,
+    markdownImageReferenceCount: markdownImageReferences.length,
+    markdownImagePaths,
+    missingReferencedImagePaths,
+    unreferencedBundledImagePaths,
+    unresolvedSandboxReferenceCount,
+    downloadFailureNoticeCount,
+    notBundledNoticeCount,
+    bundledImages: images.map((image) => ({
+      path: image.path,
+      mimeType: image.mimeType,
+      sizeBytes: image.sizeBytes,
+    })),
+  };
+  diagnostics.archive = archive;
+  diagnostics.events.push({
+    elapsedMs: Math.max(0, Date.now() - Date.parse(diagnostics.startedAt)),
+    stage: "zip-assembly",
+    details: {
+      questionCount,
+      markdownImageReferenceCount: markdownImageReferences.length,
+      imageFileCount: images.length,
+      missingReferencedImagePaths,
+      unreferencedBundledImagePaths,
+      unresolvedSandboxReferenceCount,
+      downloadFailureNoticeCount,
+      notBundledNoticeCount,
+      diagnosticsSidecarIncluded: true,
+    },
+  });
+  return diagnostics;
 }
 
 async function prepareDiagramMessages(
@@ -803,19 +1021,24 @@ async function exportSelected(): Promise<void> {
   let chosen = getSelectedMessages();
   if (chosen.length === 0) return;
 
+  let imageDiagnostics: ImageExportDiagnostics | undefined;
   setBusy(true);
   closeSelector();
 
   try {
+    settings = await loadSettings();
     const fmt = selFormatSelect.value as ExportFormat;
     const diagramMode: SvgDiagramMode =
       fmt === "md" ? "assets" : fmt === "txt" ? "text" : "none";
 
     let selectedImages: ExportImageFile[] = [];
+    let messageQuestionNumbersById: Record<string, number> | undefined;
     if (fmt === "md" && settings.downloadImages && sourceTabId !== null) {
       const hydrated = await hydrateSelectedImages(chosen);
       chosen = hydrated.messages;
       selectedImages = hydrated.images;
+      imageDiagnostics = hydrated.imageDiagnostics;
+      messageQuestionNumbersById = hydrated.messageQuestionNumbersById;
     }
 
     const prepared = await prepareDiagramMessages(chosen, diagramMode);
@@ -827,12 +1050,19 @@ async function exportSelected(): Promise<void> {
     let filename: string;
     let blob: Blob;
 
-    if (fmt === "md" && hasImages) {
+    if (fmt === "md" && (hasImages || imageDiagnostics)) {
       // Bundle Markdown + images into ZIP
       const md = formatMarkdown(exportMessages, settings, { title: pageTitle });
       const mdFilename = buildFilename(pageTitle, "md", settings.filenameTemplate, exportTime);
       filename = buildFilename(pageTitle, "zip", settings.filenameTemplate, exportTime);
-      blob = buildZipBlob(md, mdFilename, images);
+      const archiveDiagnostics = buildImageExportDiagnosticsForArchive(
+        imageDiagnostics,
+        md,
+        images,
+        exportMessages,
+        messageQuestionNumbersById,
+      );
+      blob = buildZipBlob(md, mdFilename, images, archiveDiagnostics);
     } else {
       let text: string;
       let ext: string;
@@ -872,20 +1102,45 @@ async function exportSelected(): Promise<void> {
         ? filename
         : buildDownloadPath(filename, settings.downloadSubfolder),
       saveAs: settings.promptToSave,
-    }) as { success: boolean } | undefined;
+    }) as { success?: boolean; error?: string } | undefined;
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
 
     if (!dlResponse?.success) {
-      showToast(t("popup.toast.downloadFailed"), 3500);
-    } else {
-      showToast(t("popup.toast.downloadStarted"));
+      const reason = dlResponse?.error ??
+        "Chrome did not start the export download.";
+      throw new ImageExportFailure(reason, imageDiagnostics, "archive-download");
     }
 
-    // Revoke object URL after a delay
-    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
+    showToast(t("popup.toast.downloadStarted"));
+
   } catch (err) {
     hideLoading();
     devError("Export failed:", err);
-    showToast(t("popup.toast.downloadFailed"), 3500);
+    const diagnostics = err instanceof ImageExportFailure
+      ? err.imageDiagnostics ?? imageDiagnostics
+      : imageDiagnostics;
+    const reason = safeImageExportFailure(err);
+    if (diagnostics) {
+      diagnostics.failure = {
+        stage: err instanceof ImageExportFailure ? err.stage : "export",
+        reason,
+      };
+      try {
+        const reportFilename = await downloadImageDiagnostics(diagnostics);
+        showToast(
+          `${t("popup.toast.exportFailedDiagnosticsSaved")} ${reportFilename} — ${reason}`,
+          9000,
+        );
+      } catch (diagnosticError) {
+        const reportReason = safeImageExportFailure(diagnosticError);
+        showToast(
+          `${t("popup.toast.downloadFailed")}: ${reason}. Diagnostic report also failed: ${reportReason}`,
+          9000,
+        );
+      }
+    } else {
+      showToast(`${t("popup.toast.downloadFailed")}: ${reason}`, 6000);
+    }
   } finally {
     setBusy(false);
   }

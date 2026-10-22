@@ -14,7 +14,7 @@
  *
  * Conversation text and branches come from the ChatGPT API. Rendered page
  * nodes are consulted only as a fallback for generated images omitted by
- * the API response; the script never scrolls or scrapes message text.
+ * the API response. Older rendered turns are loaded while exporting images.
  */
 
 import type {
@@ -22,6 +22,8 @@ import type {
   ApiMessage,
   ApiMappingNode,
   ConversationData,
+  ImageExportDiagnostics,
+  ImageExportDiagnosticMessage,
   ExportMessage,
   ExportImageFile,
 } from "./types.ts";
@@ -29,9 +31,42 @@ import {
   findBranchInsertionIndex,
   getMessageParentId,
   isMessageLinkedToActiveMessage,
-  walkActiveBranchNodes,
+  resolveActiveBranchNodes,
 } from "./conversation-branch.ts";
+import {
+  createRenderedGeneratedImageMessage,
+  deduplicateNamedImageResources,
+  findActiveTurnUserId,
+  findGeneratedImageMergeTarget,
+  getFollowingAssistantsInTurn,
+  getFollowingSandboxImageFilenames,
+  getUnrecoveredImageFailureDetails,
+  isGeneratedImageScanComplete,
+  getGeneratedImageScanStep,
+  getRelatedMessageIdsInTurn,
+  isGeneratedImageSelected,
+  isMatchingFilePreviewPanel,
+  isRenderedGeneratedImageCandidate,
+  mapImageFilenamesToKeys,
+  mergeRecoveredGeneratedImageMessages,
+  nudgeOlderMessagesLoader,
+  recoverApiGeneratedImages,
+  selectBlobResourcesForPrefetch,
+} from "./generated-image-recovery.ts";
+import { findConversationScroller } from "./conversation-scroller.ts";
 import { renderSvgDataUrlToPngBase64 } from "./svg-template.ts";
+import {
+  BRIDGE_API_REQUEST_TYPE,
+  BRIDGE_API_RESPONSE_TYPE,
+  BRIDGE_ERROR_TYPE,
+  BRIDGE_IMAGE_REQUEST_TYPE,
+  BRIDGE_IMAGE_RESPONSE_TYPE,
+  BRIDGE_PING_TYPE,
+  BRIDGE_PONG_TYPE,
+  CHATSCRIBE_BUILD_ID,
+  CONTENT_LOAD_TYPE,
+  CONTENT_PING_TYPE,
+} from "./content-protocol.ts";
 
 // -----------------------------------------------------------------------
 // DEV LOGGING
@@ -50,10 +85,11 @@ const devWarn = (...args: unknown[]): void => {
 // -----------------------------------------------------------------------
 
 const SOURCE = "ChatScribe";
-const BRIDGE_TIMEOUT_MS = 20_000;
+const BRIDGE_TIMEOUT_MS = 3_000;
 const API_PAGE_TIMEOUT_MS = 30_000;
 const IMAGE_TIMEOUT_MS = 60_000;
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024; // 20 MB
+const MAX_TOTAL_IMAGE_BYTES = 200 * 1024 * 1024;
 const CONVERSATION_CACHE_TTL_MS = 2 * 60_000;
 const MAX_CONCURRENT_IMAGE_DOWNLOADS = 2;
 
@@ -62,40 +98,43 @@ const MAX_CONCURRENT_IMAGE_DOWNLOADS = 2;
 // -----------------------------------------------------------------------
 
 let bridgeInstalled = false;
-let authReady = false;
 
-window.addEventListener("message", (event: MessageEvent) => {
+const contentWindow = window as Window & {
+  __chatScribeContentCleanupByBuild?: Map<string, () => void>;
+};
+const contentCleanupByBuild = contentWindow.__chatScribeContentCleanupByBuild ??= new Map();
+try {
+  contentCleanupByBuild.get(CHATSCRIBE_BUILD_ID)?.();
+} catch {
+  // A listener from an invalidated extension context must not block repair.
+}
+
+const onBridgeWindowMessage = (event: MessageEvent): void => {
   if (event.source !== window) return;
   const d = event.data as Record<string, unknown> | null;
   if (!d || d.source !== SOURCE) return;
 
-  if (d.type === "BRIDGE_PONG") {
+  if (d.type === BRIDGE_PONG_TYPE) {
     bridgeInstalled = true;
-    if (d.authReady === true) authReady = true;
   }
-
-  if (d.type === "AUTH_READY") {
-    authReady = true;
-  }
-});
+};
+window.addEventListener("message", onBridgeWindowMessage);
 
 /**
- * Wait for the bridge to report both installed and auth-ready state.
- * Pings periodically in case the content script loaded after the bridge.
+ * Wait only for the bridge listener. It can recover current session headers
+ * itself when the page was already open and its initial API request was missed.
  */
 async function waitForBridge(): Promise<void> {
-  if (bridgeInstalled && authReady) return;
+  if (bridgeInstalled) return;
 
   // Send a ping to check current state
-  window.postMessage({ source: SOURCE, type: "BRIDGE_PING" }, "*");
+  window.postMessage({ source: SOURCE, type: BRIDGE_PING_TYPE }, "*");
 
   const deadline = Date.now() + BRIDGE_TIMEOUT_MS;
 
-  while ((!bridgeInstalled || !authReady) && Date.now() < deadline) {
+  while (!bridgeInstalled && Date.now() < deadline) {
     await sleep(80);
-    if (!bridgeInstalled || !authReady) {
-      window.postMessage({ source: SOURCE, type: "BRIDGE_PING" }, "*");
-    }
+    if (!bridgeInstalled) window.postMessage({ source: SOURCE, type: BRIDGE_PING_TYPE }, "*");
   }
 
   if (!bridgeInstalled) {
@@ -104,9 +143,6 @@ async function waitForBridge(): Promise<void> {
     );
   }
 
-  if (!authReady) {
-    throw new Error("CHATGPT_CONNECTION_NOT_READY");
-  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -149,6 +185,7 @@ interface ImageResource {
   svgBackgroundColor?: string;
   inlineImageDataUrl?: string;
   filename?: string;
+  filenameHint?: string;
   renderedFromDom?: boolean;
   downloadLink?: boolean;
 }
@@ -174,7 +211,7 @@ function requestConversationPage(
       if (!d || d.source !== SOURCE) return;
       if (d.requestId !== requestId) return;
 
-      if (d.type === "BRIDGE_ERROR") {
+      if (d.type === BRIDGE_ERROR_TYPE) {
         if (done) return;
         done = true;
         window.clearTimeout(timer);
@@ -183,7 +220,7 @@ function requestConversationPage(
         return;
       }
 
-      if (d.type === "API_RESPONSE") {
+      if (d.type === BRIDGE_API_RESPONSE_TYPE) {
         if (done) return;
         done = true;
         window.clearTimeout(timer);
@@ -200,7 +237,7 @@ function requestConversationPage(
 
     window.addEventListener("message", handler);
     window.postMessage(
-      { source: SOURCE, type: "API_REQUEST", requestId, conversationId, cursor },
+      { source: SOURCE, type: BRIDGE_API_REQUEST_TYPE, requestId, conversationId, cursor },
       "*",
     );
   });
@@ -235,7 +272,7 @@ function requestImage(
       if (!d || d.source !== SOURCE) return;
       if (d.requestId !== requestId) return;
 
-      if (d.type === "BRIDGE_ERROR") {
+      if (d.type === BRIDGE_ERROR_TYPE) {
         if (done) return;
         done = true;
         window.clearTimeout(timer);
@@ -244,7 +281,7 @@ function requestImage(
         return;
       }
 
-      if (d.type === "IMAGE_RESPONSE") {
+      if (d.type === BRIDGE_IMAGE_RESPONSE_TYPE) {
         if (done) return;
         done = true;
         window.clearTimeout(timer);
@@ -261,7 +298,7 @@ function requestImage(
     window.postMessage(
       {
         source: SOURCE,
-        type: "IMAGE_REQUEST",
+        type: BRIDGE_IMAGE_REQUEST_TYPE,
         requestId,
         conversationId,
         imageUrl: resource.imageUrl,
@@ -500,7 +537,15 @@ function getImageResources(
 ): ImageResource[] {
   const variants = imageResourceCache.get(msg) ?? new Map<boolean, ImageResource[]>();
   const cached = variants.get(includeRenderedImageParts);
-  if (cached) return cached;
+  // API-only results are stable for a message object. Rendered image parts
+  // are not: ChatGPT virtualizes older turns, so a first scan can see no DOM
+  // images and a later scan can see them after pagination loads that turn.
+  // Re-scan the DOM on every rendered lookup, retaining only positive
+  // discoveries so resources remain available after their turn scrolls away.
+  if (!includeRenderedImageParts && cached) return cached;
+  const cachedRenderedResources = includeRenderedImageParts
+    ? variants.get(true)
+    : undefined;
 
   const resources = new Map<string, ImageResource>();
   const visited = new WeakSet<object>();
@@ -530,16 +575,21 @@ function getImageResources(
 
     if (!isRecord(value)) return;
 
+    const rawFilenameHint = value.image_filename_hint;
+    const filenameHint = typeof rawFilenameHint === "string"
+      ? rawFilenameHint.trim().slice(0, 256) || undefined
+      : undefined;
     const inlineSvgDataUrl = getSafeRenderedSvgDataUrl(value.rendered_svg_data_url);
     const inlineSvgKey = value.rendered_svg_key;
     if (inlineSvgDataUrl && typeof inlineSvgKey === "string") {
       mergeResource({
         key: inlineSvgKey,
         inlineSvgDataUrl,
+        filenameHint,
         svgBackgroundColor: getSafeRenderedSvgBackgroundColor(
           value.rendered_svg_background_color,
         ) ?? undefined,
-        renderedFromDom: value.rendered_from_dom === true,
+        renderedFromDom: value.rendered_from_dom === true || value.rendered_from_dom === 1,
       });
     }
 
@@ -562,8 +612,9 @@ function getImageResources(
         imageUrl: imageUrl ?? undefined,
         inlineImageDataUrl: rasterDataUrl ?? undefined,
         filename: filename ?? undefined,
-        renderedFromDom: value.rendered_from_dom === true,
-        downloadLink: value.rendered_download_link === true,
+        filenameHint,
+        renderedFromDom: value.rendered_from_dom === true || value.rendered_from_dom === 1,
+        downloadLink: value.rendered_download_link === true || value.rendered_download_link === 1,
       });
     }
   };
@@ -577,6 +628,7 @@ function getImageResources(
           imageUrl: resource.imageUrl ?? existing.imageUrl,
           svgBackgroundColor: resource.svgBackgroundColor ?? existing.svgBackgroundColor,
           filename: resource.filename ?? existing.filename,
+          filenameHint: resource.filenameHint ?? existing.filenameHint,
           renderedFromDom: resource.renderedFromDom || existing.renderedFromDom,
           downloadLink: resource.downloadLink || existing.downloadLink,
         }
@@ -611,8 +663,16 @@ function getImageResources(
     variants.set(false, [...resources.values()]);
   }
 
+  cachedRenderedResources?.forEach(mergeResource);
+
+  let foundRenderedParts = false;
   if (includeRenderedImageParts && msg.id) {
-    const renderedParts = getRenderedImagePartsForMessage(msg.id);
+    const role = msg.author?.role;
+    const renderedParts = getRenderedImagePartsForMessage(
+      msg.id,
+      role === "user" || role === "assistant" ? role : undefined,
+    );
+    foundRenderedParts = renderedParts.length > 0;
     visit(renderedParts, 0);
 
     // The API resource and rendered DOM image can use different keys for the
@@ -634,29 +694,16 @@ function getImageResources(
   }
 
   const result = deduplicateNamedImageResources([...resources.values()]);
-  variants.set(includeRenderedImageParts, result);
+  if (!includeRenderedImageParts) {
+    variants.set(false, result);
+  } else if (foundRenderedParts || cachedRenderedResources?.length) {
+    // Do not cache a negative result: older virtualized turns may be mounted
+    // later during the same export. Keep positive results for turns that are
+    // unmounted again before final conversion.
+    variants.set(true, result);
+  }
   imageResourceCache.set(msg, variants);
   return result;
-}
-
-function deduplicateNamedImageResources(resources: ImageResource[]): ImageResource[] {
-  const apiFilenames = new Set(resources.flatMap((resource) =>
-    !resource.renderedFromDom && resource.filename
-      ? [resource.filename.toLocaleLowerCase()]
-      : [],
-  ));
-  const downloadLinkFilenames = new Set(resources.flatMap((resource) =>
-    resource.renderedFromDom && resource.downloadLink && resource.filename
-      ? [resource.filename.toLocaleLowerCase()]
-      : [],
-  ));
-
-  return resources.filter((resource) => {
-    if (!resource.renderedFromDom || !resource.filename) return true;
-    const filename = resource.filename.toLocaleLowerCase();
-    if (apiFilenames.has(filename)) return false;
-    return resource.downloadLink || !downloadLinkFilenames.has(filename);
-  });
 }
 
 // Image metadata is walked several times while resolving the active branch.
@@ -742,6 +789,9 @@ function imageResourceToPart(
   if (resource.inlineSvgDataUrl) {
     part.rendered_svg_data_url = resource.inlineSvgDataUrl;
     part.rendered_svg_key = resource.key;
+    if (resource.filenameHint) {
+      part.image_filename_hint = resource.filenameHint;
+    }
     if (resource.svgBackgroundColor) {
       part.rendered_svg_background_color = resource.svgBackgroundColor;
     }
@@ -749,11 +799,36 @@ function imageResourceToPart(
   if (resource.inlineImageDataUrl) {
     part.inline_image_data_url = resource.inlineImageDataUrl;
   }
+  if (resource.filenameHint && !part.image_filename_hint) {
+    part.image_filename_hint = resource.filenameHint;
+  }
   const resolvedFilename = filename ?? resource.filename;
   if (resolvedFilename) part.image_filename = resolvedFilename;
   if (resource.renderedFromDom) part.rendered_from_dom = 1;
   if (resource.downloadLink) part.rendered_download_link = 1;
   return part;
+}
+
+function getGeneratedImagePartsWithKeys(message: ApiMessage): Array<{
+  key: string;
+  part: Record<string, string | number>;
+}> {
+  // Work from the synthetic message's own parts. Resource extraction can
+  // deduplicate two sources with one filename, losing a prefetched blob
+  // fallback before the next virtualized window is merged.
+  return (message.content?.parts ?? []).flatMap((value) => {
+    if (!isRecord(value)) return [];
+    const part = value as Record<string, string | number>;
+    const key = [
+      part.asset_pointer,
+      part.image_url,
+      part.rendered_svg_key,
+      part.inline_image_data_url,
+    ].find((candidate): candidate is string =>
+      typeof candidate === "string" && candidate.length > 0
+    );
+    return key ? [{ key, part }] : [];
+  });
 }
 
 function getSafeRenderedImageDataUrl(value: unknown): string | null {
@@ -899,10 +974,12 @@ function getImageUrlFromPart(part: Record<string, unknown>): string | null {
 
 function getRenderedImagePartsForMessage(
   messageId: string,
+  expectedRole?: "user" | "assistant",
+  root: ParentNode = document,
 ): Array<Record<string, string | number>> {
   const parts: Array<Record<string, string | number>> = [];
 
-  for (const element of document.querySelectorAll<HTMLElement>(
+  for (const element of root.querySelectorAll<HTMLElement>(
     "[data-dil-message-id], [data-message-id], [data-chatgpt-search-message-ids]",
   )) {
     const ids = getRenderedMessageIds(element);
@@ -911,6 +988,9 @@ function getRenderedImagePartsForMessage(
 
     let svgIndex = 0;
     for (const image of element.querySelectorAll<HTMLImageElement>("img")) {
+      const renderedRole = getRenderedMessageRole(image);
+      if (expectedRole && renderedRole && renderedRole !== expectedRole) continue;
+
       const src = image.currentSrc || image.src;
       const filename = getRenderedImageFilename(image, element);
       if (image.dataset.dComponent === "svg" && getSafeRenderedSvgDataUrl(src)) {
@@ -922,6 +1002,7 @@ function getRenderedImagePartsForMessage(
             ? { rendered_svg_background_color: svgBackgroundColor }
             : {}),
           rendered_from_dom: 1,
+          ...(image.alt ? { image_filename_hint: image.alt } : {}),
           ...(filename ? { image_filename: filename } : {}),
         });
         continue;
@@ -932,6 +1013,7 @@ function getRenderedImagePartsForMessage(
         parts.push({
           inline_image_data_url: inlineImageDataUrl,
           rendered_from_dom: 1,
+          ...(image.alt ? { image_filename_hint: image.alt } : {}),
           ...(filename ? { image_filename: filename } : {}),
         });
         continue;
@@ -942,6 +1024,7 @@ function getRenderedImagePartsForMessage(
         parts.push({
           image_url: imageUrl,
           rendered_from_dom: 1,
+          ...(image.alt ? { image_filename_hint: image.alt } : {}),
           ...(filename ? { image_filename: filename } : {}),
         });
       }
@@ -950,6 +1033,9 @@ function getRenderedImagePartsForMessage(
     // Some file cards expose their authenticated download URL on a link even
     // when the thumbnail is rendered as a background instead of an <img>.
     for (const link of element.querySelectorAll<HTMLAnchorElement>("a[href]")) {
+      const renderedRole = getRenderedMessageRole(link);
+      if (expectedRole && renderedRole && renderedRole !== expectedRole) continue;
+
       const imageUrl = getSafeHostedImageUrl(link.href);
       const filename = getRenderedImageFilename(link, element);
       if (!imageUrl || (!filename && !/image|download/i.test(link.textContent ?? ""))) {
@@ -967,6 +1053,12 @@ function getRenderedImagePartsForMessage(
   return parts;
 }
 
+function getRenderedMessageRole(element: Element): "user" | "assistant" | null {
+  const role = element.closest<HTMLElement>("[data-message-author-role]")
+    ?.getAttribute("data-message-author-role");
+  return role === "user" || role === "assistant" ? role : null;
+}
+
 function getRenderedImageFilename(element: Element, messageElement: Element): string | null {
   const pattern = /[\p{L}\p{N}][\p{L}\p{N} ._()\-]*\.(?:png|jpe?g|gif|webp|avif|bmp)\b/iu;
   let current: Element | null = element;
@@ -974,6 +1066,7 @@ function getRenderedImageFilename(element: Element, messageElement: Element): st
 
   while (current && current !== messageElement && depth < 5) {
     const candidates = [
+      current.getAttribute("alt"),
       current.getAttribute("aria-label"),
       current.getAttribute("title"),
       current.getAttribute("download"),
@@ -992,6 +1085,84 @@ function getRenderedImageFilename(element: Element, messageElement: Element): st
   return null;
 }
 
+function getRenderedImagePartsFromElements(
+  images: readonly HTMLImageElement[],
+  messageElement: Element,
+  messageId: string,
+): Array<Record<string, string | number>> {
+  const parts: Array<Record<string, string | number>> = [];
+  let svgIndex = 0;
+
+  for (const image of images) {
+    const src = image.currentSrc || image.src;
+    const filename = getRenderedImageFilename(image, messageElement);
+    const filenameHint = image.alt.trim();
+    const label: Record<string, string | number> = filenameHint
+      ? { image_filename_hint: filenameHint }
+      : {};
+    if (image.dataset.dComponent === "svg" && getSafeRenderedSvgDataUrl(src)) {
+      const svgBackgroundColor = getRenderedSvgBackgroundColor(image);
+      parts.push({
+        rendered_svg_data_url: src,
+        rendered_svg_key: `rendered-svg:${messageId}:${svgIndex++}`,
+        ...(svgBackgroundColor
+          ? { rendered_svg_background_color: svgBackgroundColor }
+          : {}),
+        rendered_from_dom: 1,
+        ...label,
+        ...(filename ? { image_filename: filename } : {}),
+      });
+      continue;
+    }
+
+    const inlineImageDataUrl = getSafeRenderedImageDataUrl(src);
+    if (inlineImageDataUrl) {
+      parts.push({
+        inline_image_data_url: inlineImageDataUrl,
+        rendered_from_dom: 1,
+        ...label,
+        ...(filename ? { image_filename: filename } : {}),
+      });
+      continue;
+    }
+
+    const imageUrl = getSafeHostedImageUrl(src);
+    if (imageUrl) {
+      parts.push({
+        image_url: imageUrl,
+        rendered_from_dom: 1,
+        ...label,
+        ...(filename ? { image_filename: filename } : {}),
+      });
+    }
+  }
+
+  return parts;
+}
+
+function getImagePartsWithSandboxFilenames(
+  apiResources: readonly ImageResource[],
+  renderedResources: readonly ImageResource[],
+  sandboxFilenames: readonly string[],
+): Array<Record<string, string | number>> {
+  const combinedResources = getImageResources({
+    content: {
+      content_type: "multimodal",
+      parts: [
+        ...apiResources.map((resource) => imageResourceToPart(resource)),
+        ...renderedResources.map((resource) => imageResourceToPart(resource)),
+      ],
+    },
+  }, false);
+  const filenamesByKey = mapImageFilenamesToKeys(
+    combinedResources,
+    sandboxFilenames,
+  );
+  return combinedResources.map((resource) =>
+    imageResourceToPart(resource, filenamesByKey.get(resource.key))
+  );
+}
+
 /**
  * Rewrite ChatGPT's temporary sandbox links to the image files bundled in the
  * export. Those links are only valid inside ChatGPT's sandbox and otherwise
@@ -1000,7 +1171,6 @@ function getRenderedImageFilename(element: Element, messageElement: Element): st
 function replaceSandboxImageLinks(
   content: string,
   pathsByFilename: ReadonlyMap<string, string>,
-  renderedImagePaths: readonly string[],
   preserveUnresolved = false,
 ): string {
   const pattern = /(!?\[[^\]]*\]\(\s*)(<sandbox:\/mnt\/data\/[^>]+>|sandbox:\/mnt\/data\/[^)\s]+)([^)]*\))/gi;
@@ -1029,26 +1199,6 @@ function replaceSandboxImageLinks(
       key: filename.toLocaleLowerCase(),
       isImage: match[1].startsWith("!"),
       path: resolvedPaths.get(filename.toLocaleLowerCase()),
-    });
-  }
-
-  const unmatchedNames = [...new Set(
-    references.filter((reference) => !reference.path).map((reference) => reference.key),
-  )];
-  const matchedPaths = new Set(references.flatMap((reference) =>
-    reference.path ? [reference.path] : [],
-  ));
-  const fallbackPaths = [...new Set(renderedImagePaths)].filter((path) =>
-    !matchedPaths.has(path),
-  );
-  if (unmatchedNames.length > 0 && unmatchedNames.length === fallbackPaths.length) {
-    unmatchedNames.forEach((filename, index) => {
-      references.forEach((reference) => {
-        if (reference.key === filename && !reference.path) {
-          reference.path = fallbackPaths[index];
-          resolvedPaths.set(filename, fallbackPaths[index]);
-        }
-      });
     });
   }
 
@@ -1112,31 +1262,372 @@ function getRenderedMessageIds(element: Element): string[] {
     .flatMap((id) => id.split(/[\s,]+/));
 }
 
-function isRenderedImageInActiveTurn(
+function getRenderedTurnUserId(
   element: Element,
-  candidateId: string,
+  allMessagesById: ReadonlyMap<string, ApiMessage>,
   activeMessageIds: ReadonlySet<string>,
-): boolean {
+  branchNodes: readonly ApiMessage[] | null,
+): string | null {
+  const anchorIds: string[] = [];
   let current: Element | null = element;
-  for (let depth = 0; current && depth < 10; depth++, current = current.parentElement) {
-    const ids = new Set([
-      ...getRenderedMessageIds(current),
-      ...Array.from(current.querySelectorAll<HTMLElement>(
+  for (let depth = 0; current && depth < 16; depth++, current = current.parentElement) {
+    anchorIds.push(...getRenderedMessageIds(current));
+    const turnKey = current.getAttribute("data-turn-key");
+    if (turnKey) {
+      anchorIds.push(turnKey);
+      // ChatGPT can put the user's ID on a sibling node inside the virtualized
+      // turn wrapper while the image card itself carries an assistant ID.
+      anchorIds.push(...Array.from(current.querySelectorAll<HTMLElement>(
         "[data-dil-message-id], [data-message-id], [data-chatgpt-search-message-ids]",
-      )).flatMap(getRenderedMessageIds),
-    ]);
-    if (ids.has(candidateId) && [...ids].some((id) => activeMessageIds.has(id))) {
-      return true;
+      )).flatMap(getRenderedMessageIds));
+    }
+    if (current.classList.contains("thread-scroll-container")) break;
+  }
+
+  return findActiveTurnUserId(
+    [...new Set(anchorIds)],
+    branchNodes,
+    allMessagesById,
+    activeMessageIds,
+  );
+}
+
+interface RenderedTurnProgressReference {
+  turnKey: string;
+  userId: string | null;
+  referenceId: string | null;
+}
+
+function getRenderedTurnProgressReference(
+  scroller: HTMLElement | null,
+  earliestActiveUserId: string | null,
+  allMessagesById: ReadonlyMap<string, ApiMessage>,
+  activeMessageIds: ReadonlySet<string>,
+  branchNodes: readonly ApiMessage[] | null,
+): RenderedTurnProgressReference {
+  const firstTurn = scroller?.querySelector<HTMLElement>("[data-turn-key]") ?? null;
+  const turnKey = firstTurn?.getAttribute("data-turn-key") ?? "";
+  const userId = firstTurn
+    ? getRenderedTurnUserId(firstTurn, allMessagesById, activeMessageIds, branchNodes)
+    : null;
+
+  // data-turn-key identifies a rendered UI turn; it is not guaranteed to be
+  // the API ID of that turn's user message. Compare the resolved user ID and
+  // retain direct-key matching only for pages that use the same identifier.
+  return {
+    turnKey,
+    userId,
+    referenceId: userId ?? (turnKey === earliestActiveUserId ? turnKey : null),
+  };
+}
+
+function getRenderedImageApiRole(
+  image: Element,
+  allMessagesById: ReadonlyMap<string, ApiMessage>,
+): string | null {
+  let current: Element | null = image;
+  for (let depth = 0; current && depth < 12; depth++, current = current.parentElement) {
+    const roles = getRenderedMessageIds(current)
+      .flatMap((id) => {
+        const role = allMessagesById.get(id)?.author?.role;
+        return role ? [role] : [];
+      });
+    const role = roles.find((candidate) =>
+      candidate === "assistant" || candidate === "tool"
+    ) ?? roles.find((candidate) => candidate === "user");
+    if (role) return role;
+    if (current.classList.contains("thread-scroll-container")) break;
+  }
+  return null;
+}
+
+interface RenderedFilePreviewScan {
+  messages: ApiMessage[];
+  candidates: number;
+  captured: number;
+  failed: number;
+}
+
+function getRenderedFilePreviewPart(
+  panel: HTMLElement,
+  filename: string,
+): Record<string, string | number> | null {
+  const image = panel.querySelector<HTMLImageElement>("img[src]");
+  const source = image?.currentSrc || image?.src;
+  const inlineImageDataUrl = getSafeRenderedImageDataUrl(source);
+  const imageUrl = inlineImageDataUrl ? null : getSafeHostedImageUrl(source);
+  if (!inlineImageDataUrl && !imageUrl) return null;
+  return {
+    ...(inlineImageDataUrl
+      ? { inline_image_data_url: inlineImageDataUrl }
+      : { image_url: imageUrl! }),
+    image_filename: filename,
+    rendered_from_dom: 1,
+  };
+}
+
+/** ChatGPT file cards expose a button, not an img or download URL, until opened. */
+async function getRenderedFilePreviewImages(
+  scroller: HTMLElement | null,
+  branchNodes: ApiMessage[] | null,
+  allMessagesById: ReadonlyMap<string, ApiMessage>,
+  activeMessageIds: ReadonlySet<string>,
+  selectedMessageIds: ReadonlySet<string> | null,
+  attempted: Map<string, number>,
+  unresolved: Set<string>,
+): Promise<RenderedFilePreviewScan> {
+  const result: RenderedFilePreviewScan = {
+    messages: [], candidates: 0, captured: 0, failed: 0,
+  };
+  if (!scroller) return result;
+
+  const viewport = scroller.getBoundingClientRect();
+  const buttons = Array.from(scroller.querySelectorAll<HTMLButtonElement>(
+    'button[aria-label]',
+  ));
+  for (const button of buttons) {
+    if (!button.isConnected) continue;
+    const card = button.parentElement;
+    if (!card) continue;
+    const title = card.querySelector<HTMLElement>('[title]')?.getAttribute('title');
+    const filename = getImageFilename(title);
+    if (!filename || !button.getAttribute('aria-label')?.includes(filename)) {
+      continue;
+    }
+    const rect = card.getBoundingClientRect();
+    if (rect.bottom <= viewport.top || rect.top >= viewport.bottom) continue;
+    if (getRenderedMessageRole(button) === "user") continue;
+    const sourceId = (() => {
+      let current: Element | null = button;
+      while (current && current !== scroller) {
+        const id = getRenderedMessageIds(current).find((candidate) =>
+          ["assistant", "tool"].includes(allMessagesById.get(candidate)?.author?.role ?? "")
+        );
+        if (id) return id;
+        current = current.parentElement;
+      }
+      return null;
+    })();
+    if (!sourceId) continue;
+    const turnUserId = getRenderedTurnUserId(
+      button, allMessagesById, activeMessageIds, branchNodes,
+    );
+    if (!turnUserId) continue;
+    const rowIndex = card.parentElement
+      ? Array.from(card.parentElement.children).indexOf(card)
+      : 0;
+    const key = `${sourceId}:${filename.toLocaleLowerCase()}:${rowIndex}`;
+    if ((attempted.get(key) ?? 0) >= 2) continue;
+    const sourceMessage = allMessagesById.get(sourceId);
+    const hasApiImage = Boolean(sourceMessage && getImageResources({
+      ...sourceMessage, id: undefined,
+    }, false).some((resource) =>
+      resource.filename?.toLocaleLowerCase() === filename.toLocaleLowerCase()
+    ));
+    const noteFailure = () => {
+      result.failed++;
+      if (!hasApiImage) unresolved.add(key);
+    };
+    const candidate = createRenderedGeneratedImageMessage(
+      sourceId, sourceMessage, turnUserId, [],
+    );
+    if (!isGeneratedImageSelected(
+      candidate, selectedMessageIds, branchNodes, allMessagesById,
+    )) continue;
+    result.candidates++;
+
+    // Preserve an existing viewer tab. It may already show this exact file.
+    const panelsBefore = Array.from(document.querySelectorAll<HTMLElement>(
+      '[role="tabpanel"][data-tab-id^="chatgpt-file:"]',
+    ));
+    const existingPanel = panelsBefore.find((panel) => isMatchingFilePreviewPanel(
+      panel.getAttribute("data-tab-id"),
+      panel.getAttribute("aria-label"),
+      sourceId,
+      filename,
+    )) ?? null;
+    const openedByScan = !existingPanel;
+    attempted.set(key, (attempted.get(key) ?? 0) + 1);
+    const originalScrollTop = scroller.scrollTop;
+    let previewPanel: HTMLElement | null = existingPanel;
+    let capturedThisCard = false;
+    try {
+      if (openedByScan) button.click();
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        previewPanel = Array.from(document.querySelectorAll<HTMLElement>(
+          '[role="tabpanel"][data-tab-id^="chatgpt-file:"]',
+        )).find((panel) =>
+          isMatchingFilePreviewPanel(
+            panel.getAttribute("data-tab-id"),
+            panel.getAttribute("aria-label"),
+            sourceId,
+            filename,
+          )
+        ) ?? null;
+        const part = previewPanel
+          ? getRenderedFilePreviewPart(previewPanel, filename)
+          : null;
+        if (part) {
+          result.messages.push(createRenderedGeneratedImageMessage(
+            sourceId,
+            sourceMessage,
+            turnUserId,
+            [part],
+          ));
+          result.captured++;
+          attempted.set(key, 2);
+          unresolved.delete(key);
+          capturedThisCard = true;
+          break;
+        }
+        await sleep(100);
+      }
+      if (!capturedThisCard) noteFailure();
+    } catch (error) {
+      noteFailure();
+      devWarn("Could not read a ChatGPT image file preview", error);
+    } finally {
+      const panelToClose = openedByScan
+        ? previewPanel ?? Array.from(document.querySelectorAll<HTMLElement>(
+          '[role="tabpanel"][data-tab-id^="chatgpt-file:"]',
+        )).find((panel) => !panelsBefore.includes(panel))
+        : null;
+      if (panelToClose) {
+        panelToClose.querySelector<HTMLButtonElement>(
+          'button[aria-label="Close viewer"]',
+        )?.click();
+        await sleep(100);
+      }
+      if (scroller.isConnected) scroller.scrollTop = originalScrollTop;
     }
   }
-  return false;
+  return result;
+}
+
+interface RenderedRecoveryScanStats {
+  domContainersVisited: number;
+  imageElementsExamined: number;
+  generatedImageCandidates: number;
+  candidatesWithActiveTurn: number;
+  candidatesWithoutActiveTurn: number;
+  containersWithSandboxNames: number;
+  containersLinkedToActiveBranch: number;
+  containersWithImageResources: number;
+  apiRecoveredMessages: number;
+  apiRecoveredImageResources: number;
+  recoveredImageResources: number;
+  renderedTurnSnapshots: Array<{
+    questionNumber: number | null;
+    userResolved: boolean;
+    imageElementCount: number;
+    generatedImageCandidateCount: number;
+    imageSourceKinds: string[];
+    emptyAltImageCount: number;
+    generatedImagePreviewCount: number;
+    generatedImageGalleryCount: number;
+    visibleUnhydratedGalleryCount: number;
+    sandboxFilenameCount: number;
+  }>;
+  questionRecoveryPipeline: Array<{
+    questionNumber: number;
+    candidateContainerCount: number;
+    candidateImageCount: number;
+    candidateContainersRejectedAsInactive: number;
+    candidateContainersWithoutSource: number;
+    containersWithSandboxFilenames: number;
+    sandboxFilenameCount: number;
+    containersWithApiImageResources: number;
+    apiImageResourceCount: number;
+    containersWithRenderedParts: number;
+    renderedPartCount: number;
+    renderedResourceCount: number;
+    containersWithNoCombinedResources: number;
+    containersWithImageResources: number;
+    containersWithDuplicateResources: number;
+    recoveredImageResourceCount: number;
+  }>;
 }
 
 function getUnattachedRenderedGeneratedImages(
   existingMessages: ApiMessage[],
   branchNodes: ApiMessage[] | null,
   allMessagesById: ReadonlyMap<string, ApiMessage>,
-): ApiMessage[] {
+  scroller: HTMLElement,
+): { messages: ApiMessage[]; stats: RenderedRecoveryScanStats } {
+  const stats: RenderedRecoveryScanStats = {
+    domContainersVisited: 0,
+    imageElementsExamined: 0,
+    generatedImageCandidates: 0,
+    candidatesWithActiveTurn: 0,
+    candidatesWithoutActiveTurn: 0,
+    containersWithSandboxNames: 0,
+    containersLinkedToActiveBranch: 0,
+    containersWithImageResources: 0,
+    apiRecoveredMessages: 0,
+    apiRecoveredImageResources: 0,
+    recoveredImageResources: 0,
+    renderedTurnSnapshots: [],
+    questionRecoveryPipeline: [],
+  };
+  const questionByMessageId = getQuestionNumberByMessageId(existingMessages);
+  const questionRecoveryByNumber = new Map<number, {
+    questionNumber: number;
+    candidateContainerCount: number;
+    candidateImageCount: number;
+    candidateContainersRejectedAsInactive: number;
+    candidateContainersWithoutSource: number;
+    containersWithSandboxFilenames: number;
+    sandboxFilenameCount: number;
+    containersWithApiImageResources: number;
+    apiImageResourceCount: number;
+    containersWithRenderedParts: number;
+    renderedPartCount: number;
+    renderedResourceCount: number;
+    containersWithNoCombinedResources: number;
+    containersWithImageResources: number;
+    containersWithDuplicateResources: number;
+    recoveredImageResourceCount: number;
+  }>();
+  const getQuestionRecovery = (questionNumber: number | null) => {
+    if (questionNumber === null) return null;
+    let pipeline = questionRecoveryByNumber.get(questionNumber);
+    if (!pipeline) {
+      pipeline = {
+        questionNumber,
+        candidateContainerCount: 0,
+        candidateImageCount: 0,
+        candidateContainersRejectedAsInactive: 0,
+        candidateContainersWithoutSource: 0,
+        containersWithSandboxFilenames: 0,
+        sandboxFilenameCount: 0,
+        containersWithApiImageResources: 0,
+        apiImageResourceCount: 0,
+        containersWithRenderedParts: 0,
+        renderedPartCount: 0,
+        renderedResourceCount: 0,
+        containersWithNoCombinedResources: 0,
+        containersWithImageResources: 0,
+        containersWithDuplicateResources: 0,
+        recoveredImageResourceCount: 0,
+      };
+      questionRecoveryByNumber.set(questionNumber, pipeline);
+    }
+    return pipeline;
+  };
+  const sandboxFilenamesByQuestion = new Map<number, Set<string>>();
+  for (const message of allMessagesById.values()) {
+    if (message.author?.role !== "assistant") continue;
+    const questionNumber = getDiagnosticQuestionNumber(
+      message,
+      questionByMessageId,
+      allMessagesById,
+    );
+    if (questionNumber === null) continue;
+    const filenames = sandboxFilenamesByQuestion.get(questionNumber) ?? new Set<string>();
+    getSandboxImageFilenames(extractText(message)).forEach((filename) => filenames.add(filename));
+    sandboxFilenamesByQuestion.set(questionNumber, filenames);
+  }
   const activeMessageIds = new Set(
     existingMessages.flatMap((message) => message.id ? [message.id] : []),
   );
@@ -1151,10 +1642,110 @@ function getUnattachedRenderedGeneratedImages(
   const generatedBySource = new Map<string, ApiMessage>();
   const recoveredKeys = new Set(existingImageKeys);
 
-  for (const element of document.querySelectorAll<HTMLElement>(
-    "[data-dil-message-id], [data-message-id], [data-chatgpt-search-message-ids]",
+  // Keep a question-level snapshot of the DOM before the virtualized page is
+  // moved. These counts reveal whether an image node was absent, unclassified,
+  // or present but failed later in the recovery pipeline without logging text,
+  // IDs, URLs, filenames, or image data.
+  stats.renderedTurnSnapshots = Array.from(
+    scroller.querySelectorAll<HTMLElement>("[data-turn-key]"),
+  ).map((turn) => {
+    const turnUserId = getRenderedTurnUserId(
+      turn,
+      allMessagesById,
+      activeMessageIds,
+      branchNodes,
+    );
+    const questionNumber = turnUserId
+      ? questionByMessageId.get(turnUserId) ?? null
+      : null;
+    const images = Array.from(turn.querySelectorAll<HTMLImageElement>("img"));
+    const galleries = Array.from(turn.querySelectorAll<HTMLElement>(
+      '[data-testid="generated-image-gallery"]',
+    ));
+    const scrollRect = scroller.getBoundingClientRect();
+    const candidateImages = images.filter((image) =>
+      isRenderedGeneratedImageCandidate(
+        getRenderedMessageRole(image),
+        getRenderedImageApiRole(image, allMessagesById),
+        image.alt,
+        image.closest("[data-chatgpt-search-message-ids]") !== null,
+        image.closest(
+          '[data-testid="generated-image-preview"], [data-testid="generated-image-gallery"], [data-dil-message-id]',
+        ) !== null,
+      )
+    );
+    const sourceKind = (image: HTMLImageElement): string => {
+      const src = image.currentSrc || image.src;
+      if (!src) return "empty";
+      if (src.startsWith("data:image/")) return "data-url";
+      if (src.startsWith("blob:")) return "blob";
+      if (src.startsWith("https:")) return "https";
+      return "other";
+    };
+
+    return {
+      questionNumber,
+      userResolved: Boolean(turnUserId),
+      imageElementCount: images.length,
+      generatedImageCandidateCount: candidateImages.length,
+      imageSourceKinds: [...new Set(candidateImages.map(sourceKind))].sort(),
+      emptyAltImageCount: candidateImages.filter((image) => !image.alt.trim()).length,
+      generatedImagePreviewCount: candidateImages.filter((image) =>
+        image.closest('[data-testid="generated-image-preview"], [data-testid="generated-image-gallery"]') !== null
+      ).length,
+      generatedImageGalleryCount: galleries.length,
+      visibleUnhydratedGalleryCount: scrollRect
+        ? galleries.filter((gallery) => {
+          const rect = gallery.getBoundingClientRect();
+          return rect.bottom > scrollRect.top && rect.top < scrollRect.bottom &&
+            !gallery.querySelector('img[src]');
+        }).length
+        : 0,
+      sandboxFilenameCount: questionNumber === null
+        ? 0
+        : sandboxFilenamesByQuestion.get(questionNumber)?.size ?? 0,
+    };
+  });
+
+  // Older turns are not mounted in ChatGPT's virtualized page. Recover image
+  // generation results from persisted tool nodes before consulting the DOM.
+  const apiImages = recoverApiGeneratedImages(
+    activeMessageIds,
+    branchNodes,
+    allMessagesById,
+    recoveredKeys,
+    (message) => {
+      const resources = getImageResources({ ...message, id: undefined }, false);
+      const filenamesByKey = mapImageFilenamesToKeys(
+        resources,
+        [
+          ...getSandboxImageFilenames(extractText(message)),
+          ...getFollowingSandboxImageFilenames(
+            message.id ?? "",
+            branchNodes,
+            allMessagesById,
+          ),
+        ],
+      );
+      return resources.map((resource) => ({
+        key: resource.key,
+        part: imageResourceToPart(resource, filenamesByKey.get(resource.key)),
+      }));
+    },
+  );
+  stats.apiRecoveredMessages = apiImages.length;
+  for (const image of apiImages) {
+    stats.apiRecoveredImageResources += getImageResources(image, false).length;
+    const sourceId = getMessageParentId(image);
+    if (sourceId) generatedBySource.set(sourceId, image);
+  }
+
+  for (const element of scroller.querySelectorAll<HTMLElement>(
+    "[data-turn-key], [data-dil-message-id], [data-message-id], [data-chatgpt-search-message-ids]",
   )) {
+    stats.domContainersVisited++;
     const ids = [
+      element.dataset.turnKey,
       element.dataset.dilMessageId,
       element.dataset.messageId,
       element.dataset.chatgptSearchMessageIds,
@@ -1163,9 +1754,48 @@ function getUnattachedRenderedGeneratedImages(
       .flatMap((id) => id.split(/[\s,]+/));
     if (ids.length === 0) continue;
 
-    const generatedImages = Array.from(
+    const isTurnWrapper = element.hasAttribute("data-turn-key");
+    const containerImages = Array.from(
       element.querySelectorAll<HTMLImageElement>("img"),
-    ).filter((image) => /generated image/i.test(image.alt));
+    );
+    stats.imageElementsExamined += containerImages.length;
+    const generatedImages = containerImages.filter((image) => {
+      if (isTurnWrapper && image.closest(
+        "[data-dil-message-id], [data-message-id], [data-chatgpt-search-message-ids]",
+      )) return false;
+      const renderedRole = getRenderedMessageRole(image);
+      return isRenderedGeneratedImageCandidate(
+        renderedRole,
+        getRenderedImageApiRole(image, allMessagesById),
+        image.alt,
+        image.closest("[data-chatgpt-search-message-ids]") !== null,
+        image.closest(
+          '[data-testid="generated-image-preview"], [data-testid="generated-image-gallery"], [data-dil-message-id]',
+        ) !== null,
+      );
+    });
+    stats.generatedImageCandidates += generatedImages.length;
+    const turnUserId = generatedImages.length > 0
+      ? getRenderedTurnUserId(
+        element,
+        allMessagesById,
+        activeMessageIds,
+        branchNodes,
+      )
+      : null;
+    const questionNumber = (turnUserId
+      ? questionByMessageId.get(turnUserId)
+      : undefined) ?? ids.map((id) => questionByMessageId.get(id))
+      .find((number): number is number => number !== undefined) ?? null;
+    const questionPipeline = getQuestionRecovery(questionNumber);
+    if (generatedImages.length > 0) {
+      if (turnUserId) stats.candidatesWithActiveTurn++;
+      else stats.candidatesWithoutActiveTurn++;
+      if (questionPipeline) {
+        questionPipeline.candidateContainerCount++;
+        questionPipeline.candidateImageCount += generatedImages.length;
+      }
+    }
 
     const candidateIds = [...new Set(ids)].filter((id) => {
       if (resolvedBranchIds?.has(id)) return true;
@@ -1174,42 +1804,46 @@ function getUnattachedRenderedGeneratedImages(
         allMessagesById,
         activeMessageIds,
       )) return true;
-      // The rendered image can have its own DOM message ID that is absent from
-      // the paginated API response. Recover it only when the same visible
-      // ChatGPT turn also contains an API ID on the active branch.
-      if (generatedImages.length > 0) {
-        return isRenderedImageInActiveTurn(element, id, activeMessageIds);
-      }
-      return false;
+      // The image card's ID may be absent from the API. Its nearest user
+      // message must belong to the active branch before recovering the card.
+      return turnUserId !== null;
     });
-    if (candidateIds.length === 0) continue;
+    if (candidateIds.length === 0) {
+      if (generatedImages.length > 0 && questionPipeline) {
+        questionPipeline.candidateContainersRejectedAsInactive++;
+      }
+      continue;
+    }
+    stats.containersLinkedToActiveBranch++;
 
     // Sandbox links live in the assistant's text, while the corresponding
     // image can be attached to a related tool message. Walk the candidate
     // messages and their parents so the filename can be matched to that image.
-    const relatedIds = new Set(candidateIds);
-    for (const candidateId of candidateIds) {
-      let message = allMessagesById.get(candidateId);
-      const visitedParents = new Set<string>();
-      for (let depth = 0; message && depth < 4; depth++) {
-        const parentId = getMessageParentId(message);
-        if (!parentId || visitedParents.has(parentId)) break;
-        visitedParents.add(parentId);
-        const parent = allMessagesById.get(parentId);
-        if (!parent) break;
-        relatedIds.add(parentId);
-        message = parent;
-      }
-    }
-    const sandboxFilenames = [...new Set(
-      [...relatedIds].flatMap((id) => {
+    const relatedIds = getRelatedMessageIdsInTurn(candidateIds, allMessagesById);
+    const sandboxFilenames = [...new Set([
+      ...(turnUserId
+        ? getFollowingSandboxImageFilenames(
+          turnUserId,
+          branchNodes,
+          allMessagesById,
+        )
+        : []),
+      ...[...relatedIds].flatMap((id) => {
         const message = allMessagesById.get(id);
         if (!message || !["assistant", "tool"].includes(message.author?.role ?? "")) {
           return [];
         }
         return getSandboxImageFilenames(extractText(message));
       }),
-    )];
+    ])];
+    if (sandboxFilenames.length > 0) stats.containersWithSandboxNames++;
+    if (sandboxFilenames.length > 0 && questionPipeline) {
+      questionPipeline.containersWithSandboxFilenames++;
+      questionPipeline.sandboxFilenameCount = Math.max(
+        questionPipeline.sandboxFilenameCount,
+        sandboxFilenames.length,
+      );
+    }
     if (generatedImages.length === 0 && sandboxFilenames.length === 0) continue;
     // ChatGPT's generated-image cards sometimes render with an empty alt, so
     // use the message's own image nodes when its text provides a sandbox name.
@@ -1235,87 +1869,51 @@ function getUnattachedRenderedGeneratedImages(
       return message?.author?.role === "assistant" &&
         getSandboxImageFilenames(extractText(message)).length > 0;
     });
-    const sourceId = apiImageId ?? sandboxMessageId ?? candidateIds[0];
-    if (!sourceId || generatedBySource.has(sourceId)) continue;
-
-    const sourceMessage = allMessagesById.get(sourceId);
-    const apiImageResources = sourceMessage
-      ? getImageResources({ ...sourceMessage, id: undefined }, false)
-      : [];
-
-    if (sourceMessage && apiImageResources.length > 0) {
-      const canMapSandboxNames =
-        sandboxFilenames.length === apiImageResources.length;
-      // Even if the image bytes were already found on another message, keep
-      // this synthetic association so the sandbox URL in this response gets
-      // a local filename-to-path mapping of its own.
-      const needsSandboxNameMapping = canMapSandboxNames;
-      if (
-        apiImageResources.every((resource) => recoveredKeys.has(resource.key)) &&
-        !needsSandboxNameMapping
-      ) {
-        continue;
-      }
-      apiImageResources.forEach((resource) => recoveredKeys.add(resource.key));
-      generatedBySource.set(sourceId, {
-        ...sourceMessage,
-        id: `rendered-generated-image:${sourceId}`,
-        parent: sourceId,
-        author: { role: "assistant" },
-        create_time: sourceMessage.create_time ?? Date.now() / 1000,
-        end_turn: true,
-        content: {
-          content_type: "multimodal",
-          parts: apiImageResources.map((resource, index) =>
-            imageResourceToPart(
-              resource,
-              canMapSandboxNames ? sandboxFilenames[index] : undefined,
-            ),
-          ),
-        },
-      });
+    const assistantCandidateId = candidateIds.find((id) => {
+      const role = allMessagesById.get(id)?.author?.role;
+      return role === "assistant" || role === "tool";
+    });
+    const sourceId = apiImageId ?? sandboxMessageId ?? assistantCandidateId ?? candidateIds[0];
+    if (!sourceId) {
+      if (questionPipeline) questionPipeline.candidateContainersWithoutSource++;
       continue;
     }
+    const sourceMessage = allMessagesById.get(sourceId);
+    const alreadyRecovered = generatedBySource.get(sourceId);
+    // A turn wrapper is keyed by the user message. Its uploaded attachments
+    // are unrelated to the generated image rendered later in that turn.
+    const apiImageResources = sourceMessage &&
+      ["assistant", "tool"].includes(sourceMessage.author?.role ?? "")
+      ? getImageResources({ ...sourceMessage, id: undefined }, false)
+      : alreadyRecovered
+        ? getImageResources({ ...alreadyRecovered, id: undefined }, false)
+        : [];
+    if (apiImageResources.length > 0 && questionPipeline) {
+      questionPipeline.containersWithApiImageResources++;
+      questionPipeline.apiImageResourceCount = Math.max(
+        questionPipeline.apiImageResourceCount,
+        apiImageResources.length,
+      );
+    }
 
-    let renderedParts = getRenderedImagePartsForMessage(sourceId);
+    // A turn wrapper is keyed by its user message, while the image can live
+    // in an assistant card with no message ID. Read that card directly.
+    let renderedParts = sourceMessage?.author?.role === "user"
+      ? []
+      : getRenderedImagePartsForMessage(sourceId, "assistant", scroller);
     if (renderedParts.length === 0) {
-      let svgIndex = 0;
-      const fallbackParts: Array<Record<string, string | number>> = [];
-      for (const image of renderedImageCandidates) {
-        const src = image.currentSrc || image.src;
-        const filename = getRenderedImageFilename(image, element);
-        if (image.dataset.dComponent === "svg" && getSafeRenderedSvgDataUrl(src)) {
-          const svgBackgroundColor = getRenderedSvgBackgroundColor(image);
-          fallbackParts.push({
-            rendered_svg_data_url: src,
-            rendered_svg_key: `rendered-svg:${sourceId}:${svgIndex++}`,
-            ...(svgBackgroundColor
-              ? { rendered_svg_background_color: svgBackgroundColor }
-              : {}),
-            rendered_from_dom: 1,
-            ...(filename ? { image_filename: filename } : {}),
-          });
-          continue;
-        }
-        const inlineImageDataUrl = getSafeRenderedImageDataUrl(src);
-        if (inlineImageDataUrl) {
-          fallbackParts.push({
-            inline_image_data_url: inlineImageDataUrl,
-            rendered_from_dom: 1,
-            ...(filename ? { image_filename: filename } : {}),
-          });
-          continue;
-        }
-        const imageUrl = getSafeHostedImageUrl(src);
-        if (imageUrl) {
-          fallbackParts.push({
-            image_url: imageUrl,
-            rendered_from_dom: 1,
-            ...(filename ? { image_filename: filename } : {}),
-          });
-        }
-      }
-      renderedParts = fallbackParts;
+      renderedParts = getRenderedImagePartsFromElements(
+        renderedImageCandidates,
+        element,
+        sourceId,
+      );
+    }
+    if (renderedParts.length > 0 && questionPipeline) {
+      questionPipeline.containersWithRenderedParts++;
+      questionPipeline.renderedPartCount = Math.max(
+        questionPipeline.renderedPartCount,
+        renderedParts.length,
+      );
     }
 
     const renderedResources = renderedParts.length > 0
@@ -1323,37 +1921,723 @@ function getUnattachedRenderedGeneratedImages(
           content: { content_type: "multimodal", parts: renderedParts },
         }, false)
       : [];
-    if (renderedResources.length > 0) {
-      const canMapSandboxNames =
-        sandboxFilenames.length === renderedResources.length;
-      const needsSandboxNameMapping = canMapSandboxNames;
-      if (
-        renderedResources.every((resource) => recoveredKeys.has(resource.key)) &&
-        !needsSandboxNameMapping
-      ) {
-        continue;
-      }
-      renderedResources.forEach((resource) => recoveredKeys.add(resource.key));
-      generatedBySource.set(sourceId, {
-        id: `rendered-generated-image:${sourceId}`,
-        parent: sourceMessage ? sourceId : null,
-        author: { role: "assistant" },
-        create_time: sourceMessage?.create_time ?? Date.now() / 1000,
-        end_turn: true,
-        content: {
-          content_type: "multimodal",
-          parts: renderedResources.map((resource, index) =>
-            imageResourceToPart(
-              resource,
-              canMapSandboxNames ? sandboxFilenames[index] : undefined,
-            ),
-          ),
-        },
+    if (renderedResources.length > 0 && questionPipeline) {
+      questionPipeline.renderedResourceCount = Math.max(
+        questionPipeline.renderedResourceCount,
+        renderedResources.length,
+      );
+    }
+    const combinedResources = getImageResources({
+      content: {
+        content_type: "multimodal",
+        parts: [
+          ...apiImageResources.map((resource) => imageResourceToPart(resource)),
+          ...renderedResources.map((resource) => imageResourceToPart(resource)),
+        ],
+      },
+    }, false);
+    if (combinedResources.length === 0) {
+      if (questionPipeline) questionPipeline.containersWithNoCombinedResources++;
+      continue;
+    }
+    stats.containersWithImageResources++;
+    if (questionPipeline) questionPipeline.containersWithImageResources++;
+
+    const parts = getImagePartsWithSandboxFilenames(
+      apiImageResources,
+      renderedResources,
+      sandboxFilenames,
+    );
+    const currentImageMessage = createRenderedGeneratedImageMessage(
+      sourceId,
+      sourceMessage,
+      turnUserId,
+      parts,
+    );
+    if (alreadyRecovered) {
+      generatedBySource.set(sourceId, mergeRecoveredGeneratedImageMessages(
+        alreadyRecovered,
+        currentImageMessage,
+        getGeneratedImagePartsWithKeys,
+        turnUserId ?? getMessageParentId(alreadyRecovered),
+      ));
+      combinedResources.forEach((resource) => recoveredKeys.add(resource.key));
+      continue;
+    }
+
+    const newResources = combinedResources.filter((resource) =>
+      !recoveredKeys.has(resource.key)
+    );
+    if (newResources.length === 0) {
+      if (questionPipeline) questionPipeline.containersWithDuplicateResources++;
+      continue;
+    }
+    stats.recoveredImageResources += newResources.length;
+    if (questionPipeline) {
+      questionPipeline.recoveredImageResourceCount += newResources.length;
+    }
+    combinedResources.forEach((resource) => recoveredKeys.add(resource.key));
+    generatedBySource.set(sourceId, currentImageMessage);
+  }
+
+  stats.questionRecoveryPipeline = [...questionRecoveryByNumber.values()]
+    .sort((left, right) => left.questionNumber - right.questionNumber);
+  return { messages: [...generatedBySource.values()], stats };
+}
+
+function hasOlderMessagesLoader(scroller: HTMLElement): boolean {
+  // ChatGPT keeps the pagination spinner as the first child of the
+  // conversation root. Its accessible text is localized, so use structure.
+  return scroller.querySelector(
+    '[data-chatgpt-conversation-selection-target] > :first-child > [role="status"]',
+  ) !== null;
+}
+
+async function waitForRenderedPageToSettle(scroller: HTMLElement | null): Promise<number> {
+  if (!scroller) return 0;
+  const startedAt = Date.now();
+  let lastChangeAt = startedAt;
+  const observer = new MutationObserver(() => {
+    lastChangeAt = Date.now();
+  });
+  observer.observe(scroller, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["src"],
+  });
+  try {
+    while (
+      Date.now() - startedAt < 2_500 &&
+      (Date.now() - startedAt < 600 || Date.now() - lastChangeAt < 350)
+    ) {
+      await sleep(100);
+    }
+  } finally {
+    observer.disconnect();
+  }
+
+  // Image galleries may mount before their blob <img> nodes. Wait while a
+  // visible gallery is still empty, before scrolling it out of the viewport.
+  const unhydratedVisibleGalleries = () => {
+    const viewport = scroller.getBoundingClientRect();
+    return Array.from(scroller.querySelectorAll<HTMLElement>(
+      '[data-testid="generated-image-gallery"]',
+    )).filter((gallery) => {
+      const rect = gallery.getBoundingClientRect();
+      return rect.bottom > viewport.top && rect.top < viewport.bottom &&
+        !gallery.querySelector('img[src]');
+    });
+  };
+  const hydrationDeadline = Date.now() + 2_000;
+  while (unhydratedVisibleGalleries().length > 0 && Date.now() < hydrationDeadline) {
+    await sleep(200);
+  }
+  // Some galleries remain empty because ChatGPT has not mounted their active
+  // image yet. Keep scanning other sources and record the unresolved count;
+  // a later window may expose the image, but this count is not proof of it.
+  return unhydratedVisibleGalleries().length;
+}
+
+function addImageDiagnosticEvent(
+  diagnostics: ImageExportDiagnostics,
+  startedAtMs: number,
+  stage: string,
+  details: Record<string, unknown>,
+): void {
+  diagnostics.events.push({
+    elapsedMs: Math.max(0, Math.round(performance.now() - startedAtMs)),
+    stage,
+    details,
+  });
+}
+
+function getImageDiagnosticKind(resource: ImageResource): string {
+  if (resource.inlineSvgDataUrl) return "inline-svg";
+  if (resource.inlineImageDataUrl) return "inline-data";
+  if (resource.fileId) return resource.scheme ?? "file-service";
+  if (resource.imageUrl?.startsWith("blob:")) return "blob-url";
+  if (resource.imageUrl) return "hosted-url";
+  return "unknown";
+}
+
+function safeImageDiagnosticError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message
+    .replace(/(?:https?|blob|data):\/\/\S+/gi, "[url]")
+    .replace(/data:image\/[^\s;,]+;base64,[^\s)]+/gi, "[inline image]")
+    .replace(/[\r\n\]]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 160) || "unknown image error";
+}
+
+function getQuestionNumberByMessageId(
+  messages: readonly ApiMessage[],
+): Map<string, number> {
+  const questionByMessageId = new Map<string, number>();
+  let questionNumber = 0;
+  for (const message of messages) {
+    if (message.author?.role === "user") questionNumber++;
+    if (message.id && questionNumber > 0) {
+      questionByMessageId.set(message.id, questionNumber);
+    }
+  }
+  return questionByMessageId;
+}
+
+function getDiagnosticQuestionNumber(
+  message: ApiMessage,
+  questionByMessageId: ReadonlyMap<string, number>,
+  allMessagesById: ReadonlyMap<string, ApiMessage>,
+): number | null {
+  const id = message.id ?? "";
+  const sourceId = id.startsWith("rendered-generated-image:")
+    ? id.slice("rendered-generated-image:".length)
+    : id;
+  const direct = questionByMessageId.get(sourceId);
+  if (direct !== undefined) return direct;
+  let currentId = getMessageParentId(message) ??
+    (sourceId !== id ? sourceId : null);
+  const visited = new Set<string>();
+  while (currentId && !visited.has(currentId)) {
+    visited.add(currentId);
+    const questionNumber = questionByMessageId.get(currentId);
+    if (questionNumber !== undefined) return questionNumber;
+    const current = allMessagesById.get(currentId);
+    if (!current) break;
+    currentId = getMessageParentId(current);
+  }
+  return null;
+}
+
+function findQuestionInsertionIndex(
+  messages: readonly ApiMessage[],
+  questionNumber: number,
+  questionByMessageId: ReadonlyMap<string, number>,
+  allMessagesById: ReadonlyMap<string, ApiMessage>,
+): number {
+  let lastMessageInQuestion = -1;
+  messages.forEach((message, index) => {
+    if (
+      getDiagnosticQuestionNumber(message, questionByMessageId, allMessagesById) ===
+      questionNumber
+    ) {
+      lastMessageInQuestion = index;
+    }
+  });
+  return lastMessageInQuestion >= 0
+    ? lastMessageInQuestion + 1
+    : messages.length;
+}
+
+async function collectPaginatedGeneratedImages(
+  existingMessages: ApiMessage[],
+  branchNodes: ApiMessage[] | null,
+  allMessagesById: ReadonlyMap<string, ApiMessage>,
+  conversationId: string,
+  diagnostics: ImageExportDiagnostics,
+  diagnosticStartedAtMs: number,
+  questionByMessageId: ReadonlyMap<string, number>,
+  selectedMessageIds: ReadonlySet<string> | null,
+): Promise<{
+  messages: ApiMessage[];
+  prefetched: Map<string, Awaited<ReturnType<typeof requestImage>>>;
+}> {
+  const recovered = new Map<string, ApiMessage>();
+  const prefetched = new Map<string, Awaited<ReturnType<typeof requestImage>>>();
+  const attemptedFilePreviews = new Map<string, number>();
+  const unresolvedFilePreviews = new Set<string>();
+  const blobPrefetchAttempts = new Map<string, number>();
+  const activeBranchMessages = branchNodes ?? existingMessages;
+  const activeMessageIds = new Set(
+    activeBranchMessages.flatMap((message) => message.id ? [message.id] : []),
+  );
+  const conversationMessageIds = new Set(allMessagesById.keys());
+  const readinessStartedAt = performance.now();
+  const readinessDeadline = Date.now() + 15_000;
+  let scroller: HTMLElement | null = null;
+  let previousReadyScroller: HTMLElement | null = null;
+  let consecutiveReadySamples = 0;
+  let lastScrollerSelection = findConversationScroller(
+    document, activeMessageIds, conversationMessageIds,
+  );
+  let lastScrollerMeasurement = {
+    scrollHeight: 0,
+    viewportHeight: 0,
+    renderedTurnCount: 0,
+  };
+  while (Date.now() < readinessDeadline) {
+    lastScrollerSelection = findConversationScroller(
+      document, activeMessageIds, conversationMessageIds,
+    );
+    const candidate = lastScrollerSelection.scroller;
+    const measured = candidate ?? document.querySelector<HTMLElement>(
+      ".thread-scroll-container",
+    );
+    lastScrollerMeasurement = {
+      scrollHeight: measured?.scrollHeight ?? 0,
+      viewportHeight: measured?.clientHeight ?? 0,
+      renderedTurnCount: measured?.querySelectorAll("[data-turn-key]").length ?? 0,
+    };
+    consecutiveReadySamples = candidate
+      ? previousReadyScroller === candidate ? consecutiveReadySamples + 1 : 1
+      : 0;
+    previousReadyScroller = candidate;
+    if (candidate && consecutiveReadySamples >= 2) {
+      scroller = candidate;
+      break;
+    }
+    await sleep(100);
+  }
+  const scrollerReadyWaitMs = Math.max(
+    0,
+    Math.round(performance.now() - readinessStartedAt),
+  );
+  addImageDiagnosticEvent(diagnostics, diagnosticStartedAtMs, "image-scan-readiness", {
+    ready: Boolean(scroller),
+    waitedMs: scrollerReadyWaitMs,
+    consecutiveReadySamples,
+    scrollerSource: lastScrollerSelection.source,
+    threadScrollerCount: lastScrollerSelection.threadScrollerCount,
+    visibleThreadScrollerCount: lastScrollerSelection.visibleThreadScrollerCount,
+    readyThreadScrollerCount: lastScrollerSelection.readyThreadScrollerCount,
+    rejectedForeignThreadScrollerCount:
+      lastScrollerSelection.rejectedForeignThreadScrollerCount,
+    visibleTurnCount: lastScrollerSelection.visibleTurnCount,
+    activeVisibleTurnCount: lastScrollerSelection.activeVisibleTurnCount,
+    activeMessageMatches: lastScrollerSelection.activeMessageMatches,
+    ...lastScrollerMeasurement,
+  });
+  if (!scroller) {
+    throw new Error(
+      "ChatGPT is still loading the conversation. Wait until its messages appear, then export again.",
+    );
+  }
+  const earliestActiveUserId = activeBranchMessages.find(
+    (message) => message.author?.role === "user" && message.id,
+  )?.id ?? null;
+  const initialPageEstimate = scroller
+    ? Math.ceil(scroller.scrollHeight / Math.max(1, scroller.clientHeight / 2)) + 10
+    : 1;
+  // ChatGPT grows the scroll container as older turns are fetched. A page
+  // limit based only on its initial height can therefore expire while the
+  // export is still making progress through the active conversation.
+  const safetyPageLimit = Math.max(40, activeBranchMessages.length * 4 + 20);
+  const maxPages = scroller
+    ? Math.max(initialPageEstimate, safetyPageLimit)
+    : 1;
+  const distanceFromBottom = scroller
+    ? scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop
+    : 0;
+  let stopReason = "completed";
+  addImageDiagnosticEvent(diagnostics, diagnosticStartedAtMs, "image-scan-start", {
+    scrollContainerFound: Boolean(scroller),
+    initialScrollTop: scroller?.scrollTop ?? null,
+    scrollHeight: scroller?.scrollHeight ?? null,
+    viewportHeight: scroller?.clientHeight ?? null,
+    earliestActiveUserFound: Boolean(earliestActiveUserId),
+    activeBranchMessageCount: activeBranchMessages.length,
+    initialPageEstimate,
+    safetyPageLimit,
+    maxPages,
+    scrollerReadyWaitMs,
+  });
+
+  async function prefetchVisibleBlobs(
+    messages: readonly ApiMessage[],
+    existing: readonly ImageResource[],
+    page: number,
+    phase: string,
+  ): Promise<void> {
+    const blobResources = selectBlobResourcesForPrefetch(
+      messages.flatMap((message) => getImageResources(message, false)),
+      existing,
+      new Set(prefetched.keys()),
+    ).filter((resource) => (blobPrefetchAttempts.get(resource.key) ?? 0) < 3);
+    let nextBlob = 0;
+    let succeeded = 0;
+    let bytesPrefetched = 0;
+    const failures: Array<{ resourceKind: string; reason: string }> = [];
+    await Promise.all(Array.from(
+      { length: Math.min(MAX_CONCURRENT_IMAGE_DOWNLOADS, blobResources.length) },
+      async () => {
+        while (nextBlob < blobResources.length) {
+          const resource = blobResources[nextBlob++];
+          blobPrefetchAttempts.set(
+            resource.key,
+            (blobPrefetchAttempts.get(resource.key) ?? 0) + 1,
+          );
+          try {
+            const downloaded = await requestImage(resource, conversationId);
+            prefetched.set(resource.key, downloaded);
+            succeeded++;
+            bytesPrefetched += downloaded.sizeBytes;
+          } catch (error) {
+            failures.push({
+              resourceKind: getImageDiagnosticKind(resource),
+              reason: safeImageDiagnosticError(error),
+            });
+            devWarn("Could not prefetch a rendered image", error);
+          }
+        }
+      },
+    ));
+    if (blobResources.length > 0) {
+      addImageDiagnosticEvent(diagnostics, diagnosticStartedAtMs, "blob-prefetch", {
+        page, phase,
+        attempted: blobResources.length,
+        succeeded,
+        failed: failures.length,
+        bytesPrefetched,
+        failures,
       });
     }
   }
 
-  return [...generatedBySource.values()];
+  try {
+    for (let page = 0; page < maxPages; page++) {
+      const unresolvedVisibleGalleryCount = await waitForRenderedPageToSettle(scroller);
+      const scan = getUnattachedRenderedGeneratedImages(
+        existingMessages,
+        branchNodes,
+        allMessagesById,
+        scroller,
+      );
+      // Fetch ephemeral blobs before opening a file viewer changes the page
+      // layout and can unmount this virtualized turn.
+      await prefetchVisibleBlobs(
+        scan.messages,
+        page === 0
+          ? existingMessages.flatMap((message) => getImageResources(message))
+          : [],
+        page,
+        "rendered-scan",
+      );
+      const filePreviews = await getRenderedFilePreviewImages(
+        scroller,
+        branchNodes,
+        allMessagesById,
+        activeMessageIds,
+        selectedMessageIds,
+        attemptedFilePreviews,
+        unresolvedFilePreviews,
+      );
+      await prefetchVisibleBlobs(filePreviews.messages, [], page, "file-preview");
+      const visible = [...scan.messages, ...filePreviews.messages];
+      const newlyRecoveredQuestions = new Set<number>();
+      let newlyRecoveredImageResources = 0;
+      for (const message of visible) {
+        if (!message.id) continue;
+        const previous = recovered.get(message.id);
+        const previousKeys = new Set(previous
+          ? getGeneratedImagePartsWithKeys(previous).map(({ key }) => key)
+          : []);
+        if (!previous) {
+          recovered.set(message.id, message);
+        } else {
+          const preferredParentId = [getMessageParentId(message), getMessageParentId(previous)]
+            .find((id) => id && allMessagesById.get(id)?.author?.role === "user") ??
+            getMessageParentId(message) ?? getMessageParentId(previous);
+          recovered.set(message.id, mergeRecoveredGeneratedImageMessages(
+            previous,
+            message,
+            getGeneratedImagePartsWithKeys,
+            preferredParentId,
+          ));
+        }
+        const added = getGeneratedImagePartsWithKeys(recovered.get(message.id)!)
+          .filter(({ key }) => !previousKeys.has(key)).length;
+        newlyRecoveredImageResources += added;
+        if (added > 0) {
+          const questionNumber = getDiagnosticQuestionNumber(
+            recovered.get(message.id)!, questionByMessageId, allMessagesById,
+          );
+          if (questionNumber !== null) newlyRecoveredQuestions.add(questionNumber);
+        }
+      }
+      const visibleQuestions = [...new Set(visible.flatMap((message) => {
+        const questionNumber = getDiagnosticQuestionNumber(
+          message,
+          questionByMessageId,
+          allMessagesById,
+        );
+        return questionNumber === null ? [] : [questionNumber];
+      }))].sort((a, b) => a - b);
+      const visibleImageResourceCount = visible.reduce(
+        (sum, message) => sum + getImageResources(message, false).length,
+        0,
+      );
+      const firstRenderedTurn = getRenderedTurnProgressReference(
+        scroller,
+        earliestActiveUserId,
+        allMessagesById,
+        activeMessageIds,
+        branchNodes,
+      );
+      const olderMessagesLoaderPresent = scroller
+        ? hasOlderMessagesLoader(scroller)
+        : false;
+      const earlierTurnsRemain = scroller
+        ? !isGeneratedImageScanComplete(
+          firstRenderedTurn.referenceId,
+          earliestActiveUserId,
+          olderMessagesLoaderPresent,
+          scroller.scrollTop,
+        )
+        : false;
+      addImageDiagnosticEvent(diagnostics, diagnosticStartedAtMs, "image-scan-window", {
+        page,
+        scrollTop: scroller?.scrollTop ?? null,
+        scrollHeight: scroller?.scrollHeight ?? null,
+        viewportHeight: scroller?.clientHeight ?? null,
+        mountedTurnCount: scroller?.querySelectorAll("[data-turn-key]").length ?? 0,
+        firstRenderedTurnMatchesEarliestActiveUser: Boolean(
+          earliestActiveUserId && firstRenderedTurn.referenceId === earliestActiveUserId
+        ),
+        firstRenderedTurnUserResolved: Boolean(firstRenderedTurn.userId),
+        firstRenderedTurnKeyMatchesEarliestActiveUser: Boolean(
+          earliestActiveUserId && firstRenderedTurn.turnKey === earliestActiveUserId
+        ),
+        olderMessagesLoaderPresent,
+        earlierTurnsRemain,
+        ...scan.stats,
+        recoveredMessagesThisWindow: visible.length,
+        recoveredImageResourcesThisWindow: visibleImageResourceCount,
+        recoveredQuestionNumbers: visibleQuestions,
+        newlyRecoveredQuestionNumbers: [...newlyRecoveredQuestions].sort((a, b) => a - b),
+        newlyRecoveredImageResources,
+        unresolvedVisibleGalleryCount,
+        filePreviewCandidates: filePreviews.candidates,
+        filePreviewImagesCaptured: filePreviews.captured,
+        filePreviewFailures: filePreviews.failed,
+      });
+
+      if (!scroller) {
+        stopReason = "scroll-container-not-found";
+        break;
+      }
+      const firstTurnKey = firstRenderedTurn.turnKey;
+      if (!earlierTurnsRemain) {
+        stopReason = "earliest-active-turn-reached";
+        break;
+      }
+      const firstMessageId = getRenderedMessageIds(
+        scroller.querySelector<HTMLElement>(
+          "[data-dil-message-id], [data-message-id], [data-chatgpt-search-message-ids]",
+        ) ?? scroller,
+      ).join(" ");
+      const renderedTurns = Array.from(
+        scroller.querySelectorAll<HTMLElement>("[data-turn-key]"),
+      );
+      const renderedSpan = renderedTurns.length > 1
+        ? renderedTurns.at(-1)!.getBoundingClientRect().bottom -
+          renderedTurns[0].getBoundingClientRect().top
+        : renderedTurns[0]?.getBoundingClientRect().height ?? 0;
+      // ChatGPT renders the conversation inside one virtualized spacer. Jumping
+      // straight to scrollTop=0 skips all intermediate turns, so walk upward in
+      // overlapping steps and inspect each mounted window before it unmounts.
+      const scrollStep = getGeneratedImageScanStep(scroller.clientHeight, renderedSpan);
+      const previousScrollTop = scroller.scrollTop;
+      const previousHeight = scroller.scrollHeight;
+      scroller.scrollTop = Math.max(0, previousScrollTop - scrollStep);
+
+      let loaded = false;
+      const deadline = Date.now() + 20_000;
+      const navigationStartedAt = performance.now();
+      let paginationRetryCount = 0;
+      let nextPaginationRetryAt = Date.now() + 3_000;
+      while (Date.now() < deadline) {
+        await sleep(150);
+        const nextFirstTurn = getRenderedTurnProgressReference(
+          scroller,
+          earliestActiveUserId,
+          allMessagesById,
+          activeMessageIds,
+          branchNodes,
+        );
+        const nextTurnKey = nextFirstTurn.turnKey;
+        const nextMessageId = getRenderedMessageIds(
+          scroller.querySelector<HTMLElement>(
+            "[data-dil-message-id], [data-message-id], [data-chatgpt-search-message-ids]",
+          ) ?? scroller,
+        ).join(" ");
+        if (
+          scroller.scrollHeight !== previousHeight ||
+          Math.abs(scroller.scrollTop - previousScrollTop) > 1 ||
+          nextTurnKey !== firstTurnKey ||
+          nextMessageId !== firstMessageId
+        ) {
+          loaded = true;
+          break;
+        }
+        if (isGeneratedImageScanComplete(
+          nextFirstTurn.referenceId,
+          earliestActiveUserId,
+          hasOlderMessagesLoader(scroller),
+          scroller.scrollTop,
+        )) {
+          loaded = true;
+          break;
+        }
+        // Once scrollTop is already zero, setting it to zero again emits no
+        // scroll event. Move the top sentinel out of view and back to give
+        // ChatGPT's older-message pagination a bounded second chance.
+        if (
+          previousScrollTop <= 1 && scroller.scrollTop <= 1 &&
+          hasOlderMessagesLoader(scroller) &&
+          paginationRetryCount < 2 && Date.now() >= nextPaginationRetryAt
+        ) {
+          paginationRetryCount++;
+          const retryScrollTop = await nudgeOlderMessagesLoader(
+            scroller,
+            previousHeight,
+            sleep,
+          );
+          nextPaginationRetryAt = Date.now() + 5_000;
+          addImageDiagnosticEvent(diagnostics, diagnosticStartedAtMs, "image-scan-pagination-retry", {
+            page,
+            attempt: paginationRetryCount,
+            retryScrollTop,
+            scrollHeight: scroller.scrollHeight,
+            firstRenderedTurnMatchesEarliestActiveUser: Boolean(
+              earliestActiveUserId &&
+                nextFirstTurn.referenceId === earliestActiveUserId
+            ),
+          });
+        }
+      }
+      if (!loaded) {
+        const currentFirstTurn = getRenderedTurnProgressReference(
+          scroller,
+          earliestActiveUserId,
+          allMessagesById,
+          activeMessageIds,
+          branchNodes,
+        );
+        if (isGeneratedImageScanComplete(
+          currentFirstTurn.referenceId,
+          earliestActiveUserId,
+          hasOlderMessagesLoader(scroller),
+          scroller.scrollTop,
+        )) {
+          stopReason = "earliest-active-turn-reached-during-scroll";
+          addImageDiagnosticEvent(diagnostics, diagnosticStartedAtMs, "image-scan-scroll", {
+            page,
+            loaded: false,
+            fromScrollTop: previousScrollTop,
+            requestedScrollTop: Math.max(0, previousScrollTop - scrollStep),
+            actualScrollTop: scroller.scrollTop,
+            scrollHeightBefore: previousHeight,
+            scrollHeightAfter: scroller.scrollHeight,
+            elapsedMs: Math.round(performance.now() - navigationStartedAt),
+            paginationRetryCount,
+            firstRenderedTurnUserResolved: Boolean(currentFirstTurn.userId),
+            firstRenderedTurnMatchesEarliestActiveUser: Boolean(
+              earliestActiveUserId &&
+                currentFirstTurn.referenceId === earliestActiveUserId
+            ),
+            firstRenderedTurnKeyMatchesEarliestActiveUser: Boolean(
+              earliestActiveUserId && currentFirstTurn.turnKey === earliestActiveUserId
+            ),
+            stopReason,
+          });
+          break;
+        }
+        stopReason = "older-messages-did-not-load";
+        addImageDiagnosticEvent(diagnostics, diagnosticStartedAtMs, "image-scan-scroll", {
+          page,
+          loaded: false,
+          fromScrollTop: previousScrollTop,
+          requestedScrollTop: Math.max(0, previousScrollTop - scrollStep),
+          actualScrollTop: scroller.scrollTop,
+          scrollHeightBefore: previousHeight,
+          scrollHeightAfter: scroller.scrollHeight,
+          elapsedMs: Math.round(performance.now() - navigationStartedAt),
+          paginationRetryCount,
+          firstRenderedTurnUserResolved: Boolean(currentFirstTurn.userId),
+          firstRenderedTurnMatchesEarliestActiveUser: Boolean(
+            earliestActiveUserId &&
+              currentFirstTurn.referenceId === earliestActiveUserId
+          ),
+          firstRenderedTurnKeyMatchesEarliestActiveUser: Boolean(
+            earliestActiveUserId && currentFirstTurn.turnKey === earliestActiveUserId
+          ),
+          stopReason,
+        });
+        throw new Error(
+          "ChatGPT did not load older messages needed for generated images. Try exporting again after the conversation finishes loading.",
+        );
+      }
+      const currentFirstTurn = getRenderedTurnProgressReference(
+        scroller,
+        earliestActiveUserId,
+        allMessagesById,
+        activeMessageIds,
+        branchNodes,
+      );
+      // The newly reached viewport has not been scanned yet. Even if this
+      // scroll reaches the top, ending here would omit its lazy-loaded images.
+      if (page === maxPages - 1) {
+        stopReason = "scan-page-limit";
+        addImageDiagnosticEvent(diagnostics, diagnosticStartedAtMs, "image-scan-limit", {
+          maxPages,
+          reachedOldestTurn: isGeneratedImageScanComplete(
+            currentFirstTurn.referenceId,
+            earliestActiveUserId,
+            hasOlderMessagesLoader(scroller),
+            scroller.scrollTop,
+          ),
+        });
+        throw new Error("ChatGPT has more image pages than this export can safely load.");
+      }
+      addImageDiagnosticEvent(diagnostics, diagnosticStartedAtMs, "image-scan-scroll", {
+        page,
+        loaded: true,
+        fromScrollTop: previousScrollTop,
+        requestedScrollTop: Math.max(0, previousScrollTop - scrollStep),
+        actualScrollTop: scroller.scrollTop,
+        scrollHeightBefore: previousHeight,
+        scrollHeightAfter: scroller.scrollHeight,
+        mountedTurnCount: scroller.querySelectorAll("[data-turn-key]").length,
+        elapsedMs: Math.round(performance.now() - navigationStartedAt),
+      });
+    }
+    if (unresolvedFilePreviews.size > 0) {
+      stopReason = "selected-file-preview-unavailable";
+      addImageDiagnosticEvent(diagnostics, diagnosticStartedAtMs, "image-file-preview-error", {
+        unresolvedSelectedFilePreviewCount: unresolvedFilePreviews.size,
+      });
+      throw new Error(
+        "ChatGPT did not load one or more selected image file previews needed for export.",
+      );
+    }
+  } catch (error) {
+    stopReason = stopReason === "completed" ? "error" : stopReason;
+    addImageDiagnosticEvent(diagnostics, diagnosticStartedAtMs, "image-scan-error", {
+      reason: safeImageDiagnosticError(error),
+      pagesVisited: diagnostics.events.filter((event) => event.stage === "image-scan-window")
+        .length,
+    });
+    throw error;
+  } finally {
+    const scrollTopBeforeRestore = scroller?.scrollTop ?? null;
+    if (scroller?.isConnected) {
+      scroller.scrollTop = Math.max(
+        0,
+        scroller.scrollHeight - scroller.clientHeight - distanceFromBottom,
+      );
+    }
+    addImageDiagnosticEvent(diagnostics, diagnosticStartedAtMs, "image-scan-finish", {
+      stopReason,
+      recoveredMessageCount: recovered.size,
+      prefetchedImageCount: prefetched.size,
+      scrollTopBeforeRestore,
+      scrollTopAfterRestore: scroller?.scrollTop ?? null,
+    });
+  }
+
+  return { messages: [...recovered.values()], prefetched };
 }
 
 // -----------------------------------------------------------------------
@@ -1478,6 +2762,26 @@ async function doLoadConversation(
   forceRefresh: boolean,
 ): Promise<ConversationData> {
   imageResourceCache = new WeakMap();
+  const diagnosticStartedAtMs = performance.now();
+  const imageDiagnostics: ImageExportDiagnostics = {
+    schemaVersion: 1,
+    buildId: CHATSCRIBE_BUILD_ID,
+    startedAt: new Date().toISOString(),
+    settings: {
+      bundleImages: downloadImages,
+      includeGeneratedImages,
+      fetchImages,
+      selectedMessagesOnly: selectedMessageIds !== null,
+    },
+    events: [],
+    messages: [],
+  };
+  addImageDiagnosticEvent(imageDiagnostics, diagnosticStartedAtMs, "conversation-load-start", {
+    bundleImages: downloadImages,
+    includeGeneratedImages,
+    fetchImages,
+    selectedMessagesOnly: selectedMessageIds !== null,
+  });
   await waitForBridge();
 
   const rawConvId = extractConversationId();
@@ -1494,12 +2798,14 @@ async function doLoadConversation(
   const rawCacheKey = location.pathname;
   let allById: Map<string, ApiMessage>;
   let currentNode: string | null;
+  let reusedRawConversation = false;
 
   if (
     !forceRefresh &&
     cachedRawConversation?.key === rawCacheKey &&
     Date.now() - cachedRawConversation.completedAt < CONVERSATION_CACHE_TTL_MS
   ) {
+    reusedRawConversation = true;
     allById = new Map(cachedRawConversation.messages);
     currentNode = cachedRawConversation.currentNode;
     lastLoadProgress = allById.size;
@@ -1589,6 +2895,11 @@ async function doLoadConversation(
   }
 
   devLog(`Pagination complete. Raw messages: ${allById.size}`);
+  addImageDiagnosticEvent(imageDiagnostics, diagnosticStartedAtMs, "conversation-pagination", {
+    rawApiMessageCount: allById.size,
+    reusedRawCache: reusedRawConversation,
+    currentNodeFound: Boolean(currentNode),
+  });
 
   // ---- Resolve the active branch ----
   const exportableAll = Array.from(allById.values()).filter((m) =>
@@ -1597,9 +2908,15 @@ async function doLoadConversation(
 
   let orderedMessages: ApiMessage[];
   let activeBranchNodes: ApiMessage[] | null = null;
+  let branchWalkStopReason = currentNode ? "unresolved" : "no-current-node";
+  let branchWalkVisitedNodeCount = 0;
+  let usedChronologicalFallback = false;
 
   if (currentNode) {
-    activeBranchNodes = walkActiveBranchNodes(allById, currentNode);
+    const branchWalk = resolveActiveBranchNodes(allById, currentNode);
+    activeBranchNodes = branchWalk.messages;
+    branchWalkStopReason = branchWalk.stopReason;
+    branchWalkVisitedNodeCount = branchWalk.visitedNodeCount;
     const branch = activeBranchNodes?.filter((message) =>
       isExportable(message, downloadImages, includeGeneratedImages),
     );
@@ -1609,6 +2926,7 @@ async function doLoadConversation(
         `Branch walk succeeded: ${orderedMessages.length} messages (current_node path)`,
       );
     } else {
+      usedChronologicalFallback = true;
       devWarn("Branch walk failed; falling back to chronological pairing");
       orderedMessages = buildChronologicalMessages(
         exportableAll,
@@ -1617,6 +2935,7 @@ async function doLoadConversation(
       );
     }
   } else {
+    usedChronologicalFallback = true;
     devWarn("No current_node; using chronological pairing");
     orderedMessages = buildChronologicalMessages(
       exportableAll,
@@ -1625,22 +2944,163 @@ async function doLoadConversation(
     );
   }
 
-  if (downloadImages && includeGeneratedImages) {
-    const generatedMessages = getUnattachedRenderedGeneratedImages(
-      orderedMessages,
-      activeBranchNodes,
+  const questionByMessageId = getQuestionNumberByMessageId(orderedMessages);
+  let currentDiagnosticQuestion: number | null = null;
+  for (const message of activeBranchNodes ?? []) {
+    if (message.author?.role === "user") {
+      const exportQuestionNumber = message.id
+        ? questionByMessageId.get(message.id)
+        : undefined;
+      if (exportQuestionNumber !== undefined) {
+        currentDiagnosticQuestion = exportQuestionNumber;
+      }
+    }
+    if (message.id && currentDiagnosticQuestion !== null &&
+      !questionByMessageId.has(message.id)) {
+      questionByMessageId.set(message.id, currentDiagnosticQuestion);
+    }
+  }
+  const apiNodeAuditByQuestion = new Map<number, {
+    rawUserNodes: number;
+    rawAssistantNodes: number;
+    exportableAssistantNodes: number;
+    assistantNodesWithText: number;
+    assistantApiImageResources: number;
+    assistantSandboxReferences: number;
+    rawToolNodes: number;
+    toolApiImageResources: number;
+  }>();
+  let unmappedAssistantOrToolNodeCount = 0;
+  for (const message of allById.values()) {
+    const role = message.author?.role;
+    if (role !== "user" && role !== "assistant" && role !== "tool") continue;
+    const questionNumber = getDiagnosticQuestionNumber(
+      message,
+      questionByMessageId,
       allById,
     );
+    if (questionNumber === null) {
+      if (role === "assistant" || role === "tool") unmappedAssistantOrToolNodeCount++;
+      continue;
+    }
+    const audit = apiNodeAuditByQuestion.get(questionNumber) ?? {
+      rawUserNodes: 0,
+      rawAssistantNodes: 0,
+      exportableAssistantNodes: 0,
+      assistantNodesWithText: 0,
+      assistantApiImageResources: 0,
+      assistantSandboxReferences: 0,
+      rawToolNodes: 0,
+      toolApiImageResources: 0,
+    };
+    if (role === "user") audit.rawUserNodes++;
+    if (role === "assistant") {
+      audit.rawAssistantNodes++;
+      if (isExportable(message, downloadImages, includeGeneratedImages)) {
+        audit.exportableAssistantNodes++;
+      }
+      if (extractText(message)) audit.assistantNodesWithText++;
+      audit.assistantApiImageResources += getImageResources(message, false).length;
+      audit.assistantSandboxReferences += [
+        ...extractText(message).matchAll(/sandbox:\/mnt\/data\//gi),
+      ].length;
+    }
+    if (role === "tool") {
+      audit.rawToolNodes++;
+      audit.toolApiImageResources += getImageResources(message, false).length;
+    }
+    apiNodeAuditByQuestion.set(questionNumber, audit);
+  }
+  addImageDiagnosticEvent(imageDiagnostics, diagnosticStartedAtMs, "active-branch-resolved", {
+    branchWalkSucceeded: activeBranchNodes !== null,
+    branchWalkStopReason,
+    branchWalkVisitedNodeCount,
+    usedChronologicalFallback,
+    activeBranchMessageCount: activeBranchNodes?.length ?? null,
+    exportableMessageCount: orderedMessages.length,
+    questionCount: new Set(questionByMessageId.values()).size,
+    selectedMessageCount: selectedMessageIds?.size ?? orderedMessages.length,
+    selectedMessagesOnly: selectedMessageIds !== null,
+    unmappedAssistantOrToolNodeCount,
+    apiNodeAuditByQuestion: [...apiNodeAuditByQuestion]
+      .sort(([left], [right]) => left - right)
+      .map(([questionNumber, counts]) => ({ questionNumber, ...counts })),
+  });
+
+  let prefetchedGeneratedImages = new Map<
+    string,
+    Awaited<ReturnType<typeof requestImage>>
+  >();
+  if (downloadImages && includeGeneratedImages && fetchImages) {
+    let recovered: Awaited<ReturnType<typeof collectPaginatedGeneratedImages>>;
+    try {
+      recovered = await collectPaginatedGeneratedImages(
+        orderedMessages,
+        activeBranchNodes,
+        allById,
+        conversationId,
+        imageDiagnostics,
+        diagnosticStartedAtMs,
+        questionByMessageId,
+        selectedMessageIds,
+      );
+    } catch (error) {
+      const reason = safeImageDiagnosticError(error);
+      imageDiagnostics.failure = { stage: "generated-image-scan", reason };
+      addImageDiagnosticEvent(imageDiagnostics, diagnosticStartedAtMs, "image-export-failed", {
+        stage: "generated-image-scan",
+        reason,
+      });
+      const diagnosticError = new Error(reason);
+      Object.assign(diagnosticError, { imageDiagnostics });
+      throw diagnosticError;
+    }
+    const generatedMessages = recovered.messages;
+    prefetchedGeneratedImages = recovered.prefetched;
+    addImageDiagnosticEvent(imageDiagnostics, diagnosticStartedAtMs, "generated-image-recovery", {
+      recoveredMessageCount: generatedMessages.length,
+      recoveredImageResourceCount: generatedMessages.reduce(
+        (sum, message) => sum + getImageResources(message, false).length,
+        0,
+      ),
+      recoveredQuestionNumbers: [...new Set(generatedMessages.flatMap((message) => {
+        const questionNumber = getDiagnosticQuestionNumber(
+          message,
+          questionByMessageId,
+          allById,
+        );
+        return questionNumber === null ? [] : [questionNumber];
+      }))].sort((a, b) => a - b),
+      recoveredMessagesWithoutQuestionNumber: generatedMessages.filter((message) =>
+        getDiagnosticQuestionNumber(message, questionByMessageId, allById) === null
+      ).length,
+      prefetchedBlobCount: prefetchedGeneratedImages.size,
+    });
 
     for (const generated of generatedMessages) {
       const parentId = getMessageParentId(generated);
-      const insertionIndex = parentId
+      const sourceOnBranch = Boolean(parentId && activeBranchNodes?.some(
+        (message) => message.id === parentId,
+      ));
+      const questionNumber = getDiagnosticQuestionNumber(
+        generated,
+        questionByMessageId,
+        allById,
+      );
+      const insertionIndex = parentId && activeBranchNodes && sourceOnBranch
         ? findBranchInsertionIndex(
             orderedMessages,
             activeBranchNodes,
             parentId,
           )
-        : orderedMessages.length;
+        : questionNumber !== null
+          ? findQuestionInsertionIndex(
+            orderedMessages,
+            questionNumber,
+            questionByMessageId,
+            allById,
+          )
+          : orderedMessages.length;
       orderedMessages.splice(
         insertionIndex,
         0,
@@ -1659,20 +3119,69 @@ async function doLoadConversation(
   const imageCache = new Map<string, Promise<ExportImageFile>>();
   const imageFilesByFingerprint = new Map<string, ExportImageFile>();
   const imageResourcesToDownload = new Map<string, ImageResource>();
+  const diagnosticMessagesById = new Map<string, ImageExportDiagnosticMessage>();
+  for (const msg of orderedMessages) {
+    if (!msg.id) continue;
+    const role = msg.author?.role;
+    const resources = getImageResources(msg);
+    const text = extractText(msg);
+    const sandboxReferenceCount = [...text.matchAll(/sandbox:\/mnt\/data\//gi)].length;
+    if (
+      role !== "user" && role !== "assistant" &&
+      resources.length === 0 && sandboxReferenceCount === 0
+    ) continue;
+    diagnosticMessagesById.set(msg.id, {
+      questionNumber: getDiagnosticQuestionNumber(
+        msg,
+        questionByMessageId,
+        allById,
+      ),
+      role: role ?? "unknown",
+      origin: msg.id.startsWith("rendered-generated-image:")
+        ? "rendered-image-recovery"
+        : "conversation-api",
+      includedBySettings: downloadImages &&
+        (role === "user" || (role === "assistant" && includeGeneratedImages)),
+      imageResourceCount: resources.length,
+      imageResourceKinds: [...new Set(resources.map(getImageDiagnosticKind))].sort(),
+      sandboxReferenceCount,
+      downloadAttemptedCount: 0,
+      downloadedPaths: [],
+      downloadFailures: [],
+    });
+  }
   if (fetchImages) {
     for (const msg of orderedMessages) {
       if (!msg.id) continue;
-      if (!isSelectedForImageDownload(msg.id, selectedMessageIds)) continue;
+      if (!isSelectedForImageDownload(msg, selectedMessageIds)) continue;
       const role = msg.author?.role;
       if (role !== "user" && !(role === "assistant" && includeGeneratedImages)) {
         continue;
       }
-      for (const resource of getImageResources(msg)) {
+      const resources = getImageResources(msg);
+      const diagnosticMessage = diagnosticMessagesById.get(msg.id);
+      if (diagnosticMessage) {
+        diagnosticMessage.downloadAttemptedCount = resources.length;
+      }
+      for (const resource of resources) {
         imageResourcesToDownload.set(resource.key, resource);
       }
     }
   }
   const totalImageDownloads = imageResourcesToDownload.size;
+  addImageDiagnosticEvent(imageDiagnostics, diagnosticStartedAtMs, "image-download-plan", {
+    uniqueResourceCount: totalImageDownloads,
+    messageResourceRecords: [...diagnosticMessagesById.values()].filter((message) =>
+      message.downloadAttemptedCount > 0
+    ).map((message) => ({
+      questionNumber: message.questionNumber,
+      role: message.role,
+      origin: message.origin,
+      imageResourceCount: message.imageResourceCount,
+      imageResourceKinds: message.imageResourceKinds,
+      sandboxReferenceCount: message.sandboxReferenceCount,
+    })),
+  });
   let completedImageDownloads = 0;
   if (totalImageDownloads > 0) {
     publishLoadProgress({ stage: "images", completed: 0, total: totalImageDownloads });
@@ -1699,15 +3208,15 @@ async function doLoadConversation(
   }
 
   function isSelectedForImageDownload(
-    messageId: string,
+    message: ApiMessage,
     selectedIds: ReadonlySet<string> | null,
   ): boolean {
-    if (!selectedIds) return true;
-    if (selectedIds.has(messageId)) return true;
-    const generatedSourceId = messageId.startsWith("rendered-generated-image:")
-      ? messageId.slice("rendered-generated-image:".length)
-      : null;
-    return generatedSourceId !== null && selectedIds.has(generatedSourceId);
+    return isGeneratedImageSelected(
+      message,
+      selectedIds,
+      activeBranchNodes,
+      allById,
+    );
   }
 
   // ---- Convert to ExportMessage ----
@@ -1723,19 +3232,28 @@ async function doLoadConversation(
       const imagePaths: string[] = [];
       const renderedDiagramPaths: string[] = [];
       const localImagePathsByFilename = new Map<string, string>();
-      const renderedAttachmentPaths: string[] = [];
       let failedImageCount = 0;
-      const failedImageDetails: string[] = [];
+      let failedImageDetails: string[] = [];
 
       const mayIncludeImages = downloadImages &&
         (role !== "assistant" || includeGeneratedImages);
       const hasImageResource = mayIncludeImages && getImageResources(msg).length > 0;
       const mayDownloadImages = fetchImages && mayIncludeImages &&
-        isSelectedForImageDownload(msg.id, selectedMessageIds);
+        isSelectedForImageDownload(msg, selectedMessageIds);
+      const diagnosticMessage = diagnosticMessagesById.get(msg.id);
       if (mayDownloadImages) {
         const imageResources = getImageResources(msg);
+        if (diagnosticMessage) {
+          diagnosticMessage.downloadAttemptedCount = imageResources.length;
+        }
+        const filenamesByKey = mapImageFilenamesToKeys(
+          imageResources,
+          getSandboxImageFilenames(text),
+        );
+        const failedResources: Array<{ filename?: string; detail: string }> = [];
 
         const downloadedResults = await Promise.all(imageResources.map(async (resource) => {
+          const filename = resource.filename ?? filenamesByKey.get(resource.key);
           if (!imageCache.has(resource.key)) {
             imageCache.set(
               resource.key,
@@ -1758,14 +3276,15 @@ async function doLoadConversation(
                         mimeType: "image/png",
                         sizeBytes: estimateBase64Size(inlineSvgBase64),
                       }
-                    : await requestImage(resource, conversationId);
+                    : prefetchedGeneratedImages.get(resource.key) ??
+                      await requestImage(resource, conversationId);
                   const fingerprint = await fingerprintImage(downloaded.base64);
                   const existingImage = imageFilesByFingerprint.get(fingerprint);
                   if (existingImage) return existingImage;
 
-                  if (totalImageBytes + downloaded.sizeBytes > MAX_IMAGE_BYTES) {
+                  if (totalImageBytes + downloaded.sizeBytes > MAX_TOTAL_IMAGE_BYTES) {
                     throw new Error(
-                      "Images exceed the 20 MB export limit.",
+                      "Images exceed the 200 MB export limit.",
                     );
                   }
                   totalImageBytes += downloaded.sizeBytes;
@@ -1796,24 +3315,29 @@ async function doLoadConversation(
 
           try {
             const imgFile = await imageCache.get(resource.key)!;
+            if (diagnosticMessage && !diagnosticMessage.downloadedPaths.includes(imgFile.path)) {
+              diagnosticMessage.downloadedPaths.push(imgFile.path);
+            }
             return {
               path: imgFile.path,
               renderedSvg: Boolean(resource.inlineSvgDataUrl),
-              filename: resource.filename,
-              renderedFromDom: Boolean(resource.renderedFromDom),
+              filename,
+              renderedFromDom: resource.renderedFromDom,
             };
           } catch (err) {
-            failedImageCount++;
-            const filename = resource.filename?.replace(/[\r\n\]]/g, " ").trim();
+            diagnosticMessage?.downloadFailures.push(safeImageDiagnosticError(err));
+            const safeFilename = filename?.replace(/[\r\n\]]/g, " ").trim();
             const reason = (err instanceof Error ? err.message : String(err))
               .replace(/https?:\/\/\S+/g, "[image URL]")
               .replace(/[\r\n\]]/g, " ")
               .replace(/\s+/g, " ")
               .trim()
               .slice(0, 140);
-            failedImageDetails.push(
-              [filename, reason].filter(Boolean).join(": ") || "unknown download error",
-            );
+            failedResources.push({
+              filename,
+              detail: [safeFilename, reason].filter(Boolean).join(": ") ||
+                "unknown download error",
+            });
             devWarn("Image download failed:", resource.key, err);
             return null;
           }
@@ -1821,19 +3345,22 @@ async function doLoadConversation(
         const successfulDownloads = downloadedResults.flatMap((result) =>
           result ? [result] : [],
         );
+        failedImageDetails = getUnrecoveredImageFailureDetails(
+          failedResources,
+          successfulDownloads.flatMap((result) => result.filename ? [result.filename] : []),
+        );
+        failedImageCount = failedImageDetails.length;
         imagePaths.push(...new Set(successfulDownloads.map((result) => result.path)));
         renderedDiagramPaths.push(...new Set(successfulDownloads
           .filter((result) => result.renderedSvg)
           .map((result) => result.path)));
         for (const result of successfulDownloads) {
           if (result.filename) {
-            localImagePathsByFilename.set(
-              result.filename.toLocaleLowerCase(),
-              result.path,
-            );
-          }
-          if (result.renderedFromDom && !result.renderedSvg) {
-            renderedAttachmentPaths.push(result.path);
+            const normalizedFilename = result.filename.toLocaleLowerCase();
+            if (!localImagePathsByFilename.has(normalizedFilename) ||
+              !result.renderedFromDom) {
+              localImagePathsByFilename.set(normalizedFilename, result.path);
+            }
           }
         }
       }
@@ -1848,7 +3375,6 @@ async function doLoadConversation(
       const imageMarkdownText = replaceSandboxImageLinks(
         text,
         localImagePathsByFilename,
-        renderedAttachmentPaths,
         true,
       );
       const failureNotice = failedImageCount > 0
@@ -1863,9 +3389,6 @@ async function doLoadConversation(
         content,
         ...(svgBackgroundColor ? { svgBackgroundColor } : {}),
         ...(imageMarkdownContent !== content ? { imageMarkdownContent } : {}),
-        ...(renderedAttachmentPaths.length > 0
-          ? { renderedImageFallbackPaths: [...new Set(renderedAttachmentPaths)] }
-          : {}),
         ...(localImagePathsByFilename.size > 0
           ? { imagePathsByFilename: Object.fromEntries(localImagePathsByFilename) }
           : {}),
@@ -1893,25 +3416,22 @@ async function doLoadConversation(
 
   for (const generated of generatedImageMessages) {
     const sourceId = generated.id.slice("rendered-generated-image:".length);
-    let sourceNode = allById.get(sourceId);
-    let target = messages.find((message) =>
-      message.id === sourceId && message.role === "assistant",
+    const followingAssistants = getFollowingAssistantsInTurn(
+      sourceId,
+      activeBranchNodes,
+      messages,
+      allById,
     );
-    const visitedParents = new Set<string>();
-
-    while (!target && sourceNode) {
-      // Stop at the user turn. An image-only assistant response should remain
-      // its own answer instead of being attached to an assistant from an
-      // earlier turn in the conversation.
-      if (sourceNode.author?.role === "user") break;
-      const parentId = getMessageParentId(sourceNode);
-      if (!parentId || visitedParents.has(parentId)) break;
-      visitedParents.add(parentId);
-      target = messages.find((message) =>
-        message.id === parentId && message.role === "assistant",
-      );
-      sourceNode = allById.get(parentId);
-    }
+    // A later answer can link to a different, corrected image. Only attach
+    // this generated card to that answer when its actual filename matches.
+    const target = findGeneratedImageMergeTarget(
+      sourceId,
+      generated.imagePathsByFilename ?? {},
+      messages,
+      followingAssistants,
+      getSandboxImageFilenames,
+      selectedMessageIds,
+    );
 
     if (!target) continue;
     syntheticIdsToMerge.add(generated.id);
@@ -1926,13 +3446,6 @@ async function doLoadConversation(
 
     const generatedPaths = generatedImages.flatMap((message) => message.imagePaths);
     target.imagePaths = [...new Set([...target.imagePaths, ...generatedPaths])];
-    const renderedImageFallbackPaths = [...new Set([
-      ...(target.renderedImageFallbackPaths ?? []),
-      ...generatedPaths,
-    ])];
-    if (renderedImageFallbackPaths.length > 0) {
-      target.renderedImageFallbackPaths = renderedImageFallbackPaths;
-    }
     const imagePathsByFilename = new Map(
       Object.entries(target.imagePathsByFilename ?? {}),
     );
@@ -1954,11 +3467,19 @@ async function doLoadConversation(
       ])];
     }
 
-    const sourceContent = target.imageMarkdownContent ?? target.content;
+    const failureNotices = generatedImages
+      .map((message) => message.content)
+      .filter(Boolean);
+    const sourceContent = [
+      target.imageMarkdownContent ?? target.content,
+      ...failureNotices,
+    ].filter(Boolean).join("\n\n");
+    if (failureNotices.length > 0) {
+      target.content = [target.content, ...failureNotices].filter(Boolean).join("\n\n");
+    }
     const imageMarkdownContent = replaceSandboxImageLinks(
       sourceContent,
       new Map(imagePathsByFilename),
-      renderedImageFallbackPaths,
       true,
     );
     if (imageMarkdownContent !== target.content) {
@@ -1981,14 +3502,12 @@ async function doLoadConversation(
       const imageMarkdownContent = replaceSandboxImageLinks(
         sourceContent,
         new Map(Object.entries(message.imagePathsByFilename ?? {})),
-        message.renderedImageFallbackPaths ?? [],
       );
       if (imageMarkdownContent !== message.content) {
         message.imageMarkdownContent = imageMarkdownContent;
       } else {
         delete message.imageMarkdownContent;
       }
-      delete message.renderedImageFallbackPaths;
       delete message.imagePathsByFilename;
     }
   }
@@ -2002,10 +3521,48 @@ async function doLoadConversation(
     }
   }
   const images = [...imagesByPath.values()];
+  const messageQuestionNumbersById = Object.fromEntries(orderedMessages.flatMap((message) => {
+    if (!message.id) return [];
+    const questionNumber = getDiagnosticQuestionNumber(
+      message,
+      questionByMessageId,
+      allById,
+    );
+    return questionNumber === null ? [] : [[message.id, questionNumber] as const];
+  }));
 
   devLog(`Export ready: ${messages.length} messages, ${images.length} images`);
+  imageDiagnostics.messages = [...diagnosticMessagesById.values()];
+  addImageDiagnosticEvent(imageDiagnostics, diagnosticStartedAtMs, "image-download-results", {
+    uniqueResourcesPlanned: totalImageDownloads,
+    imageFilesCreated: images.length,
+    totalImageBytes,
+    messagesWithImageResources: imageDiagnostics.messages.filter((message) =>
+      message.imageResourceCount > 0
+    ).length,
+    messagesWithDownloadFailures: imageDiagnostics.messages.filter((message) =>
+      message.downloadFailures.length > 0
+    ).length,
+    failedResourceAttempts: imageDiagnostics.messages.reduce(
+      (sum, message) => sum + message.downloadFailures.length,
+      0,
+    ),
+    imagePaths: images.map((image) => image.path),
+  });
+  addImageDiagnosticEvent(imageDiagnostics, diagnosticStartedAtMs, "conversation-export-finish", {
+    exportedMessageCount: messages.length,
+    exportedQuestionCount: new Set(messages.flatMap((message) => {
+      const questionNumber = getDiagnosticQuestionNumber(
+        orderedMessages.find((candidate) => candidate.id === message.id) ?? {},
+        questionByMessageId,
+        allById,
+      );
+      return questionNumber === null ? [] : [questionNumber];
+    })).size,
+    imageFileCount: images.length,
+  });
 
-  return { messages, images };
+  return { messages, images, imageDiagnostics, messageQuestionNumbersById };
 }
 
 // -----------------------------------------------------------------------
@@ -2025,11 +3582,12 @@ void chrome.storage.sync.get({ theme: "system" }).then((r) => {
   if (r.theme === "light" || r.theme === "dark") toastTheme = r.theme;
 });
 
-chrome.storage.onChanged.addListener((changes, area) => {
+const onContentStorageChanged: Parameters<typeof chrome.storage.onChanged.addListener>[0] = (changes, area) => {
   if (area !== "sync" || !changes.theme) return;
   const v = changes.theme.newValue;
   toastTheme = v === "light" || v === "dark" ? v : "system";
-});
+};
+chrome.storage.onChanged.addListener(onContentStorageChanged);
 
 function ensureSuccessToast(): HTMLDivElement {
   if (successToast?.isConnected) return successToast;
@@ -2213,7 +3771,7 @@ function showExportSuccess(message: string): void {
 // CHROME MESSAGE LISTENER
 // -----------------------------------------------------------------------
 
-chrome.runtime.onMessage.addListener(
+const onContentMessage: Parameters<typeof chrome.runtime.onMessage.addListener>[0] =
   (
     message: {
       type: string;
@@ -2248,7 +3806,7 @@ chrome.runtime.onMessage.addListener(
       return true;
     }
 
-    if (message.type === "LOAD_CONVERSATION") {
+    if (message.type === CONTENT_LOAD_TYPE) {
       if (loadInFlight) publishLoadProgress();
       void loadConversation(
         message.downloadImages === true,
@@ -2258,17 +3816,22 @@ chrome.runtime.onMessage.addListener(
         message.forceRefresh === true,
       )
         .then((data) => sendResponse({ success: true, data }))
-        .catch((err: unknown) =>
+        .catch((err: unknown) => {
+          const imageDiagnostics = err && typeof err === "object" &&
+              "imageDiagnostics" in err
+            ? (err as { imageDiagnostics?: ImageExportDiagnostics }).imageDiagnostics
+            : undefined;
           sendResponse({
             success: false,
             error: err instanceof Error ? err.message : String(err),
-          }),
-        );
+            ...(imageDiagnostics ? { imageDiagnostics } : {}),
+          });
+        });
       return true; // Keep channel open for async response
     }
 
-    if (message.type === "CHATSCRIBE_PING") {
-      sendResponse({ ready: true });
+    if (message.type === CONTENT_PING_TYPE) {
+      sendResponse({ ready: true, buildId: CHATSCRIBE_BUILD_ID });
       return false;
     }
 
@@ -2279,5 +3842,14 @@ chrome.runtime.onMessage.addListener(
     }
 
     return false;
-  },
-);
+  };
+chrome.runtime.onMessage.addListener(onContentMessage);
+
+contentCleanupByBuild.set(CHATSCRIBE_BUILD_ID, () => {
+  window.removeEventListener("message", onBridgeWindowMessage);
+  chrome.storage.onChanged.removeListener(onContentStorageChanged);
+  chrome.runtime.onMessage.removeListener(onContentMessage);
+  window.clearTimeout(successToastTimer);
+  successToast?.remove();
+  successToastStyle?.remove();
+});

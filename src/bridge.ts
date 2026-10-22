@@ -14,9 +14,30 @@
  *   IMAGE_REQUEST        → content requests an image download
  *   IMAGE_RESPONSE       → bridge returns base64 image data
  *   BRIDGE_ERROR         → bridge reports an error for a request
+ * Message types are scoped to the build so an old bridge in an already-open
+ * ChatGPT tab cannot answer requests from a newly loaded extension.
  */
 
+import {
+  BRIDGE_API_REQUEST_TYPE,
+  BRIDGE_API_RESPONSE_TYPE,
+  BRIDGE_ERROR_TYPE,
+  BRIDGE_IMAGE_REQUEST_TYPE,
+  BRIDGE_IMAGE_RESPONSE_TYPE,
+  BRIDGE_PING_TYPE,
+  BRIDGE_PONG_TYPE,
+  CHATSCRIBE_BUILD_ID,
+} from "./content-protocol.ts";
+
 (function installBridge(): void {
+  const bridgeWindow = window as Window & {
+    __chatScribeBridgeBuildIds?: Set<string>;
+    __chatScribeBridgeFetchBase?: typeof window.fetch;
+  };
+  const installedBuildIds = bridgeWindow.__chatScribeBridgeBuildIds ??= new Set();
+  if (installedBuildIds.has(CHATSCRIBE_BUILD_ID)) return;
+  installedBuildIds.add(CHATSCRIBE_BUILD_ID);
+
   const SOURCE = "ChatScribe";
 
   // ChatGPT conversation API endpoints
@@ -35,9 +56,132 @@
 
   // Captured authentication headers from ChatGPT's own requests
   let capturedHeaders: Headers | null = null;
+  let authRefreshInFlight: Promise<Headers> | null = null;
+
+  async function refreshAuthHeaders(): Promise<Headers> {
+    if (authRefreshInFlight) return authRefreshInFlight;
+
+    const refresh = (async () => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), 6_000);
+        try {
+          // The page can be open before the extension is installed or reloaded,
+          // so the bridge may miss ChatGPT's initial conversation request. The
+          // same-origin session endpoint lets it recover the current bearer
+          // token without asking the user to reload the page.
+          const response = await nativeFetch(
+            new URL("/api/auth/session", window.location.origin),
+            {
+              method: "GET",
+              credentials: "include",
+              headers: { Accept: "application/json" },
+              signal: controller.signal,
+            },
+          );
+          if (!response.ok) {
+            throw new Error(`ChatGPT session check returned ${response.status}.`);
+          }
+
+          const session = await response.json() as unknown;
+          if (!session || typeof session !== "object" || Array.isArray(session)) {
+            throw new Error("CHATGPT_CONNECTION_NOT_READY");
+          }
+          const data = session as Record<string, unknown>;
+          const accessToken = data.accessToken ?? data.access_token;
+          if (typeof accessToken !== "string" || accessToken.length === 0) {
+            throw new Error("CHATGPT_CONNECTION_NOT_READY");
+          }
+
+          const headers = new Headers(capturedHeaders ?? undefined);
+          headers.set("Authorization", `Bearer ${accessToken}`);
+          capturedHeaders = headers;
+          return headers;
+        } catch (error) {
+          if (attempt > 0 || !(error instanceof TypeError)) throw error;
+          await new Promise((resolve) => window.setTimeout(resolve, 350));
+        } finally {
+          window.clearTimeout(timeout);
+        }
+      }
+      throw new Error("CHATGPT_CONNECTION_NOT_READY");
+    })();
+
+    authRefreshInFlight = refresh;
+    try {
+      return await refresh;
+    } finally {
+      if (authRefreshInFlight === refresh) authRefreshInFlight = null;
+    }
+  }
+
+  function isTransientFetchError(error: unknown): boolean {
+    return error instanceof TypeError;
+  }
+
+  async function fetchConversationData(url: string): Promise<unknown> {
+    let headers = capturedHeaders ?? await refreshAuthHeaders();
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 15_000);
+      try {
+        const response = await nativeFetch(url, {
+          method: "GET",
+          credentials: "include",
+          headers: new Headers(headers),
+          signal: controller.signal,
+        });
+
+        if ((response.status === 401 || response.status === 403) && attempt === 0) {
+          try {
+            await response.body?.cancel();
+          } catch {
+            // A failed body cleanup should not block the auth refresh.
+          }
+          headers = await refreshAuthHeaders();
+          continue;
+        }
+
+        const retryableStatus =
+          response.status === 408 ||
+          response.status === 425 ||
+          response.status === 429 ||
+          response.status >= 500;
+        if (retryableStatus && attempt === 0) {
+          try {
+            await response.body?.cancel();
+          } catch {
+            // Keep the bounded retry even if the body cannot be cancelled.
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, 350));
+          continue;
+        }
+
+        if (!response.ok) {
+          throw new Error(`ChatGPT API returned ${response.status} ${response.statusText}`);
+        }
+        return await response.json() as unknown;
+      } catch (error) {
+        lastError = error;
+        if (attempt > 0 || !isTransientFetchError(error)) throw error;
+        await new Promise((resolve) => window.setTimeout(resolve, 350));
+      } finally {
+        window.clearTimeout(timeout);
+      }
+    }
+
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("ChatGPT conversation request failed after retry.");
+  }
 
   // Wrap the native fetch to capture auth context
-  const nativeFetch = window.fetch;
+  // Reuse the first available fetch across later builds. An older unversioned
+  // bridge may already wrap it, but reloading this build cannot stack another
+  // wrapper on top of every bridge version installed in the same tab.
+  const nativeFetch = bridgeWindow.__chatScribeBridgeFetchBase ??= window.fetch;
 
   window.fetch = function patchedFetch(
     input: RequestInfo | URL,
@@ -67,8 +211,6 @@
         const refreshedHeaders = new Headers(capturedHeaders ?? undefined);
         requestHeaders.forEach((value, name) => refreshedHeaders.set(name, value));
         capturedHeaders = refreshedHeaders;
-        // Notify content.ts that auth context is now available.
-        window.postMessage({ source: SOURCE, type: "AUTH_READY" }, "*");
       }
     } catch {
       // Never break the real fetch
@@ -378,11 +520,11 @@
     if (!msg || msg.source !== SOURCE) return;
 
     // --- Ping: report bridge readiness ---
-    if (msg.type === "BRIDGE_PING") {
+    if (msg.type === BRIDGE_PING_TYPE) {
       window.postMessage(
         {
           source: SOURCE,
-          type: "BRIDGE_PONG",
+          type: BRIDGE_PONG_TYPE,
           authReady: Boolean(capturedHeaders),
         },
         "*",
@@ -391,7 +533,7 @@
     }
 
     // --- API_REQUEST: fetch a conversation page ---
-    if (msg.type === "API_REQUEST") {
+    if (msg.type === BRIDGE_API_REQUEST_TYPE) {
       const requestId = msg.requestId as string;
       const conversationId = msg.conversationId as unknown;
       const cursor = typeof msg.cursor === "string" ? msg.cursor : null;
@@ -400,7 +542,7 @@
         window.postMessage(
           {
             source: SOURCE,
-            type: "BRIDGE_ERROR",
+            type: BRIDGE_ERROR_TYPE,
             requestId,
             error: "Invalid conversation ID.",
           },
@@ -409,36 +551,12 @@
         return;
       }
 
-      if (!capturedHeaders) {
-        window.postMessage(
-          {
-            source: SOURCE,
-            type: "BRIDGE_ERROR",
-            requestId,
-            error: "CHATGPT_CONNECTION_NOT_READY",
-          },
-          "*",
-        );
-        return;
-      }
-
-      const headers = new Headers(capturedHeaders);
       const url = buildConvUrl(conversationId, cursor);
 
-      void nativeFetch(url, {
-        method: "GET",
-        credentials: "include",
-        headers,
-      })
-        .then(async (res) => {
-          if (!res.ok) {
-            throw new Error(
-              `ChatGPT API returned ${res.status} ${res.statusText}`,
-            );
-          }
-          const data = await res.json() as unknown;
+      void fetchConversationData(url)
+        .then((data) => {
           window.postMessage(
-            { source: SOURCE, type: "API_RESPONSE", requestId, data },
+            { source: SOURCE, type: BRIDGE_API_RESPONSE_TYPE, requestId, data },
             "*",
           );
         })
@@ -446,7 +564,7 @@
           window.postMessage(
             {
               source: SOURCE,
-              type: "BRIDGE_ERROR",
+              type: BRIDGE_ERROR_TYPE,
               requestId,
               error: err instanceof Error ? err.message : String(err),
             },
@@ -458,7 +576,7 @@
     }
 
     // --- IMAGE_REQUEST: download an image and return base64 ---
-    if (msg.type === "IMAGE_REQUEST") {
+    if (msg.type === BRIDGE_IMAGE_REQUEST_TYPE) {
       const requestId = msg.requestId as string;
       const imageUrl = msg.imageUrl as unknown;
       const fileId = msg.fileId as unknown;
@@ -474,7 +592,7 @@
         window.postMessage(
           {
             source: SOURCE,
-            type: "BRIDGE_ERROR",
+            type: BRIDGE_ERROR_TYPE,
             requestId,
             error: "Image URL or file reference is invalid.",
           },
@@ -487,7 +605,7 @@
         window.postMessage(
           {
             source: SOURCE,
-            type: "BRIDGE_ERROR",
+            type: BRIDGE_ERROR_TYPE,
             requestId,
             error: "Auth context not ready for image download.",
           },
@@ -546,7 +664,7 @@
         window.postMessage(
           {
             source: SOURCE,
-            type: "IMAGE_RESPONSE",
+            type: BRIDGE_IMAGE_RESPONSE_TYPE,
             requestId,
             ...image,
           },
@@ -556,7 +674,7 @@
         window.postMessage(
           {
             source: SOURCE,
-            type: "BRIDGE_ERROR",
+            type: BRIDGE_ERROR_TYPE,
             requestId,
             error: err instanceof Error ? err.message : String(err),
           },
@@ -570,7 +688,7 @@
 
   // Announce the bridge is installed (auth not yet ready until first fetch observed)
   window.postMessage(
-    { source: SOURCE, type: "BRIDGE_PONG", authReady: false },
+    { source: SOURCE, type: BRIDGE_PONG_TYPE, authReady: false },
     "*",
   );
 })();

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   findBranchInsertionIndex,
   isMessageLinkedToActiveMessage,
+  resolveActiveBranchNodes,
   walkActiveBranchNodes,
 } from "../src/conversation-branch.ts";
 import type { ApiMessage } from "../src/types.ts";
@@ -65,6 +66,90 @@ describe("active conversation branch", () => {
       "user-1",
       "image-1",
     ]);
+  });
+
+  it("accepts a parentless earliest user as the root after full pagination", () => {
+    const byId = new Map<string, ApiMessage>([
+      ["root-user", {
+        id: "root-user",
+        author: { role: "user" },
+        create_time: 1,
+      }],
+      ["image-tool", {
+        id: "image-tool",
+        parent: "root-user",
+        author: { role: "tool" },
+        content: {
+          content_type: "multimodal",
+          parts: [{ asset_pointer: "sediment://file_image" }],
+        },
+        create_time: 2,
+      }],
+      ["answer", {
+        id: "answer",
+        parent: "image-tool",
+        author: { role: "assistant" },
+        end_turn: true,
+        create_time: 3,
+      }],
+      ["later-user", {
+        id: "later-user",
+        parent: "answer",
+        author: { role: "user" },
+        create_time: 4,
+      }],
+    ]);
+
+    const result = resolveActiveBranchNodes(byId, "later-user");
+
+    expect(result.stopReason).toBe("root-found-earliest-user");
+    expect(result.messages?.map((message) => message.id)).toEqual([
+      "root-user",
+      "image-tool",
+      "answer",
+      "later-user",
+    ]);
+  });
+
+  it("does not treat a non-earliest parentless user as the conversation root", () => {
+    const byId = new Map<string, ApiMessage>([
+      ["earlier-user", {
+        id: "earlier-user",
+        author: { role: "user" },
+        create_time: 1,
+      }],
+      ["unlinked-user", {
+        id: "unlinked-user",
+        author: { role: "user" },
+        create_time: 2,
+      }],
+    ]);
+
+    const result = resolveActiveBranchNodes(byId, "unlinked-user");
+
+    expect(result.stopReason).toBe("unmarked-terminal-node");
+    expect(result.messages).toBeNull();
+  });
+
+  it("does not treat a truncated parent chain as a complete active branch", () => {
+    const byId = new Map<string, ApiMessage>([
+      ["root-user", {
+        id: "root-user",
+        author: { role: "user" },
+        create_time: 1,
+      }],
+      ["truncated-answer", {
+        id: "truncated-answer",
+        parent: "missing-parent",
+        author: { role: "assistant" },
+        create_time: 2,
+      }],
+    ]);
+
+    const result = resolveActiveBranchNodes(byId, "truncated-answer");
+
+    expect(result.stopReason).toBe("parent-node-missing");
+    expect(result.messages).toBeNull();
   });
 
   it("places an image recovered from a filtered node before the next exportable turn", () => {

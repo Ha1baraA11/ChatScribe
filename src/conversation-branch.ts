@@ -55,37 +55,116 @@ function hasExplicitRootParent(message: ApiMessage): boolean {
   ].some((parentId) => parentId === null);
 }
 
+export interface ActiveBranchWalkResult {
+  messages: ApiMessage[] | null;
+  stopReason:
+    | "root-found-explicit"
+    | "root-found-earliest-user"
+    | "current-node-missing"
+    | "parent-node-missing"
+    | "unmarked-terminal-node"
+    | "parent-cycle";
+  visitedNodeCount: number;
+}
+
+function isEarliestKnownUserMessage(
+  message: ApiMessage,
+  byId: ReadonlyMap<string, ApiMessage>,
+): boolean {
+  const createTime = message.create_time;
+  if (message.author?.role !== "user" || !message.id ||
+      typeof createTime !== "number") {
+    return false;
+  }
+
+  return ![...byId.values()].some((candidate) =>
+    candidate.id !== message.id &&
+    candidate.author?.role === "user" &&
+    typeof candidate.create_time === "number" &&
+    candidate.create_time < createTime
+  );
+}
+
 /**
  * Return every API node on the selected branch, including nodes that are not
  * themselves exportable. Image-only assistant turns can be omitted from the
  * API text export but still provide the ID used by the rendered-image fallback.
  */
-export function walkActiveBranchNodes(
+export function resolveActiveBranchNodes(
   byId: ReadonlyMap<string, ApiMessage>,
   currentNode: string,
-): ApiMessage[] | null {
+): ActiveBranchWalkResult {
   const path: ApiMessage[] = [];
   const visited = new Set<string>();
   let nodeId: string | null = currentNode;
 
-  while (nodeId && !visited.has(nodeId)) {
+  while (nodeId) {
+    if (visited.has(nodeId)) {
+      return {
+        messages: null,
+        stopReason: "parent-cycle",
+        visitedNodeCount: visited.size,
+      };
+    }
     visited.add(nodeId);
     const message = byId.get(nodeId);
-    if (!message) break;
+    if (!message) {
+      return {
+        messages: null,
+        stopReason: path.length === 0 ? "current-node-missing" : "parent-node-missing",
+        visitedNodeCount: visited.size,
+      };
+    }
 
     path.push(message);
 
     const parentId = getMessageParentId(message);
-    const reachedRoot =
-      parentId === "client-created-root" ||
-      (!parentId && hasExplicitRootParent(message));
-    if (reachedRoot) return path.reverse();
-    if (!parentId) return null;
+    if (parentId === "client-created-root" ||
+        (!parentId && hasExplicitRootParent(message))) {
+      return {
+        messages: path.reverse(),
+        stopReason: "root-found-explicit",
+        visitedNodeCount: visited.size,
+      };
+    }
+    if (!parentId && isEarliestKnownUserMessage(message, byId)) {
+      return {
+        messages: path.reverse(),
+        stopReason: "root-found-earliest-user",
+        visitedNodeCount: visited.size,
+      };
+    }
+    if (!parentId) {
+      return {
+        messages: null,
+        stopReason: "unmarked-terminal-node",
+        visitedNodeCount: visited.size,
+      };
+    }
+    if (!byId.has(parentId)) {
+      return {
+        messages: null,
+        stopReason: "parent-node-missing",
+        visitedNodeCount: visited.size,
+      };
+    }
 
     nodeId = parentId;
   }
 
-  return null;
+  return {
+    messages: null,
+    stopReason: "unmarked-terminal-node",
+    visitedNodeCount: visited.size,
+  };
+}
+
+/** Walk the active branch, returning null if the parent chain is incomplete. */
+export function walkActiveBranchNodes(
+  byId: ReadonlyMap<string, ApiMessage>,
+  currentNode: string,
+): ApiMessage[] | null {
+  return resolveActiveBranchNodes(byId, currentNode).messages;
 }
 
 /**

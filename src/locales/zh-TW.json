@@ -49,6 +49,7 @@
   "popup.toast.exported": "匯出完成",
   "popup.toast.downloadStarted": "已開始下載…",
   "popup.toast.downloadFailed": "下載失敗",
+  "popup.toast.exportFailedDiagnosticsSaved": "匯出已中斷，診斷報告已儲存：",
   "popup.toast.githubSaved": "已儲存至 GitHub！",
   "popup.toast.githubFailed": "儲存至 GitHub 失敗",
   "popup.toast.starThanks": "感謝你加星號！ ⭐",

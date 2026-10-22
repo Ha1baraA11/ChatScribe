@@ -49,6 +49,7 @@
   "popup.toast.exported": "Export complete",
   "popup.toast.downloadStarted": "Download started…",
   "popup.toast.downloadFailed": "Download failed",
+  "popup.toast.exportFailedDiagnosticsSaved": "Export stopped; diagnostic report saved as:",
   "popup.toast.githubSaved": "Saved to GitHub!",
   "popup.toast.githubFailed": "GitHub save failed",
   "popup.toast.starThanks": "Thanks for the star! ⭐",

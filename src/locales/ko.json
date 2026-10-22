@@ -49,6 +49,7 @@
   "popup.toast.exported": "내보내기가 완료되었습니다",
   "popup.toast.downloadStarted": "다운로드를 시작했습니다…",
   "popup.toast.downloadFailed": "다운로드하지 못했습니다",
+  "popup.toast.exportFailedDiagnosticsSaved": "내보내기가 중단되었습니다. 진단 보고서 저장 파일:",
   "popup.toast.githubSaved": "GitHub에 저장했습니다!",
   "popup.toast.githubFailed": "GitHub에 저장하지 못했습니다",
   "popup.toast.starThanks": "별표를 눌러 주셔서 감사합니다! ⭐",

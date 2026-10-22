@@ -1,10 +1,13 @@
 import { defineConfig } from "vite";
+import { computeBuildId } from "./scripts/build-id.mjs";
 
 export default defineConfig({
+  define: {
+    __CHATSCRIBE_BUILD_ID__: JSON.stringify(computeBuildId()),
+  },
   build: {
     rollupOptions: {
       input: {
-        bridge: "src/bridge.ts",
         background: "src/background.ts",
         popup: "src/popup.ts",
         options: "src/options.ts",

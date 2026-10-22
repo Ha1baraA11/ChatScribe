@@ -49,6 +49,7 @@
   "popup.toast.exported": "Экспорт завершён",
   "popup.toast.downloadStarted": "Загрузка начата…",
   "popup.toast.downloadFailed": "Ошибка загрузки",
+  "popup.toast.exportFailedDiagnosticsSaved": "Экспорт остановлен; отчет диагностики сохранен как:",
   "popup.toast.githubSaved": "Сохранено на GitHub!",
   "popup.toast.githubFailed": "Ошибка сохранения на GitHub",
   "popup.toast.starThanks": "Спасибо за звезду! ⭐",

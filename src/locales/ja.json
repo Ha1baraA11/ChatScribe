@@ -49,6 +49,7 @@
   "popup.toast.exported": "エクスポートが完了しました",
   "popup.toast.downloadStarted": "ダウンロードを開始しました…",
   "popup.toast.downloadFailed": "ダウンロードに失敗しました",
+  "popup.toast.exportFailedDiagnosticsSaved": "エクスポートを中断しました。診断レポートの保存先:",
   "popup.toast.githubSaved": "GitHub に保存しました！",
   "popup.toast.githubFailed": "GitHub への保存に失敗しました",
   "popup.toast.starThanks": "スターありがとうございます！ ⭐",

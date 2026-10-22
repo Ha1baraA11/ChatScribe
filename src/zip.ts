@@ -3,13 +3,14 @@
  *
  * Minimal ZIP archive builder (no dependencies, browser-native only).
  *
- * Creates a ZIP containing one text file and an optional images/ folder.
+ * Creates a ZIP containing one text file, optional images/, and an optional
+ * privacy-safe image-export diagnostic report for troubleshooting.
  * The ZIP structure follows the ZIP specification (local file headers +
  * central directory). Uses STORE compression (no deflate) for simplicity
  * and broad compatibility.
  */
 
-import type { ExportImageFile } from "./types.ts";
+import type { ExportImageFile, ImageExportDiagnostics } from "./types.ts";
 
 // -----------------------------------------------------------------------
 // LOW-LEVEL ZIP HELPERS
@@ -155,6 +156,7 @@ export function buildZipBlob(
   conversationText: string,
   conversationFilename: string,
   imageFiles: ExportImageFile[],
+  diagnostics?: ImageExportDiagnostics,
 ): Blob {
   const encoder = encodeUtf8;
 
@@ -165,6 +167,12 @@ export function buildZipBlob(
       name: img.path,
       data: base64ToUint8Array(img.base64),
     })),
+    ...(diagnostics
+      ? [{
+          name: "diagnostics/image-export.json",
+          data: encoder(JSON.stringify(diagnostics, null, 2)),
+        }]
+      : []),
   ];
 
   // Local file records

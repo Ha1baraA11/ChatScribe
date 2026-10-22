@@ -21,6 +21,10 @@ import {
   disconnectGitHub,
   getStoredToken,
 } from "./github.ts";
+import {
+  CHATSCRIBE_BUILD_ID,
+  CONTENT_PING_TYPE,
+} from "./content-protocol.ts";
 
 // -----------------------------------------------------------------------
 // DEV LOGGING
@@ -54,6 +58,7 @@ const chromeCapabilities = chrome as unknown as {
     executeScript: (details: {
       target: { tabId: number };
       files: string[];
+      world?: "MAIN" | "ISOLATED";
     }) => Promise<unknown[]>;
   };
 };
@@ -227,9 +232,10 @@ function isValidContent(v: unknown): v is string {
 // MESSAGE HANDLERS
 // -----------------------------------------------------------------------
 
-// --- ENSURE CONTENT SCRIPT ---
-// A page may have been open before ChatScribe was installed or updated. Inject
-// only after a ping confirms that its isolated-world listener is absent.
+// --- ENSURE CONTENT SCRIPT AND MAIN-WORLD BRIDGE ---
+// A page may have been open before ChatScribe was installed or updated. The
+// isolated content script can survive in a partially connected state while
+// the MAIN-world bridge is missing, so ensure the bridge on every request.
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type !== "ENSURE_CONTENT_SCRIPT") return false;
   if (!isOwnExtension(sender)) return false;
@@ -247,31 +253,46 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         throw new Error("Open a ChatGPT conversation before exporting.");
       }
 
-      try {
-        const ping = await chrome.tabs.sendMessage(tab.id!, {
-          type: "CHATSCRIBE_PING",
-        }) as { ready?: boolean } | undefined;
-        if (ping?.ready) {
-          sendResponse({ success: true });
-          return;
-        }
-      } catch {
-        // The content script is not present in this tab yet.
-      }
-
       if (!chromeCapabilities.scripting?.executeScript) {
         throw new Error("This browser cannot reconnect ChatScribe without reloading the page.");
       }
 
+      const targetTabId = tab.id ?? tabId as number;
+
+      // bridge.js is idempotent, so this also repairs tabs that were already
+      // open when the extension was reloaded without wrapping fetch twice.
       await chromeCapabilities.scripting.executeScript({
-        target: { tabId: tab.id! },
+        target: { tabId: targetTabId },
+        world: "MAIN",
+        files: ["bridge.js"],
+      });
+
+      let contentReady = false;
+      try {
+        const ping = await chrome.tabs.sendMessage(targetTabId, {
+          type: CONTENT_PING_TYPE,
+        }) as { ready?: boolean; buildId?: string } | undefined;
+        contentReady = ping?.ready === true && ping.buildId === CHATSCRIBE_BUILD_ID;
+      } catch {
+        // No content script from this build is present in this tab yet.
+      }
+
+      if (contentReady) {
+        sendResponse({ success: true });
+        return;
+      }
+
+      await chromeCapabilities.scripting.executeScript({
+        target: { tabId: targetTabId },
         files: ["content.js"],
       });
 
-      const ping = await chrome.tabs.sendMessage(tab.id!, {
-        type: "CHATSCRIBE_PING",
-      }) as { ready?: boolean } | undefined;
-      if (!ping?.ready) throw new Error("ChatScribe could not reconnect to this tab.");
+      const ping = await chrome.tabs.sendMessage(targetTabId, {
+        type: CONTENT_PING_TYPE,
+      }) as { ready?: boolean; buildId?: string } | undefined;
+      if (!ping?.ready || ping.buildId !== CHATSCRIBE_BUILD_ID) {
+        throw new Error("ChatScribe could not reconnect to this tab.");
+      }
       sendResponse({ success: true });
     } catch (error) {
       sendResponse({
@@ -350,7 +371,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (downloadId !== undefined) {
         pendingDownloads.add(downloadId);
       }
-      sendResponse({ success: downloadId !== undefined, downloadId });
+      const error = chrome.runtime.lastError?.message;
+      sendResponse({ success: downloadId !== undefined, downloadId, error });
     },
   );
 
