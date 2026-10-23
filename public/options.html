@@ -910,6 +910,33 @@
             Keep the latest-answer and message-selection options visible whenever
             ChatScribe opens.
           </p>
+          <label class="choice-row" for="selectorOrder">
+            <span data-i18n="options.selectorOrder.label">Message selection order</span>
+            <span class="select-control">
+              <select id="selectorOrder" aria-describedby="selector-order-hint">
+                <option value="newest-first" data-i18n="options.selectorOrder.newestFirst">Newest first</option>
+                <option value="oldest-first" data-i18n="options.selectorOrder.oldestFirst">Oldest first</option>
+              </select>
+              <svg
+                class="select-chevron"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+                focusable="false"
+              >
+                <path
+                  d="m7 10 5 5 5-5"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </span>
+          </label>
+          <p class="hint" id="selector-order-hint" data-i18n="options.selectorOrder.hint">
+            Choose whether the newest or oldest message appears at the top. Exports stay in conversation order.
+          </p>
         </fieldset>
 
         <fieldset>

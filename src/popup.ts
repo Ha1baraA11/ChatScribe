@@ -571,13 +571,23 @@ document.addEventListener("keydown", (event) => {
 });
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName !== "sync" || !changes.keepCopyOptionsOpen || !settings) return;
-  const wasExpanded = !copyOptions.hidden;
-  settings = {
-    ...settings,
-    keepCopyOptionsOpen: changes.keepCopyOptionsOpen.newValue === true,
-  };
-  setCopyOptionsExpanded(wasExpanded);
+  if (areaName !== "sync" || !settings) return;
+  if (changes.keepCopyOptionsOpen) {
+    const wasExpanded = !copyOptions.hidden;
+    settings = {
+      ...settings,
+      keepCopyOptionsOpen: changes.keepCopyOptionsOpen.newValue === true,
+    };
+    setCopyOptionsExpanded(wasExpanded);
+  }
+  if (changes.selectorOrder) {
+    settings = {
+      ...settings,
+      selectorOrder: changes.selectorOrder.newValue === "oldest-first"
+        ? "oldest-first"
+        : "newest-first",
+    };
+  }
 });
 
 // -----------------------------------------------------------------------
@@ -648,14 +658,20 @@ function openSelector(
 ): void {
   if (!conversationData) return;
   closeCopyOptions();
-  populateSelector(conversationData.messages, selectAll, selectedIds);
+  const orderedMessages = settings?.selectorOrder === "oldest-first"
+    ? conversationData.messages
+    : [...conversationData.messages].reverse();
+  populateSelector(orderedMessages, selectAll, selectedIds);
   document.body.classList.add("overlay-open");
   selectorOverlay.classList.add("open");
   updateSelectorCount();
-  const firstCheckbox = selList.querySelector<HTMLInputElement>(
-    "input[type='checkbox']",
-  );
-  (firstCheckbox ?? selCancelBtn).focus();
+  const firstCheckbox = getCheckboxes()[0];
+  if (firstCheckbox) {
+    firstCheckbox.focus({ preventScroll: true });
+    selList.scrollTop = 0;
+  } else {
+    selCancelBtn.focus();
+  }
 }
 
 function closeSelector(): void {

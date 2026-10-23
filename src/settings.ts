@@ -22,6 +22,10 @@ function isPanelMode(value: unknown): value is Settings["panelMode"] {
   return value === "popup" || value === "sidebar";
 }
 
+function isSelectorOrder(value: unknown): value is Settings["selectorOrder"] {
+  return value === "newest-first" || value === "oldest-first";
+}
+
 export async function loadSettings(): Promise<Settings> {
   const defaults = await chrome.storage.sync.get(
     DEFAULT_SETTINGS as unknown as Record<string, unknown>,
@@ -71,6 +75,9 @@ export async function loadSettings(): Promise<Settings> {
     keepCopyOptionsOpen: typeof stored.keepCopyOptionsOpen === "boolean"
       ? stored.keepCopyOptionsOpen
       : defaults.keepCopyOptionsOpen as boolean,
+    selectorOrder: isSelectorOrder(stored.selectorOrder)
+      ? stored.selectorOrder
+      : DEFAULT_SETTINGS.selectorOrder,
     panelMode: isPanelMode(stored.panelMode)
       ? stored.panelMode
       : defaults.panelMode as Settings["panelMode"],
