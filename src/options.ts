@@ -83,6 +83,15 @@ const FILENAME_PRESETS: Record<string, string> = {
 // Save UI
 const saveBtn = $id<HTMLButtonElement>("save-btn");
 const savedLabel = $id<HTMLSpanElement>("saved-label");
+let savedLabelTimer: number | undefined;
+
+function showSavedLabel(): void {
+  savedLabel.classList.add("visible");
+  window.clearTimeout(savedLabelTimer);
+  savedLabelTimer = window.setTimeout(() => {
+    savedLabel.classList.remove("visible");
+  }, 1800);
+}
 
 // GitHub UI
 const githubStatus = $id<HTMLParagraphElement>("github-status");
@@ -359,6 +368,13 @@ languageSelect.addEventListener("change", () => {
   void refreshGitHubStatus();
 });
 
+selectorOrderSelect.addEventListener("change", async () => {
+  await chrome.storage.sync.set({
+    selectorOrder: selectorOrderSelect.value as Settings["selectorOrder"],
+  });
+  showSavedLabel();
+});
+
 promptToSaveInput.addEventListener("change", () => {
   updateDownloadLocationControls();
   updateExportPreview();
@@ -393,10 +409,7 @@ saveBtn.addEventListener("click", async () => {
   const current = gatherSettings();
   await saveSettings(current);
 
-  savedLabel.classList.add("visible");
-  setTimeout(() => {
-    savedLabel.classList.remove("visible");
-  }, 1800);
+  showSavedLabel();
 });
 
 downloadsSettingsLink.addEventListener("click", (e) => {

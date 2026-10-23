@@ -26,6 +26,7 @@ import {
 } from "./formatter.ts";
 import { buildZipBlob, blobToBase64 } from "./zip.ts";
 import { selectHydratedExport } from "./export-selection.ts";
+import { getInitialSelectorScrollPosition } from "./selector-scroll.ts";
 import { CONTENT_LOAD_TYPE } from "./content-protocol.ts";
 import type {
   ConversationData,
@@ -658,17 +659,20 @@ function openSelector(
 ): void {
   if (!conversationData) return;
   closeCopyOptions();
-  const orderedMessages = settings?.selectorOrder === "oldest-first"
-    ? conversationData.messages
-    : [...conversationData.messages].reverse();
-  populateSelector(orderedMessages, selectAll, selectedIds);
+  const scrollPosition = getInitialSelectorScrollPosition(
+    settings?.selectorOrder ?? "newest-first",
+  );
+  populateSelector(conversationData.messages, selectAll, selectedIds);
   document.body.classList.add("overlay-open");
   selectorOverlay.classList.add("open");
   updateSelectorCount();
-  const firstCheckbox = getCheckboxes()[0];
-  if (firstCheckbox) {
-    firstCheckbox.focus({ preventScroll: true });
-    selList.scrollTop = 0;
+  selList.scrollTop = scrollPosition === "bottom" ? selList.scrollHeight : 0;
+  const checkboxes = getCheckboxes();
+  const focusCheckbox = scrollPosition === "bottom"
+    ? checkboxes.at(-1)
+    : checkboxes[0];
+  if (focusCheckbox) {
+    focusCheckbox.focus({ preventScroll: true });
   } else {
     selCancelBtn.focus();
   }
