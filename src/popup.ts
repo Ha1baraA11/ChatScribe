@@ -26,6 +26,7 @@ import {
 } from "./formatter.ts";
 import { buildZipBlob, blobToBase64 } from "./zip.ts";
 import { selectHydratedExport } from "./export-selection.ts";
+import { getInitialSelectorScrollPosition } from "./selector-scroll.ts";
 import { CONTENT_LOAD_TYPE } from "./content-protocol.ts";
 import type {
   ConversationData,
@@ -571,13 +572,23 @@ document.addEventListener("keydown", (event) => {
 });
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName !== "sync" || !changes.keepCopyOptionsOpen || !settings) return;
-  const wasExpanded = !copyOptions.hidden;
-  settings = {
-    ...settings,
-    keepCopyOptionsOpen: changes.keepCopyOptionsOpen.newValue === true,
-  };
-  setCopyOptionsExpanded(wasExpanded);
+  if (areaName !== "sync" || !settings) return;
+  if (changes.keepCopyOptionsOpen) {
+    const wasExpanded = !copyOptions.hidden;
+    settings = {
+      ...settings,
+      keepCopyOptionsOpen: changes.keepCopyOptionsOpen.newValue === true,
+    };
+    setCopyOptionsExpanded(wasExpanded);
+  }
+  if (changes.selectorOrder) {
+    settings = {
+      ...settings,
+      selectorOrder: changes.selectorOrder.newValue === "oldest-first"
+        ? "oldest-first"
+        : "newest-first",
+    };
+  }
 });
 
 // -----------------------------------------------------------------------
@@ -648,14 +659,23 @@ function openSelector(
 ): void {
   if (!conversationData) return;
   closeCopyOptions();
+  const scrollPosition = getInitialSelectorScrollPosition(
+    settings?.selectorOrder ?? "newest-first",
+  );
   populateSelector(conversationData.messages, selectAll, selectedIds);
   document.body.classList.add("overlay-open");
   selectorOverlay.classList.add("open");
   updateSelectorCount();
-  const firstCheckbox = selList.querySelector<HTMLInputElement>(
-    "input[type='checkbox']",
-  );
-  (firstCheckbox ?? selCancelBtn).focus();
+  selList.scrollTop = scrollPosition === "bottom" ? selList.scrollHeight : 0;
+  const checkboxes = getCheckboxes();
+  const focusCheckbox = scrollPosition === "bottom"
+    ? checkboxes.at(-1)
+    : checkboxes[0];
+  if (focusCheckbox) {
+    focusCheckbox.focus({ preventScroll: true });
+  } else {
+    selCancelBtn.focus();
+  }
 }
 
 function closeSelector(): void {

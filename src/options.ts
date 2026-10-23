@@ -66,6 +66,7 @@ const downloadImagesInput = $id<HTMLInputElement>("downloadImages");
 const includeGeneratedImagesInput = $id<HTMLInputElement>("includeGeneratedImages");
 const includeTimestampInput = $id<HTMLInputElement>("includeTimestamp");
 const keepCopyOptionsOpenInput = $id<HTMLInputElement>("keepCopyOptionsOpen");
+const selectorOrderSelect = $id<HTMLSelectElement>("selectorOrder");
 const themeSelect = $id<HTMLSelectElement>("theme-select");
 const panelModeSelect = $id<HTMLSelectElement>("panelMode");
 const languageSelect = $id<HTMLSelectElement>("language-select");
@@ -82,6 +83,15 @@ const FILENAME_PRESETS: Record<string, string> = {
 // Save UI
 const saveBtn = $id<HTMLButtonElement>("save-btn");
 const savedLabel = $id<HTMLSpanElement>("saved-label");
+let savedLabelTimer: number | undefined;
+
+function showSavedLabel(): void {
+  savedLabel.classList.add("visible");
+  window.clearTimeout(savedLabelTimer);
+  savedLabelTimer = window.setTimeout(() => {
+    savedLabel.classList.remove("visible");
+  }, 1800);
+}
 
 // GitHub UI
 const githubStatus = $id<HTMLParagraphElement>("github-status");
@@ -138,6 +148,7 @@ function populateForm(settings: Settings): void {
   includeGeneratedImagesInput.checked = settings.includeGeneratedImages;
   includeTimestampInput.checked = settings.includeTimestamp;
   keepCopyOptionsOpenInput.checked = settings.keepCopyOptionsOpen;
+  selectorOrderSelect.value = settings.selectorOrder;
 
   themeSelect.value = settings.theme;
   panelModeSelect.value = settings.panelMode;
@@ -169,6 +180,7 @@ function gatherSettings(): Settings {
     includeGeneratedImages: includeGeneratedImagesInput.checked,
     includeTimestamp: includeTimestampInput.checked,
     keepCopyOptionsOpen: keepCopyOptionsOpenInput.checked,
+    selectorOrder: selectorOrderSelect.value as Settings["selectorOrder"],
     theme: themeSelect.value as Settings["theme"],
     panelMode: panelModeSelect.value as Settings["panelMode"],
     language: languageSelect.value as Settings["language"],
@@ -356,6 +368,13 @@ languageSelect.addEventListener("change", () => {
   void refreshGitHubStatus();
 });
 
+selectorOrderSelect.addEventListener("change", async () => {
+  await chrome.storage.sync.set({
+    selectorOrder: selectorOrderSelect.value as Settings["selectorOrder"],
+  });
+  showSavedLabel();
+});
+
 promptToSaveInput.addEventListener("change", () => {
   updateDownloadLocationControls();
   updateExportPreview();
@@ -390,10 +409,7 @@ saveBtn.addEventListener("click", async () => {
   const current = gatherSettings();
   await saveSettings(current);
 
-  savedLabel.classList.add("visible");
-  setTimeout(() => {
-    savedLabel.classList.remove("visible");
-  }, 1800);
+  showSavedLabel();
 });
 
 downloadsSettingsLink.addEventListener("click", (e) => {

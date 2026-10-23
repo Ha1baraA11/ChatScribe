@@ -190,6 +190,7 @@ export type HeadingStyle = "transcript" | "bold" | "none";
 export type SeparatorStyle = "single" | "double" | "rule";
 export type ThemeStyle = "system" | "light" | "dark";
 export type PanelMode = "popup" | "sidebar";
+export type SelectorOrder = "newest-first" | "oldest-first";
 export type LanguageCode =
   | "auto"
   | "en"
@@ -213,6 +214,7 @@ export interface Settings {
   downloadImages: boolean;
   includeGeneratedImages: boolean;
   keepCopyOptionsOpen: boolean;
+  selectorOrder: SelectorOrder;
   theme: ThemeStyle;
   panelMode: PanelMode;
   language: LanguageCode;
@@ -228,6 +230,7 @@ export const DEFAULT_SETTINGS: Settings = {
   downloadImages: false,
   includeGeneratedImages: true,
   keepCopyOptionsOpen: false,
+  selectorOrder: "newest-first",
   theme: "system",
   panelMode: "popup",
   language: "auto",
