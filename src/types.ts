@@ -4,7 +4,12 @@
  * Shared type definitions used across content.ts, popup.ts, etc.
  */
 
-import type { CONTENT_LOAD_TYPE } from "./content-protocol.ts";
+import type {
+  CONTENT_CHECK_REVISION_TYPE,
+  CONTENT_CONVERSATION_CHANGED_TYPE,
+  CONTENT_LOAD_TYPE,
+  CONTENT_WATCH_CONVERSATION_TYPE,
+} from "./content-protocol.ts";
 
 // -----------------------------------------------------------------------
 // EXPORT TYPES
@@ -110,6 +115,8 @@ export interface ImageExportDiagnostics {
 export interface ConversationData {
   messages: ExportMessage[];
   images: ExportImageFile[];
+  /** Lightweight API revision used to detect completed conversation updates. */
+  revision?: string;
   imageDiagnostics?: ImageExportDiagnostics;
   /** Runtime-only map used to align selected exports with full-conversation question numbers. */
   messageQuestionNumbersById?: Record<string, number>;
@@ -255,6 +262,9 @@ export type ChromeMessage =
       forceRefresh?: boolean;
       selectedMessageIds?: string[];
     }
+  | { type: typeof CONTENT_CHECK_REVISION_TYPE }
+  | { type: typeof CONTENT_WATCH_CONVERSATION_TYPE; watch: boolean }
+  | { type: typeof CONTENT_CONVERSATION_CHANGED_TYPE; conversationId: string }
   | { type: "COPY_TO_CLIPBOARD"; text: string; tabId?: number }
   | { type: "SHOW_EXPORT_SUCCESS"; message: string }
   | { type: "EXPORT_PROGRESS"; collected: number }

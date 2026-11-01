@@ -65,8 +65,12 @@ import {
   BRIDGE_PONG_TYPE,
   CHATSCRIBE_BUILD_ID,
   CONTENT_LOAD_TYPE,
+  CONTENT_CHECK_REVISION_TYPE,
+  CONTENT_WATCH_CONVERSATION_TYPE,
+  CONTENT_CONVERSATION_CHANGED_TYPE,
   CONTENT_PING_TYPE,
 } from "./content-protocol.ts";
+import { getConversationRevision } from "./conversation-revision.ts";
 
 // -----------------------------------------------------------------------
 // DEV LOGGING
@@ -153,8 +157,8 @@ function sleep(ms: number): Promise<void> {
 // CONVERSATION ID
 // -----------------------------------------------------------------------
 
-function extractConversationId(): string | null {
-  const match = window.location.pathname.match(
+function extractConversationId(pathname = window.location.pathname): string | null {
+  const match = pathname.match(
     /\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i,
   );
   return match ? match[1] : null;
@@ -2693,9 +2697,14 @@ let cachedRawConversation: {
   key: string;
   messages: Map<string, ApiMessage>;
   currentNode: string | null;
+  revision: string;
   completedAt: number;
 } | null = null;
 let lastLoadProgress = 0;
+let latestConversationLoadSequence = 0;
+let latestRawFetchSequence = 0;
+const latestForcedLoadSequenceByPath = new Map<string, number>();
+const forcedLoadsInFlightByPath = new Map<string, number>();
 
 function publishLoadProgress(progress: {
   stage?: "messages" | "images";
@@ -2722,10 +2731,11 @@ async function loadConversation(
   selectedMessageIds?: string[],
   forceRefresh = false,
 ): Promise<ConversationData> {
+  const requestPath = window.location.pathname;
   const selectedKey = selectedMessageIds
     ? [...selectedMessageIds].sort().join(",")
     : "all";
-  const key = `${location.pathname}:${downloadImages}:${includeGeneratedImages}:${fetchImages}:${selectedKey}:${forceRefresh}`;
+  const key = `${requestPath}:${downloadImages}:${includeGeneratedImages}:${fetchImages}:${selectedKey}:${forceRefresh}`;
   if (loadInFlight?.key === key) return loadInFlight.promise;
   if (
     !forceRefresh &&
@@ -2735,6 +2745,21 @@ async function loadConversation(
     return Promise.resolve(cachedLoad.data);
   }
 
+  const requestSequence = ++latestConversationLoadSequence;
+  if (forceRefresh) {
+    latestForcedLoadSequenceByPath.set(requestPath, requestSequence);
+    // Keep route history bounded for long-lived ChatGPT tabs.
+    if (latestForcedLoadSequenceByPath.size > 16) {
+      const oldestPath = latestForcedLoadSequenceByPath.keys().next().value;
+      if (oldestPath && oldestPath !== requestPath) {
+        latestForcedLoadSequenceByPath.delete(oldestPath);
+      }
+    }
+    forcedLoadsInFlightByPath.set(
+      requestPath,
+      (forcedLoadsInFlightByPath.get(requestPath) ?? 0) + 1,
+    );
+  }
   lastLoadProgress = 0;
   const promise = doLoadConversation(
     downloadImages,
@@ -2742,12 +2767,26 @@ async function loadConversation(
     fetchImages,
     selectedMessageIds ? new Set(selectedMessageIds) : null,
     forceRefresh,
+    requestPath,
   )
     .then((data) => {
-      cachedLoad = { key, data, completedAt: Date.now() };
+      const isLatestForcedLoad = forceRefresh &&
+        latestForcedLoadSequenceByPath.get(requestPath) === requestSequence;
+      const isCurrentCachedLoad = !forceRefresh &&
+        requestSequence === latestConversationLoadSequence &&
+        (forcedLoadsInFlightByPath.get(requestPath) ?? 0) === 0;
+      if ((isLatestForcedLoad || isCurrentCachedLoad) &&
+        window.location.pathname === requestPath) {
+        cachedLoad = { key, data, completedAt: Date.now() };
+      }
       return data;
     })
     .finally(() => {
+      if (forceRefresh) {
+        const remaining = (forcedLoadsInFlightByPath.get(requestPath) ?? 1) - 1;
+        if (remaining > 0) forcedLoadsInFlightByPath.set(requestPath, remaining);
+        else forcedLoadsInFlightByPath.delete(requestPath);
+      }
       if (loadInFlight?.promise === promise) loadInFlight = null;
     });
   loadInFlight = { key, promise };
@@ -2760,6 +2799,7 @@ async function doLoadConversation(
   fetchImages: boolean,
   selectedMessageIds: ReadonlySet<string> | null,
   forceRefresh: boolean,
+  requestPath: string,
 ): Promise<ConversationData> {
   imageResourceCache = new WeakMap();
   const diagnosticStartedAtMs = performance.now();
@@ -2782,9 +2822,7 @@ async function doLoadConversation(
     fetchImages,
     selectedMessagesOnly: selectedMessageIds !== null,
   });
-  await waitForBridge();
-
-  const rawConvId = extractConversationId();
+  const rawConvId = extractConversationId(requestPath);
   if (!rawConvId) {
     throw new Error(
       "Could not determine the ChatGPT conversation ID from the URL.",
@@ -2792,12 +2830,18 @@ async function doLoadConversation(
   }
   const conversationId = rawConvId;
 
+  await waitForBridge();
+  if (window.location.pathname !== requestPath) {
+    throw new Error("The ChatGPT conversation changed while it was loading.");
+  }
+
   devLog("Loading conversation", conversationId);
 
   // ---- Paginate through all pages (reuse raw API data for export-time image downloads) ----
-  const rawCacheKey = location.pathname;
+  const rawCacheKey = requestPath;
   let allById: Map<string, ApiMessage>;
   let currentNode: string | null;
+  let revision: string;
   let reusedRawConversation = false;
 
   if (
@@ -2808,10 +2852,12 @@ async function doLoadConversation(
     reusedRawConversation = true;
     allById = new Map(cachedRawConversation.messages);
     currentNode = cachedRawConversation.currentNode;
+    revision = cachedRawConversation.revision;
     lastLoadProgress = allById.size;
     publishLoadProgress();
     devLog(`Reusing ${allById.size} cached raw conversation messages`);
   } else {
+    const rawFetchSequence = ++latestRawFetchSequence;
     allById = new Map<string, ApiMessage>();
 
     async function fetchAndCollect(cursor: string | null): Promise<{
@@ -2851,6 +2897,7 @@ async function doLoadConversation(
     }
 
     let { page, collected } = await fetchAndCollect(null);
+    revision = getConversationRevision(page);
     lastLoadProgress = collected;
     publishLoadProgress();
 
@@ -2886,12 +2933,18 @@ async function doLoadConversation(
       publishLoadProgress();
     }
 
-    cachedRawConversation = {
-      key: rawCacheKey,
-      messages: new Map(allById),
-      currentNode,
-      completedAt: Date.now(),
-    };
+    if (
+      rawFetchSequence === latestRawFetchSequence &&
+      window.location.pathname === rawCacheKey
+    ) {
+      cachedRawConversation = {
+        key: rawCacheKey,
+        messages: new Map(allById),
+        currentNode,
+        revision,
+        completedAt: Date.now(),
+      };
+    }
   }
 
   devLog(`Pagination complete. Raw messages: ${allById.size}`);
@@ -3562,7 +3615,13 @@ async function doLoadConversation(
     imageFileCount: images.length,
   });
 
-  return { messages, images, imageDiagnostics, messageQuestionNumbersById };
+  return {
+    messages,
+    images,
+    revision,
+    imageDiagnostics,
+    messageQuestionNumbersById,
+  };
 }
 
 // -----------------------------------------------------------------------
@@ -3771,6 +3830,98 @@ function showExportSuccess(message: string): void {
 // CHROME MESSAGE LISTENER
 // -----------------------------------------------------------------------
 
+async function checkConversationRevision(): Promise<{
+  conversationId: string;
+  revision: string;
+}> {
+  const requestPath = window.location.pathname;
+  const conversationId = extractConversationId(requestPath);
+  if (!conversationId) {
+    throw new Error("Could not determine the ChatGPT conversation ID from the URL.");
+  }
+
+  await waitForBridge();
+  if (window.location.pathname !== requestPath) {
+    throw new Error("The ChatGPT conversation changed while it was being checked.");
+  }
+
+  const page = await requestConversationPage(conversationId, null);
+  if (window.location.pathname !== requestPath) {
+    throw new Error("The ChatGPT conversation changed while it was being checked.");
+  }
+
+  return { conversationId, revision: getConversationRevision(page) };
+}
+
+const CONVERSATION_MARKER_SELECTOR =
+  "[data-turn-key], [data-dil-message-id], [data-message-id], [data-chatgpt-search-message-ids]";
+let conversationWatchObserver: MutationObserver | null = null;
+let conversationWatchTimer: number | undefined;
+
+function isConversationMutation(record: MutationRecord): boolean {
+  const target = record.target instanceof Element
+    ? record.target
+    : record.target.parentElement;
+  if (target?.closest(CONVERSATION_MARKER_SELECTOR)) return true;
+
+  for (const node of [...record.addedNodes, ...record.removedNodes]) {
+    if (!(node instanceof Element)) continue;
+    if (node.matches(CONVERSATION_MARKER_SELECTOR) ||
+      node.querySelector(CONVERSATION_MARKER_SELECTOR)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function stopWatchingConversation(): void {
+  conversationWatchObserver?.disconnect();
+  conversationWatchObserver = null;
+  if (conversationWatchTimer !== undefined) {
+    window.clearTimeout(conversationWatchTimer);
+    conversationWatchTimer = undefined;
+  }
+}
+
+function startWatchingConversation(): void {
+  if (conversationWatchObserver || typeof MutationObserver === "undefined") return;
+  const root = document.body ?? document.documentElement;
+  if (!root) return;
+
+  conversationWatchObserver = new MutationObserver((records) => {
+    if (!records.some(isConversationMutation)) return;
+    if (conversationWatchTimer !== undefined) {
+      window.clearTimeout(conversationWatchTimer);
+    }
+    conversationWatchTimer = window.setTimeout(() => {
+      conversationWatchTimer = undefined;
+      const conversationId = extractConversationId();
+      if (!conversationId) return;
+      void chrome.runtime.sendMessage({
+        type: CONTENT_CONVERSATION_CHANGED_TYPE,
+        conversationId,
+      }).catch(() => {
+        /* The popup may have closed before the page change settled. */
+      });
+    }, 750);
+  });
+  conversationWatchObserver.observe(root, {
+    subtree: true,
+    childList: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: [
+      "data-turn-key",
+      "data-dil-message-id",
+      "data-message-id",
+      "data-chatgpt-search-message-ids",
+      "aria-label",
+      "disabled",
+      "data-state",
+    ],
+  });
+}
+
 const onContentMessage: Parameters<typeof chrome.runtime.onMessage.addListener>[0] =
   (
     message: {
@@ -3782,6 +3933,7 @@ const onContentMessage: Parameters<typeof chrome.runtime.onMessage.addListener>[
       selectedMessageIds?: string[];
       text?: string;
       message?: string;
+      watch?: boolean;
     },
     _sender,
     sendResponse,
@@ -3830,6 +3982,23 @@ const onContentMessage: Parameters<typeof chrome.runtime.onMessage.addListener>[
       return true; // Keep channel open for async response
     }
 
+    if (message.type === CONTENT_CHECK_REVISION_TYPE) {
+      void checkConversationRevision()
+        .then((data) => sendResponse({ success: true, ...data }))
+        .catch((error: unknown) => sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        }));
+      return true;
+    }
+
+    if (message.type === CONTENT_WATCH_CONVERSATION_TYPE) {
+      if (message.watch === true) startWatchingConversation();
+      else stopWatchingConversation();
+      sendResponse({ success: true });
+      return false;
+    }
+
     if (message.type === CONTENT_PING_TYPE) {
       sendResponse({ ready: true, buildId: CHATSCRIBE_BUILD_ID });
       return false;
@@ -3844,9 +4013,12 @@ const onContentMessage: Parameters<typeof chrome.runtime.onMessage.addListener>[
     return false;
   };
 chrome.runtime.onMessage.addListener(onContentMessage);
+window.addEventListener("pagehide", stopWatchingConversation);
 
 contentCleanupByBuild.set(CHATSCRIBE_BUILD_ID, () => {
   window.removeEventListener("message", onBridgeWindowMessage);
+  window.removeEventListener("pagehide", stopWatchingConversation);
+  stopWatchingConversation();
   chrome.storage.onChanged.removeListener(onContentStorageChanged);
   chrome.runtime.onMessage.removeListener(onContentMessage);
   window.clearTimeout(successToastTimer);

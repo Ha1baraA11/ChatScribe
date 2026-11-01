@@ -131,6 +131,7 @@ import {
           method: "GET",
           credentials: "include",
           headers: new Headers(headers),
+          cache: "no-store",
           signal: controller.signal,
         });
 

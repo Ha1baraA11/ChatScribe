@@ -27,7 +27,12 @@ import {
 import { buildZipBlob, blobToBase64 } from "./zip.ts";
 import { selectHydratedExport } from "./export-selection.ts";
 import { getInitialSelectorScrollPosition } from "./selector-scroll.ts";
-import { CONTENT_LOAD_TYPE } from "./content-protocol.ts";
+import {
+  CONTENT_LOAD_TYPE,
+  CONTENT_CHECK_REVISION_TYPE,
+  CONTENT_WATCH_CONVERSATION_TYPE,
+  CONTENT_CONVERSATION_CHANGED_TYPE,
+} from "./content-protocol.ts";
 import type {
   ConversationData,
   ExportMessage,
@@ -149,14 +154,28 @@ let conversationData: ConversationData | null = null;
 let settings: Settings | null = null;
 let pageTitle = "ChatGPT Conversation";
 let sourceTabId: number | null = null;
+let sourceConversationId: string | null = null;
 let loadSequence = 0;
 let githubReturnSelection: Set<string> | null = null;
+let selectorRevisionCheckTimer: number | undefined;
+let selectorRevisionCheckDueAt: number | undefined;
+let selectorRevisionCheckInFlight = false;
+let selectorRevisionCheckQueued = false;
+let selectorRevisionRetryIndex = 0;
+let selectorLastRevisionCheckAt = 0;
+let selectorWatchTabId: number | null = null;
 const PANEL_TARGET_TAB_KEY = "chatscribePanelTargetTabId";
+const SELECTOR_REVISION_RETRY_DELAYS_MS = [5_000, 10_000, 20_000, 30_000];
 
 function isMissingReceiver(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /receiving end does not exist|no receiver|could not establish connection/i
     .test(message);
+}
+
+function getConversationIdFromUrl(url: string | undefined): string | null {
+  const match = url?.match(/\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[/?#]|$)/i);
+  return match?.[1] ?? null;
 }
 
 async function requestConversation(
@@ -200,6 +219,47 @@ async function requestConversation(
     }
     throw error;
   }
+}
+
+async function requestConversationRevision(
+  tabId: number,
+  ensureContentScript = true,
+): Promise<{
+  success: boolean;
+  conversationId?: string;
+  revision?: string;
+  error?: string;
+}> {
+  if (ensureContentScript) {
+    const ensured = await chrome.runtime.sendMessage({
+      type: "ENSURE_CONTENT_SCRIPT",
+      tabId,
+    }) as { success?: boolean; error?: string } | undefined;
+    if (!ensured?.success) {
+      throw new Error(ensured?.error ?? "ChatScribe could not reconnect to this tab.");
+    }
+  }
+
+  try {
+    return await chrome.tabs.sendMessage(tabId, {
+      type: CONTENT_CHECK_REVISION_TYPE,
+    });
+  } catch (error) {
+    if (isMissingReceiver(error)) {
+      if (!ensureContentScript) return requestConversationRevision(tabId, true);
+      throw new Error("ChatScribe could not reconnect to this tab.");
+    }
+    throw error;
+  }
+}
+
+function setConversationWatch(tabId: number, watch: boolean): void {
+  void chrome.tabs.sendMessage(tabId, {
+    type: CONTENT_WATCH_CONVERSATION_TYPE,
+    watch,
+  }).catch(() => {
+    /* The tab may close while the selector is opening or closing. */
+  });
 }
 
 class ImageExportFailure extends Error {
@@ -314,6 +374,7 @@ async function loadConversationForTab(tabId: number): Promise<void> {
   }
   if (requestId !== loadSequence) return;
   sourceTabId = tabId;
+  sourceConversationId = null;
   conversationData = null;
   closeSelector();
   showLoading(t("popup.loading"));
@@ -324,6 +385,7 @@ async function loadConversationForTab(tabId: number): Promise<void> {
       throw new Error(t("popup.error.notChatGpt"));
     }
 
+    sourceConversationId = getConversationIdFromUrl(tab.url);
     pageTitle = tab.title ?? "ChatGPT Conversation";
     const response = await requestConversation(
       tabId,
@@ -404,6 +466,23 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   }
 
   if (
+    message.type === CONTENT_CONVERSATION_CHANGED_TYPE &&
+    sender.tab?.id === sourceTabId &&
+    selectorOverlay.classList.contains("open")
+  ) {
+    const conversationId = typeof message.conversationId === "string"
+      ? message.conversationId
+      : null;
+    if (conversationId && conversationId !== sourceConversationId && sourceTabId !== null) {
+      void loadConversationForTab(sourceTabId);
+      return false;
+    }
+    selectorRevisionRetryIndex = 0;
+    scheduleSelectorRevisionCheck(750);
+    return false;
+  }
+
+  if (
     message.type === "EXPORT_PROGRESS" &&
     typeof message.collected === "number" &&
     sender.tab?.id === sourceTabId
@@ -428,6 +507,8 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   return false;
 });
 
+window.addEventListener("pagehide", stopSelectorSync);
+
 void init();
 
 // -----------------------------------------------------------------------
@@ -444,13 +525,63 @@ async function sendToPage(message: object): Promise<void> {
 // -----------------------------------------------------------------------
 
 copyBtn.addEventListener("click", () => {
-  if (!conversationData || !settings) {
+  if (sourceTabId === null || !settings) {
     showToast(t("popup.error.loadFailed"));
     return;
   }
   closeCopyOptions();
-  void copyMessages(conversationData.messages, { title: pageTitle });
+  void copyFullConversation();
 });
+
+async function copyFullConversation(): Promise<void> {
+  const tabId = sourceTabId;
+  const requestId = loadSequence;
+  if (tabId === null || !settings) return;
+
+  setBusy(true);
+  showLoading(t("popup.loading"));
+  try {
+    const copySettings = await loadSettings();
+    if (requestId !== loadSequence || sourceTabId !== tabId) return;
+    settings = copySettings;
+
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab.url?.startsWith("https://chatgpt.com/")) {
+      throw new Error(t("popup.error.notChatGpt"));
+    }
+    const response = await requestConversation(
+      tabId,
+      copySettings.downloadImages,
+      copySettings.includeGeneratedImages,
+      false,
+      undefined,
+      true,
+    );
+    if (requestId !== loadSequence || sourceTabId !== tabId) return;
+    if (!response?.success || !response.data) {
+      throw new Error(response?.error ?? t("popup.error.loadFailed"));
+    }
+    if (response.data.messages.length === 0) {
+      throw new Error(t("popup.error.noMessages"));
+    }
+
+    conversationData = response.data;
+    sourceConversationId = getConversationIdFromUrl(tab.url);
+    pageTitle = tab.title ?? pageTitle;
+    hideLoading();
+    await copyMessages(response.data.messages, { title: pageTitle });
+  } catch (error) {
+    if (requestId !== loadSequence || sourceTabId !== tabId) return;
+    devError("Failed to refresh conversation before copying:", error);
+    const message = error instanceof Error ? error.message : "";
+    showToast(message || t("popup.error.loadFailed"), 5000);
+  } finally {
+    if (requestId === loadSequence && sourceTabId === tabId) {
+      hideLoading();
+      setBusy(false);
+    }
+  }
+}
 
 copyMenuToggle.addEventListener("click", () => {
   if (settings?.keepCopyOptionsOpen) return;
@@ -529,11 +660,11 @@ async function copyLatestAnswer(): Promise<void> {
 
 copySelectBtn.addEventListener("click", () => {
   closeCopyOptions();
-  if (!conversationData) {
+  if (!conversationData || !settings || sourceTabId === null) {
     showToast(t("popup.error.loadFailed"));
     return;
   }
-  openSelector(false);
+  void refreshConversationForSelector(false);
 });
 
 function closeCopyOptions(): void {
@@ -601,10 +732,10 @@ exportBtn.addEventListener("click", () => {
     showToast(t("popup.error.loadFailed"));
     return;
   }
-  void refreshConversationForExport();
+  void refreshConversationForSelector(true);
 });
 
-async function refreshConversationForExport(): Promise<void> {
+async function refreshConversationForSelector(selectAll: boolean): Promise<void> {
   const requestId = loadSequence;
   const tabId = sourceTabId;
   if (!settings || tabId === null) return;
@@ -612,13 +743,13 @@ async function refreshConversationForExport(): Promise<void> {
   setBusy(true);
   showLoading(t("popup.loading"));
   try {
-    const exportSettings = await loadSettings();
+    const selectorSettings = await loadSettings();
     if (requestId !== loadSequence || sourceTabId !== tabId) return;
-    settings = exportSettings;
+    settings = selectorSettings;
     const response = await requestConversation(
       tabId,
-      exportSettings.downloadImages,
-      exportSettings.includeGeneratedImages,
+      selectorSettings.downloadImages,
+      selectorSettings.includeGeneratedImages,
       false,
       undefined,
       true,
@@ -634,12 +765,13 @@ async function refreshConversationForExport(): Promise<void> {
     const tab = await chrome.tabs.get(tabId);
     if (requestId !== loadSequence || sourceTabId !== tabId) return;
     conversationData = response.data;
+    sourceConversationId = getConversationIdFromUrl(tab.url);
     pageTitle = tab.title ?? pageTitle;
-    openSelector(true);
+    openSelector(selectAll);
   } catch (error) {
     if (requestId !== loadSequence || sourceTabId !== tabId) return;
     const message = error instanceof Error ? error.message : "";
-    devError("Failed to refresh conversation for export:", error);
+    devError("Failed to refresh conversation before opening the selector:", error);
     showToast(message || t("popup.error.loadFailed"), 5000);
   } finally {
     if (requestId === loadSequence && sourceTabId === tabId) {
@@ -676,11 +808,169 @@ function openSelector(
   } else {
     selCancelBtn.focus();
   }
+  startSelectorSync();
 }
 
 function closeSelector(): void {
   selectorOverlay.classList.remove("open");
   document.body.classList.remove("overlay-open");
+  stopSelectorSync();
+}
+
+function startSelectorSync(): void {
+  if (sourceTabId === null || !sourceConversationId) return;
+  if (selectorWatchTabId !== null && selectorWatchTabId !== sourceTabId) {
+    stopSelectorSync();
+  }
+  selectorRevisionRetryIndex = 0;
+  selectorLastRevisionCheckAt = 0;
+  selectorWatchTabId = sourceTabId;
+  setConversationWatch(sourceTabId, true);
+  scheduleSelectorRevisionCheck(0);
+}
+
+function stopSelectorSync(): void {
+  if (selectorWatchTabId !== null) {
+    setConversationWatch(selectorWatchTabId, false);
+    selectorWatchTabId = null;
+  }
+  if (selectorRevisionCheckTimer !== undefined) {
+    window.clearTimeout(selectorRevisionCheckTimer);
+    selectorRevisionCheckTimer = undefined;
+  }
+  selectorRevisionCheckDueAt = undefined;
+  selectorRevisionCheckQueued = false;
+  selectorRevisionRetryIndex = 0;
+}
+
+function scheduleSelectorRevisionCheck(delayMs: number): void {
+  if (!selectorOverlay.classList.contains("open") || sourceTabId === null) return;
+  const throttleDueAt = selectorLastRevisionCheckAt + 5_000;
+  const dueAt = Math.max(Date.now() + delayMs, throttleDueAt);
+  if (
+    selectorRevisionCheckTimer !== undefined &&
+    selectorRevisionCheckDueAt !== undefined &&
+    selectorRevisionCheckDueAt <= dueAt
+  ) return;
+
+  if (selectorRevisionCheckTimer !== undefined) {
+    window.clearTimeout(selectorRevisionCheckTimer);
+  }
+  selectorRevisionCheckDueAt = dueAt;
+  selectorRevisionCheckTimer = window.setTimeout(() => {
+    selectorRevisionCheckTimer = undefined;
+    selectorRevisionCheckDueAt = undefined;
+    void checkSelectorRevision();
+  }, Math.max(0, dueAt - Date.now()));
+}
+
+function schedulePendingAnswerRetry(): void {
+  const delay = SELECTOR_REVISION_RETRY_DELAYS_MS[
+    Math.min(selectorRevisionRetryIndex, SELECTOR_REVISION_RETRY_DELAYS_MS.length - 1)
+  ];
+  selectorRevisionRetryIndex++;
+  scheduleSelectorRevisionCheck(delay);
+}
+
+function refreshOpenSelector(data: ConversationData): void {
+  const selectedIds = new Set(getCheckedIds());
+  const scrollTop = selList.scrollTop;
+  const wasAtBottom = selList.scrollHeight - selList.scrollTop - selList.clientHeight <= 2;
+  const focusedId = document.activeElement instanceof HTMLInputElement
+    ? document.activeElement.dataset.id
+    : undefined;
+
+  conversationData = data;
+  populateSelector(data.messages, false, selectedIds);
+  selList.scrollTop = wasAtBottom
+    ? selList.scrollHeight
+    : Math.min(scrollTop, selList.scrollHeight);
+  if (focusedId) {
+    getCheckboxes().find((checkbox) => checkbox.dataset.id === focusedId)
+      ?.focus({ preventScroll: true });
+  }
+}
+
+async function checkSelectorRevision(): Promise<void> {
+  if (!selectorOverlay.classList.contains("open") || sourceTabId === null) return;
+  if (selectorRevisionCheckInFlight) {
+    selectorRevisionCheckQueued = true;
+    return;
+  }
+
+  const tabId = sourceTabId;
+  const conversationId = sourceConversationId;
+  const requestId = loadSequence;
+  if (!conversationId || !settings) return;
+
+  selectorRevisionCheckInFlight = true;
+  selectorLastRevisionCheckAt = Date.now();
+  let fullRefreshFailed = false;
+
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (requestId !== loadSequence || sourceTabId !== tabId) return;
+    const tabConversationId = getConversationIdFromUrl(tab.url);
+    if (tabConversationId !== conversationId) {
+      void loadConversationForTab(tabId);
+      return;
+    }
+
+    const head = await requestConversationRevision(tabId, false);
+    if (requestId !== loadSequence || sourceTabId !== tabId) return;
+    if (!head.success || !head.revision || !head.conversationId) {
+      throw new Error(head.error ?? t("popup.error.loadFailed"));
+    }
+    if (head.conversationId !== conversationId) {
+      void loadConversationForTab(tabId);
+      return;
+    }
+
+    if (head.revision !== conversationData?.revision) {
+      fullRefreshFailed = true;
+      const response = await requestConversation(
+        tabId,
+        settings.downloadImages,
+        settings.includeGeneratedImages,
+        false,
+        undefined,
+        true,
+      );
+      if (requestId !== loadSequence || sourceTabId !== tabId) return;
+      if (!response?.success || !response.data) {
+        throw new Error(response?.error ?? t("popup.error.loadFailed"));
+      }
+      if (response.data.messages.length === 0) {
+        throw new Error(t("popup.error.noMessages"));
+      }
+
+      fullRefreshFailed = false;
+      refreshOpenSelector(response.data);
+      if (response.data.revision !== head.revision) {
+        selectorRevisionCheckQueued = true;
+      }
+    }
+
+    if (conversationData?.messages.at(-1)?.role === "user") {
+      schedulePendingAnswerRetry();
+    } else {
+      selectorRevisionRetryIndex = 0;
+    }
+  } catch (error) {
+    devError("Could not sync the open message selector:", error);
+    if (fullRefreshFailed && requestId === loadSequence) {
+      showToast(t("popup.error.loadFailed"), 5000);
+    }
+    if (conversationData?.messages.at(-1)?.role === "user") {
+      schedulePendingAnswerRetry();
+    }
+  } finally {
+    selectorRevisionCheckInFlight = false;
+    if (selectorRevisionCheckQueued && selectorOverlay.classList.contains("open")) {
+      selectorRevisionCheckQueued = false;
+      scheduleSelectorRevisionCheck(750);
+    }
+  }
 }
 
 function getCheckboxes(): HTMLInputElement[] {

@@ -105,11 +105,17 @@ describe("content script build handshake", () => {
   it("registers only one current-build content listener after reinjection", async () => {
     vi.resetModules();
     const chromeListeners = new Set<MessageListener>();
-    const windowListeners = new Set<unknown>();
+    const windowListeners = new Map<string, Set<unknown>>();
     const storageListeners = new Set<unknown>();
     const fakeWindow = {
-      addEventListener: (_type: string, listener: unknown) => windowListeners.add(listener),
-      removeEventListener: (_type: string, listener: unknown) => windowListeners.delete(listener),
+      addEventListener: (type: string, listener: unknown) => {
+        const listenersForType = windowListeners.get(type) ?? new Set<unknown>();
+        listenersForType.add(listener);
+        windowListeners.set(type, listenersForType);
+      },
+      removeEventListener: (type: string, listener: unknown) => {
+        windowListeners.get(type)?.delete(listener);
+      },
       clearTimeout: vi.fn(),
     };
     vi.stubGlobal("window", fakeWindow);
@@ -133,7 +139,8 @@ describe("content script build handshake", () => {
     vi.resetModules();
     await import("../src/content.ts");
 
-    expect(windowListeners.size).toBe(1);
+    expect(windowListeners.get("message")?.size).toBe(1);
+    expect(windowListeners.get("pagehide")?.size).toBe(1);
     expect(chromeListeners.size).toBe(1);
     expect(storageListeners.size).toBe(1);
     const currentListener = [...chromeListeners][0];
