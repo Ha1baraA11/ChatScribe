@@ -38,3 +38,25 @@ describe("message selector order setting", () => {
     });
   });
 });
+
+describe("Claude thinking setting", () => {
+  it("defaults to off for existing and new installs", async () => {
+    stubStoredSettings({});
+
+    await expect(loadSettings()).resolves.toMatchObject({
+      includeClaudeThinking: false,
+    });
+  });
+
+  it("preserves a saved preference and falls back to off for invalid values", async () => {
+    stubStoredSettings({ includeClaudeThinking: true });
+    await expect(loadSettings()).resolves.toMatchObject({
+      includeClaudeThinking: true,
+    });
+
+    stubStoredSettings({ includeClaudeThinking: "yes" });
+    await expect(loadSettings()).resolves.toMatchObject({
+      includeClaudeThinking: false,
+    });
+  });
+});

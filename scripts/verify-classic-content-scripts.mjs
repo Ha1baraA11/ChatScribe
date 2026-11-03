@@ -9,6 +9,9 @@ const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
 const scripts = new Set(
   (manifest.content_scripts ?? []).flatMap((entry) => entry.js ?? []),
 );
+// Claude's listener is injected on demand after optional host permission is
+// granted, so it intentionally does not appear in manifest.content_scripts.
+scripts.add("claude-content.js");
 const expectedBuildId = computeBuildId();
 
 if (scripts.size === 0) {

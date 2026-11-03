@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/brand/chatscribe-logo-master.png" width="180" alt="Icône caméléon d’exportation de ChatScribe" />
   <h1>ChatScribe</h1>
-  <p><strong>Copiez ou exportez les conversations de chatgpt.com.</strong><br />
+  <p><strong>Copiez ou exportez les conversations de chatgpt.com et claude.ai.</strong><br />
   Copiez toute la conversation, la dernière réponse ou les messages de votre choix.</p>
   <p>Téléchargez en Markdown, texte, JSON ou CSV, ou enregistrez un export Markdown sur GitHub.</p>
   <p><a href="https://chrome.google.com/webstore/detail/aapnhkibnnhppanchcfngalkkojjfcmf">Installer ChatScribe depuis le Chrome Web Store</a></p>
@@ -15,6 +15,7 @@
 - Copiez dans le presse-papiers toute la conversation, la dernière réponse de l’assistant ou les messages sélectionnés.
 - Sélectionnez les messages individuellement. Filtrez par utilisateur ou assistant, sélectionnez tout ou rien, inversez la sélection et développez les aperçus.
 - Exportez toute la conversation ou les messages sélectionnés en Markdown, texte, JSON ou CSV.
+- La version web de Claude ne demande un accès facultatif au site que si vous choisissez de l'activer. Les Artifacts sont exportés dans leur version finale et les résumés de réflexion sont facultatifs.
 - En option, téléchargez les images de la conversation, y compris les images générées accessibles sur la page, et regroupez-les avec le Markdown dans un ZIP. Le Markdown contient des liens relatifs vers les fichiers image.
 - Pour les exports Markdown, les modèles de diagrammes SVG pris en charge sont convertis en images PNG. En texte, ils sont remplacés par `[Diagram]` ; les modèles non pris en charge restent inchangés.
 - Enregistrez un export Markdown dans le dossier `exports/` du dépôt GitHub de votre choix. Si l’export contient des images, il est enregistré dans un ZIP.
@@ -64,7 +65,7 @@ L’extension traite le contenu de la conversation pour effectuer l’action que
 
 ## Remerciements
 
-ChatScribe est développé de manière indépendante. L’idée du projet s’inspire de [AI Exporter de Grant Totinov](https://github.com/GrantTotinov/AIExporter) ; merci à Grant. ChatScribe ne dépend pas du code source d’AI Exporter, n’est ni affilié ni officiellement soutenu par Grant Totinov, ChatGPT ou OpenAI, et n’est le produit officiel d’aucun d’entre eux.
+ChatScribe est développé de manière indépendante. L’idée du projet s’inspire de [AI Exporter de Grant Totinov](https://github.com/GrantTotinov/AIExporter) ; merci à Grant. ChatScribe ne dépend pas du code source d’AI Exporter, n’est ni affilié ni officiellement soutenu par Grant Totinov, ChatGPT ou OpenAI, et n’est le produit officiel d’aucun d’entre eux. ChatScribe n’est pas non plus affilié à Anthropic ou Claude, ni officiellement soutenu par eux.
 
 ## Licence
 

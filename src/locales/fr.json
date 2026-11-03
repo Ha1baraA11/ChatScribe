@@ -142,5 +142,13 @@
   "github.error.cancelled": "La connexion GitHub a été annulée.",
   "github.error.unknown": "La connexion GitHub a échoué pour une raison inconnue.",
   "popup.githubProfile": "Visiter le profil GitHub",
-  "options.appearance.themeHint": "Le thème système suit celui du navigateur ou du système d’exploitation."
+  "options.appearance.themeHint": "Le thème système suit celui du navigateur ou du système d’exploitation.",
+  "popup.error.notSupportedSite": "Ouvrez d'abord une conversation sur chatgpt.com ou claude.ai",
+  "popup.permission.claude.title": "Autoriser l'accès à Claude",
+  "popup.permission.claude.body": "ChatScribe a besoin d'un accès facultatif à claude.ai pour lire la conversation ouverte. L'autorisation sera demandée uniquement si vous choisissez de continuer.",
+  "popup.permission.claude.button": "Autoriser l'accès à Claude",
+  "popup.permission.claude.denied": "L'accès à Claude n'a pas été autorisé.",
+  "popup.permission.claude.failed": "Impossible de demander l'accès à Claude.",
+  "options.downloads.includeClaudeThinking": "Inclure les blocs de réflexion de Claude",
+  "options.downloads.claudeThinkingHint": "Désactivé par défaut. Claude peut ne fournir qu'un résumé partiel de sa réflexion pour certaines réponses."
 }

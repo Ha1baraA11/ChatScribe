@@ -220,6 +220,7 @@ export interface Settings {
   downloadSubfolder: string;
   downloadImages: boolean;
   includeGeneratedImages: boolean;
+  includeClaudeThinking: boolean;
   keepCopyOptionsOpen: boolean;
   selectorOrder: SelectorOrder;
   theme: ThemeStyle;
@@ -236,6 +237,7 @@ export const DEFAULT_SETTINGS: Settings = {
   downloadSubfolder: "",
   downloadImages: false,
   includeGeneratedImages: true,
+  includeClaudeThinking: false,
   keepCopyOptionsOpen: false,
   selectorOrder: "newest-first",
   theme: "system",
@@ -258,6 +260,7 @@ export type ChromeMessage =
       type: typeof CONTENT_LOAD_TYPE;
       downloadImages: boolean;
       includeGeneratedImages: boolean;
+      includeClaudeThinking?: boolean;
       fetchImages?: boolean;
       forceRefresh?: boolean;
       selectedMessageIds?: string[];

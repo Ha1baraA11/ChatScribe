@@ -142,5 +142,13 @@
   "github.error.cancelled": "GitHub 로그인이 취소되었습니다.",
   "github.error.unknown": "알 수 없는 이유로 GitHub 로그인에 실패했습니다.",
   "popup.githubProfile": "GitHub 프로필 보기",
-  "options.appearance.themeHint": "시스템 설정을 선택하면 브라우저 또는 운영체제 테마를 따릅니다."
+  "options.appearance.themeHint": "시스템 설정을 선택하면 브라우저 또는 운영체제 테마를 따릅니다.",
+  "popup.error.notSupportedSite": "chatgpt.com 또는 claude.ai 대화를 여세요",
+  "popup.permission.claude.title": "Claude 접근 허용",
+  "popup.permission.claude.body": "열려 있는 대화를 읽으려면 ChatScribe에 claude.ai 선택적 접근 권한이 필요합니다. 아래 버튼을 눌러 계속할 때만 권한을 요청합니다.",
+  "popup.permission.claude.button": "Claude 접근 허용",
+  "popup.permission.claude.denied": "Claude 접근 권한이 허용되지 않았습니다.",
+  "popup.permission.claude.failed": "Claude 접근 권한을 요청할 수 없습니다.",
+  "options.downloads.includeClaudeThinking": "Claude 사고 블록 포함",
+  "options.downloads.claudeThinkingHint": "기본값은 끔입니다. 일부 답변에서 Claude가 사고 요약의 일부만 제공할 수 있습니다."
 }

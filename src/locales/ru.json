@@ -142,5 +142,13 @@
   "github.error.cancelled": "Вход через GitHub был отменён.",
   "github.error.unknown": "Вход через GitHub завершился неудачей по неизвестной причине.",
   "popup.githubProfile": "Открыть профиль GitHub",
-  "options.appearance.themeHint": "Системная тема следует настройкам браузера или операционной системы."
+  "options.appearance.themeHint": "Системная тема следует настройкам браузера или операционной системы.",
+  "popup.error.notSupportedSite": "Сначала откройте беседу на chatgpt.com или claude.ai",
+  "popup.permission.claude.title": "Разрешить доступ к Claude",
+  "popup.permission.claude.body": "ChatScribe требуется дополнительный доступ к claude.ai, чтобы прочитать открытую беседу. Разрешение будет запрошено, только если вы нажмёте кнопку продолжения.",
+  "popup.permission.claude.button": "Разрешить доступ к Claude",
+  "popup.permission.claude.denied": "Доступ к Claude не разрешён.",
+  "popup.permission.claude.failed": "Не удалось запросить доступ к Claude.",
+  "options.downloads.includeClaudeThinking": "Добавлять блоки рассуждений Claude",
+  "options.downloads.claudeThinkingHint": "По умолчанию выключено. Для некоторых ответов Claude может предоставить только часть краткого описания рассуждений."
 }

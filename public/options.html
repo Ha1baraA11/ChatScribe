@@ -141,16 +141,16 @@
 
       .settings-grid {
         display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        align-items: stretch;
+        grid-template-columns: minmax(0, 1fr);
+        align-items: start;
         gap: 18px;
       }
 
       fieldset {
         border: 1px solid var(--border);
-        border-radius: 14px;
+        border-radius: 12px;
         min-width: 0;
-        padding: 18px 20px 20px;
+        padding: 16px 18px 18px;
         margin: 0;
         background: var(--canvas);
         transition: border-color 0.16s ease;
@@ -158,10 +158,6 @@
 
       fieldset:hover {
         border-color: var(--text-muted);
-      }
-
-      .settings-card-wide {
-        grid-column: 1 / -1;
       }
 
       legend {
@@ -371,19 +367,14 @@
 
       .downloads-grid {
         display: grid;
-        grid-template-columns: minmax(0, 1fr);
-        gap: 0;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        column-gap: 36px;
+        row-gap: 22px;
       }
 
       .download-option {
         min-width: 0;
-        padding: 6px 0;
-      }
-
-      .download-option + .download-option {
-        margin-top: 8px;
-        padding-top: 14px;
-        border-top: 1px solid var(--border);
+        padding: 2px 0;
       }
 
       .download-option label {
@@ -426,6 +417,45 @@
 
       .download-option[hidden] {
         display: none;
+      }
+
+      .preferences-grid,
+      .formatting-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        column-gap: 36px;
+        row-gap: 22px;
+      }
+
+      .preference-item,
+      .format-setting {
+        min-width: 0;
+      }
+
+      .preference-item > label.choice-row {
+        padding-top: 0;
+      }
+
+      .preference-item > .hint {
+        margin-top: 5px;
+      }
+
+      .preference-item > label[for="keepCopyOptionsOpen"] + .hint {
+        margin-left: 27px;
+      }
+
+      .format-setting h3 {
+        margin: 0 0 10px;
+        font-size: 14px;
+        font-weight: 600;
+      }
+
+      .format-setting label {
+        padding: 5px 0;
+      }
+
+      .formatting-grid + .hint {
+        margin-top: 16px;
       }
 
       .repository-link {
@@ -597,13 +627,33 @@
           padding: 32px 20px 24px;
         }
 
-        .settings-grid {
-          grid-template-columns: minmax(0, 1fr);
-          gap: 14px;
+        .preferences-grid,
+        .downloads-grid,
+        .formatting-grid {
+          column-gap: 24px;
+          row-gap: 18px;
         }
 
-        .settings-card-wide {
-          grid-column: auto;
+        .preference-item > label.choice-row {
+          align-items: flex-start;
+          flex-direction: column;
+          gap: 8px;
+        }
+
+        .preference-item > label.choice-row .select-control {
+          flex: 0 1 auto;
+          width: 100%;
+          min-width: 0;
+          max-width: 100%;
+        }
+      }
+
+      @media (max-width: 600px) {
+        .preferences-grid,
+        .downloads-grid,
+        .formatting-grid {
+          grid-template-columns: minmax(0, 1fr);
+          row-gap: 18px;
         }
       }
 
@@ -676,161 +726,146 @@
 
       <div class="settings-grid">
         <fieldset>
-          <legend data-i18n="options.appearance.legend">Appearance</legend>
-          <label class="choice-row" for="theme">
-            <span data-i18n="options.appearance.theme">Theme</span>
-            <span class="select-control">
-              <select id="theme">
-                <option value="system" data-i18n="options.appearance.themeSystem">
-                  System
-                </option>
-                <option value="light" data-i18n="options.appearance.themeLight">
-                  Light
-                </option>
-                <option value="dark" data-i18n="options.appearance.themeDark">
-                  Dark
-                </option>
-              </select>
-              <svg
-                class="select-chevron"
-                viewBox="0 0 24 24"
-                aria-hidden="true"
-                focusable="false"
-              >
-                <path
-                  d="m7 10 5 5 5-5"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                />
-              </svg>
-            </span>
-          </label>
-          <p class="hint" data-i18n="options.appearance.themeHint">
-            System follows your browser/operating system theme.
-          </p>
-          <label class="choice-row" for="panelMode">
-            <span data-i18n="options.appearance.panelModeLabel">Open ChatScribe as</span>
-            <span class="select-control">
-              <select id="panelMode">
-                <option value="popup" data-i18n="options.appearance.panelModePopup">
-                  Popup (default)
-                </option>
-                <option value="sidebar" data-i18n="options.appearance.panelModeSidebar">
-                  Persistent sidebar
-                </option>
-              </select>
-              <svg
-                class="select-chevron"
-                viewBox="0 0 24 24"
-                aria-hidden="true"
-                focusable="false"
-              >
-                <path
-                  d="m7 10 5 5 5-5"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                />
-              </svg>
-            </span>
-          </label>
-          <p class="hint" data-i18n="options.appearance.panelModeHint">
-            Choose whether ChatScribe opens in a toolbar popup or a persistent sidebar.
-          </p>
+          <legend data-i18n="options.preferences.legend">Preferences</legend>
+          <div class="preferences-grid">
+            <div class="preference-item">
+              <label class="choice-row" for="theme">
+                <span data-i18n="options.appearance.theme">Theme</span>
+                <span class="select-control">
+                  <select id="theme" aria-describedby="theme-hint">
+                    <option value="system" data-i18n="options.appearance.system">Follow system</option>
+                    <option value="light" data-i18n="options.appearance.light">Light</option>
+                    <option value="dark" data-i18n="options.appearance.dark">Dark</option>
+                  </select>
+                  <svg class="select-chevron" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="m7 10 5 5 5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                </span>
+              </label>
+              <p class="hint" id="theme-hint" data-i18n="options.appearance.themeHint">
+                The system setting follows your browser or operating system theme.
+              </p>
+            </div>
+
+            <div class="preference-item">
+              <label class="choice-row" for="language">
+                <span data-i18n="options.language.label">Language</span>
+                <span class="select-control select-control-language">
+                  <select id="language" aria-describedby="language-hint">
+                    <option value="auto" data-i18n="options.language.auto">Auto-detect (browser language)</option>
+                    <option value="en">English</option>
+                    <option value="es">Español</option>
+                    <option value="fr">Français</option>
+                    <option value="de">Deutsch</option>
+                    <option value="ru">Русский</option>
+                    <option value="ja">日本語</option>
+                    <option value="ko">한국어</option>
+                    <option value="pt-BR">Português (Brasil)</option>
+                    <option value="zh">简体中文</option>
+                    <option value="zh-TW">繁體中文</option>
+                  </select>
+                  <svg class="select-chevron" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="m7 10 5 5 5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                </span>
+              </label>
+              <p class="hint" id="language-hint" data-i18n="options.language.hint">
+                Choose the language for the ChatScribe interface.
+              </p>
+            </div>
+
+            <div class="preference-item">
+              <label class="choice-row" for="panelMode">
+                <span data-i18n="options.appearance.panelModeLabel">Open ChatScribe as</span>
+                <span class="select-control">
+                  <select id="panelMode" aria-describedby="panel-mode-hint">
+                    <option value="popup" data-i18n="options.appearance.panelModePopup">Popup (default)</option>
+                    <option value="sidebar" data-i18n="options.appearance.panelModeSidebar">Persistent sidebar</option>
+                  </select>
+                  <svg class="select-chevron" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="m7 10 5 5 5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                </span>
+              </label>
+              <p class="hint" id="panel-mode-hint" data-i18n="options.appearance.panelModeHint">
+                Unlike a popup, the sidebar stays open when it loses focus. Switch tabs or apps, then return to Chrome to view ChatScribe and export progress.
+              </p>
+            </div>
+
+            <div class="preference-item">
+              <label class="choice-row" for="selectorOrder">
+                <span data-i18n="options.selectorOrder.label">Message selector opening position</span>
+                <span class="select-control">
+                  <select id="selectorOrder" aria-describedby="selector-order-hint">
+                    <option value="newest-first" data-i18n="options.selectorOrder.newestFirst">Newest messages (open at bottom)</option>
+                    <option value="oldest-first" data-i18n="options.selectorOrder.oldestFirst">Oldest messages (open at top)</option>
+                  </select>
+                  <svg class="select-chevron" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="m7 10 5 5 5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                </span>
+              </label>
+              <p class="hint" id="selector-order-hint" data-i18n="options.selectorOrder.hint">
+                Messages always stay in conversation order (oldest to newest). This setting only controls where the selector opens.
+              </p>
+            </div>
+
+            <div class="preference-item">
+              <label for="keepCopyOptionsOpen">
+                <input type="checkbox" id="keepCopyOptionsOpen" aria-describedby="keep-copy-options-hint" />
+                <span data-i18n="options.copyMenu.keepExpanded">Keep the copy options expanded</span>
+              </label>
+              <p class="hint" id="keep-copy-options-hint" data-i18n="options.copyMenu.keepExpandedHint">
+                Keep “Copy latest answer” and “Choose messages…” visible whenever ChatScribe is open.
+              </p>
+            </div>
+          </div>
         </fieldset>
 
-        <fieldset>
-          <legend data-i18n="options.language.legend">Language</legend>
-          <label class="choice-row" for="language">
-            <span data-i18n="options.language.label">Language</span>
-            <span class="select-control select-control-language">
-              <select id="language">
-                <option value="auto" data-i18n="options.language.auto">
-                  Auto-detect (browser language)
-                </option>
-                <option value="en">English</option>
-                <option value="es">Español</option>
-                <option value="fr">Français</option>
-                <option value="de">Deutsch</option>
-                <option value="ru">Русский</option>
-                <option value="ja">日本語</option>
-                <option value="ko">한국어</option>
-                <option value="pt-BR">Português (Brasil)</option>
-                <option value="zh">简体中文</option>
-                <option value="zh-TW">繁體中文</option>
-              </select>
-              <svg
-                class="select-chevron"
-                viewBox="0 0 24 24"
-                aria-hidden="true"
-                focusable="false"
-              >
-                <path
-                  d="m7 10 5 5 5-5"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                />
-              </svg>
-            </span>
-          </label>
-          <p class="hint" data-i18n="options.language.hint">
-            Choose the language for ChatScribe's interface.
-          </p>
-        </fieldset>
-
-        <fieldset id="downloads-settings" class="settings-card-wide">
+        <fieldset id="downloads-settings">
           <legend data-i18n="options.downloads.legend">Downloads</legend>
           <div class="downloads-grid">
             <div class="download-option">
-              <label for="askWhereToSave">
-                <input type="checkbox" id="askWhereToSave" />
-                <span data-i18n="options.downloads.askWhereToSave"
-                  >Ask where to save each export</span
-                >
-              </label>
-            </div>
-            <div class="download-option">
               <label for="downloadImagesLocally">
-                <input type="checkbox" id="downloadImagesLocally" />
-                <span data-i18n="options.downloads.bundleImages"
-                  >Bundle downloaded images with exports as a ZIP</span
-                >
+                <input type="checkbox" id="downloadImagesLocally" aria-describedby="download-images-hint" />
+                <span data-i18n="options.downloads.downloadImages">Bundle images with export as a ZIP</span>
               </label>
-              <p class="hint" data-i18n="options.downloads.bundleImagesHint">
-                When enabled, image exports include an images folder. Otherwise,
-                exports keep ChatGPT-hosted image links.
+              <p class="hint" id="download-images-hint" data-i18n="options.downloads.imagesHint">
+                When enabled, images are saved into an images/ folder and linked by relative paths. Disable to omit image attachments entirely.
               </p>
-              <a
-                class="repository-link"
-                id="downloads-settings-link"
-                href="#"
-                data-i18n="options.downloads.settingsLink"
-              >
-                Open browser download location settings
+              <a class="repository-link" id="downloads-settings-link" href="#" data-i18n="options.downloads.settingsLink">
+                Open browser download settings
               </a>
             </div>
             <div class="download-option">
               <label for="includeGeneratedImages">
-                <input type="checkbox" id="includeGeneratedImages" />
-                <span data-i18n="options.downloads.includeGeneratedImages"
-                  >Include images generated in ChatGPT answers</span
-                >
+                <input type="checkbox" id="includeGeneratedImages" aria-describedby="generated-images-hint" />
+                <span data-i18n="options.downloads.includeGeneratedImages">Include images generated in ChatGPT answers</span>
               </label>
-              <p
-                class="hint"
-                data-i18n="options.downloads.generatedImagesHint"
-              >
-                Applies when image bundling is enabled. Turn off to omit images
-                generated in ChatGPT answers.
+              <p class="hint" id="generated-images-hint" data-i18n="options.downloads.generatedImagesHint">
+                Applies when image bundling is enabled. Turn off to omit images generated in ChatGPT answers.
               </p>
+            </div>
+            <div class="download-option">
+              <label for="includeClaudeThinking">
+                <input type="checkbox" id="includeClaudeThinking" aria-describedby="claude-thinking-hint" />
+                <span data-i18n="options.downloads.includeClaudeThinking">Include Claude thinking blocks</span>
+              </label>
+              <p class="hint" id="claude-thinking-hint" data-i18n="options.downloads.claudeThinkingHint">
+                Off by default. Claude may provide only a partial thinking summary for some answers.
+              </p>
+            </div>
+            <div class="download-option">
+              <label for="askWhereToSave">
+                <input type="checkbox" id="askWhereToSave" />
+                <span data-i18n="options.downloads.promptToSave">Ask where to save on each export</span>
+              </label>
+            </div>
+            <div class="download-option">
+              <label for="includeTimestamp">
+                <input type="checkbox" id="includeTimestamp" />
+                <span data-i18n="options.timestamp.include">Include export date/time at the top of the file</span>
+              </label>
             </div>
             <div class="download-option">
               <label class="field-label" for="filenamePreset" data-i18n="options.downloads.filenameFormatLabel">
@@ -899,116 +934,56 @@
         </fieldset>
 
         <fieldset>
-          <legend data-i18n="options.copyMenu.legend">Copy menu</legend>
-          <label for="keepCopyOptionsOpen">
-            <input type="checkbox" id="keepCopyOptionsOpen" />
-            <span data-i18n="options.copyMenu.keepExpanded"
-              >Keep copy options expanded</span
-            >
-          </label>
-          <p class="hint" data-i18n="options.copyMenu.keepExpandedHint">
-            Keep the latest-answer and message-selection options visible whenever
-            ChatScribe opens.
-          </p>
-          <label class="choice-row" for="selectorOrder">
-            <span data-i18n="options.selectorOrder.label">Message selector opening position</span>
-            <span class="select-control">
-              <select id="selectorOrder" aria-describedby="selector-order-hint">
-                <option value="newest-first" data-i18n="options.selectorOrder.newestFirst">Newest messages (open at bottom)</option>
-                <option value="oldest-first" data-i18n="options.selectorOrder.oldestFirst">Oldest messages (open at top)</option>
-              </select>
-              <svg
-                class="select-chevron"
-                viewBox="0 0 24 24"
-                aria-hidden="true"
-                focusable="false"
-              >
-                <path
-                  d="m7 10 5 5 5-5"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                />
-              </svg>
-            </span>
-          </label>
-          <p class="hint" id="selector-order-hint" data-i18n="options.selectorOrder.hint">
-            Messages always stay in conversation order (oldest to newest). This setting only controls where the selector opens.
-          </p>
-        </fieldset>
-
-        <fieldset>
-          <legend data-i18n="options.headings.legend">Message headings</legend>
-          <label>
-            <input type="radio" name="headingStyle" value="transcript" />
-            <span data-i18n="options.headings.transcript">Conversation transcript with speaker labels (recommended)</span>
-          </label>
-          <label>
-            <input type="radio" name="headingStyle" value="none" />
-            <span data-i18n="options.headings.none">No speaker labels</span>
-          </label>
-          <p class="hint" data-i18n="options.headings.groupHint">
+          <legend data-i18n="options.formatting.legend">Message formatting</legend>
+          <div class="formatting-grid">
+            <section class="format-setting" aria-labelledby="headings-label">
+              <h3 id="headings-label" data-i18n="options.headings.legend">Message Headings</h3>
+              <div role="radiogroup" aria-labelledby="headings-label" aria-describedby="heading-group-hint">
+                <label>
+                  <input type="radio" name="headingStyle" value="transcript" />
+                  <span data-i18n="options.headings.transcript">Conversation transcript (recommended)</span>
+                </label>
+                <label>
+                  <input type="radio" name="headingStyle" value="none" />
+                  <span data-i18n="options.headings.none">No role labels</span>
+                </label>
+              </div>
+            </section>
+            <section class="format-setting" aria-labelledby="spacing-label">
+              <h3 id="spacing-label" data-i18n="options.separator.legend">Message Spacing</h3>
+              <div role="radiogroup" aria-labelledby="spacing-label">
+                <label>
+                  <input type="radio" name="messageSeparator" value="single" />
+                  <span data-i18n="options.separator.single">Single blank line</span>
+                </label>
+                <label>
+                  <input type="radio" name="messageSeparator" value="double" />
+                  <span data-i18n="options.separator.double">Two blank lines</span>
+                </label>
+                <label>
+                  <input type="radio" name="messageSeparator" value="rule" />
+                  <span data-i18n="options.separator.rule">Horizontal rule (---)</span>
+                </label>
+              </div>
+              <p class="hint" data-i18n="options.separator.groupHint">
+                Each question and its answers form a group. Two horizontal rules separate groups.
+              </p>
+            </section>
+          </div>
+          <p class="hint" id="heading-group-hint" data-i18n="options.headings.groupHint">
             Each Q&A group gets one numbered Question entry in the outline. Original headings stay bold in the answer text.
           </p>
         </fieldset>
 
         <fieldset>
-          <legend data-i18n="options.spacing.legend">
-            Spacing between messages
-          </legend>
-          <label>
-            <input type="radio" name="messageSeparator" value="single" />
-            <span data-i18n="options.spacing.single">Single blank line</span>
-          </label>
-          <label>
-            <input type="radio" name="messageSeparator" value="double" />
-            <span data-i18n="options.spacing.double">Double blank line</span>
-          </label>
-          <label>
-            <input type="radio" name="messageSeparator" value="rule" />
-            <span data-i18n-html="options.spacing.rule"
-              >Horizontal rule (<code>---</code>)</span
-            >
-          </label>
-          <p class="hint" data-i18n="options.separator.groupHint">
-            Each question and its answers form a group. Two horizontal rules separate groups.
-          </p>
-        </fieldset>
-
-        <fieldset>
-          <legend data-i18n="options.timestamp.legend">Timestamp</legend>
-          <label for="includeTimestamp">
-            <input type="checkbox" id="includeTimestamp" />
-            <span data-i18n="options.timestamp.include"
-              >Include export date/time at the top of the file</span
-            >
-          </label>
-        </fieldset>
-
-        <fieldset>
           <legend data-i18n="options.github.legend">GitHub</legend>
           <div class="github-panel">
-            <p
-              id="github-status"
-              class="github-status"
-              aria-live="polite"
-              data-i18n="options.github.statusDisconnected"
-            >
-              Save exports straight to a GitHub repo.
+            <p id="github-status" class="github-status" aria-live="polite" data-i18n="options.github.disconnected">
+              Save exports directly to a GitHub repository.
             </p>
             <div class="github-actions">
-              <button id="github-connect" data-i18n="options.github.connect">
-                Connect GitHub
-              </button>
-              <button
-                id="github-disconnect"
-                hidden
-                data-i18n="options.github.disconnect"
-              >
-                Disconnect
-              </button>
+              <button id="github-connect" data-i18n="options.github.connect">Connect GitHub</button>
+              <button id="github-disconnect" hidden data-i18n="options.github.disconnect">Disconnect</button>
             </div>
           </div>
         </fieldset>

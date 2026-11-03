@@ -64,6 +64,7 @@ const downloadSubfolderError = $id<HTMLParagraphElement>("download-subfolder-err
 const filenamePreview = $id<HTMLParagraphElement>("filename-preview");
 const downloadImagesInput = $id<HTMLInputElement>("downloadImages");
 const includeGeneratedImagesInput = $id<HTMLInputElement>("includeGeneratedImages");
+const includeClaudeThinkingInput = $id<HTMLInputElement>("includeClaudeThinking");
 const includeTimestampInput = $id<HTMLInputElement>("includeTimestamp");
 const keepCopyOptionsOpenInput = $id<HTMLInputElement>("keepCopyOptionsOpen");
 const selectorOrderSelect = $id<HTMLSelectElement>("selectorOrder");
@@ -146,6 +147,7 @@ function populateForm(settings: Settings): void {
   downloadSubfolderInput.value = settings.downloadSubfolder;
   downloadImagesInput.checked = settings.downloadImages;
   includeGeneratedImagesInput.checked = settings.includeGeneratedImages;
+  includeClaudeThinkingInput.checked = settings.includeClaudeThinking;
   includeTimestampInput.checked = settings.includeTimestamp;
   keepCopyOptionsOpenInput.checked = settings.keepCopyOptionsOpen;
   selectorOrderSelect.value = settings.selectorOrder;
@@ -178,6 +180,7 @@ function gatherSettings(): Settings {
     downloadSubfolder: downloadSubfolderInput.value.trim(),
     downloadImages: downloadImagesInput.checked,
     includeGeneratedImages: includeGeneratedImagesInput.checked,
+    includeClaudeThinking: includeClaudeThinkingInput.checked,
     includeTimestamp: includeTimestampInput.checked,
     keepCopyOptionsOpen: keepCopyOptionsOpenInput.checked,
     selectorOrder: selectorOrderSelect.value as Settings["selectorOrder"],
@@ -408,7 +411,6 @@ saveBtn.addEventListener("click", async () => {
 
   const current = gatherSettings();
   await saveSettings(current);
-
   showSavedLabel();
 });
 

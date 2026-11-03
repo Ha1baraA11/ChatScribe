@@ -142,5 +142,13 @@
   "github.error.cancelled": "GitHub のログインがキャンセルされました。",
   "github.error.unknown": "原因不明のエラーで GitHub にログインできませんでした。",
   "popup.githubProfile": "GitHub プロフィールを表示",
-  "options.appearance.themeHint": "システム設定では、ブラウザーまたはオペレーティングシステムのテーマに従います。"
+  "options.appearance.themeHint": "システム設定では、ブラウザーまたはオペレーティングシステムのテーマに従います。",
+  "popup.error.notSupportedSite": "chatgpt.com または claude.ai の会話を開いてください",
+  "popup.permission.claude.title": "Claude へのアクセスを許可",
+  "popup.permission.claude.body": "開いている会話を読み込むため、ChatScribe は claude.ai への任意アクセスを必要とします。下のボタンを選んだときだけ権限をリクエストします。",
+  "popup.permission.claude.button": "Claude へのアクセスを許可",
+  "popup.permission.claude.denied": "Claude へのアクセスが許可されませんでした。",
+  "popup.permission.claude.failed": "Claude へのアクセスをリクエストできませんでした。",
+  "options.downloads.includeClaudeThinking": "Claude の思考ブロックを含める",
+  "options.downloads.claudeThinkingHint": "既定では無効です。回答によっては Claude の思考要約が一部のみの場合があります。"
 }

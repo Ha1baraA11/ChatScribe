@@ -99,6 +99,28 @@ describe("formatter", () => {
     expect(plain).toBe("Header\n\nbold and italic and code and link (https://example.com)");
   });
 
+  it("preserves shorter backtick runs and Markdown syntax inside longer code fences", () => {
+    const shorterFence = String.fromCharCode(96).repeat(3);
+    const nestedCode = "const nested = " + shorterFence + "literal" + shorterFence + ";";
+    const md = [
+      "````typescript",
+      nestedCode,
+      "# keep this heading literal",
+      "- keep this list marker literal",
+      "````",
+    ].join("\n");
+
+    expect(stripMarkdown(md)).toBe([
+      nestedCode,
+      "# keep this heading literal",
+      "- keep this list marker literal",
+    ].join("\n"));
+  });
+
+  it("strips tilde fences while keeping fenced content intact", () => {
+    expect(stripMarkdown("~~~text\n**literal**\n~~~")).toBe("**literal**");
+  });
+
   it("builds clean filenames", () => {
     const filename = buildFilename("My Test: Chat / Conversation?", "md");
     expect(filename).toMatch(/^My_Test_Chat_Conversation/);

@@ -1,8 +1,8 @@
 # Privacy Policy for ChatScribe
 
-**Effective date:** October 10, 2026
+**Effective date:** November 3, 2026
 
-ChatScribe is a browser extension for exporting conversations from ChatGPT. Users can export the open conversation or selected messages as Markdown, plain text, JSON, or CSV; copy them to the clipboard; optionally bundle available conversation images with a Markdown export in a ZIP file; or save a Markdown export to a GitHub repository they choose.
+ChatScribe is a browser extension for exporting conversations from ChatGPT and Claude. Users can export the open conversation or selected messages as Markdown, plain text, JSON, or CSV; copy them to the clipboard; optionally bundle available conversation images with a Markdown export in a ZIP file; or save a Markdown export to a GitHub repository they choose.
 
 This Privacy Policy explains what information ChatScribe processes, how it is used, and where it is stored.
 
@@ -10,9 +10,9 @@ This Privacy Policy explains what information ChatScribe processes, how it is us
 
 ChatScribe processes the following information when you use its features:
 
-### ChatGPT conversation content
+### ChatGPT and Claude conversation content
 
-When you choose to export or copy a conversation, the extension accesses the conversation currently open on `chatgpt.com`.
+When you choose to export or copy a conversation, the extension accesses the conversation currently open on `chatgpt.com` or `claude.ai`, using the signed-in session already present in that website. Claude access is optional and the extension asks for `claude.ai` site permission only after you choose to allow it in the popup.
 
 This may include:
 
@@ -20,6 +20,8 @@ This may include:
 - Assistant messages
 - Conversation message identifiers
 - Conversation structure and ordering information required to reconstruct the conversation
+- Claude Artifact updates needed to include the final Artifact version in the export
+- Claude thinking summaries only when you enable that option in Settings
 - Image resources associated with messages when you choose to include available images in an export
 
 ChatScribe processes this information only to perform the export or copy operation requested by the user.
@@ -46,7 +48,7 @@ Information is used only to provide the functionality requested by the user.
 
 ### Local export
 
-When you choose to export as `.md`, `.txt`, `.json`, or `.csv`, the selected conversation content is processed locally by the extension and passed to the browser's download functionality. If you choose to include available conversation images, ChatScribe retrieves those image resources from ChatGPT and bundles them with the Markdown export in a ZIP file.
+When you choose to export as `.md`, `.txt`, `.json`, or `.csv`, the selected conversation content is processed locally by the extension and passed to the browser's download functionality. If you choose to include available conversation images, ChatScribe retrieves those image resources from the website where the conversation is open and bundles them with the Markdown export in a ZIP file. For Claude, image files are bundled only when they are available from `claude.ai` over HTTPS.
 
 ### Clipboard
 
@@ -103,6 +105,7 @@ ChatScribe does not sell, rent, or share user data with advertisers, analytics p
 The extension communicates with the following external services when their functionality is used:
 
 - **ChatGPT (`chatgpt.com`)** — to access the currently open conversation using the user's existing authenticated ChatGPT session.
+- **Claude (`claude.ai`)** — only after the user grants optional site access, to access the currently open conversation using the user's existing authenticated Claude session.
 - **GitHub (`github.com` and `api.github.com`)** — when the user connects GitHub or explicitly saves an export to GitHub.
 
 GitHub receives information according to the GitHub functionality and permissions authorized by the user.
@@ -119,6 +122,7 @@ You can:
 - Copy a conversation to the clipboard.
 - Choose whether to save an export to GitHub.
 - Choose which GitHub repository receives an export.
+- Grant or revoke optional access to `claude.ai` in the browser's extension permission settings.
 - Disconnect GitHub from the extension's Settings page.
 - Remove the extension from Chrome.
 
@@ -136,7 +140,7 @@ The extension:
 - Stores the GitHub access token locally rather than in synchronized Chrome storage.
 - Does not store GitHub passwords.
 - Sends conversation content to GitHub only when the user explicitly chooses a GitHub export.
-- Uses HTTPS when communicating with ChatGPT and GitHub endpoints.
+- Uses HTTPS when communicating with ChatGPT, Claude, and GitHub endpoints.
 
 No method of electronic storage or transmission can guarantee absolute security. Users should take appropriate care when exporting sensitive conversations to external destinations such as GitHub.
 
@@ -149,6 +153,10 @@ ChatScribe relies on third-party services for functionality:
 ChatScribe operates on `chatgpt.com` and uses the authenticated session already established by the user in the ChatGPT website.
 
 ChatScribe does not collect or store the user's ChatGPT password.
+
+### Claude
+
+Claude support uses the authenticated session already established by the user on `claude.ai`. Site access is optional and is requested after the user chooses to enable it from the popup. ChatScribe does not collect or store the user's Claude password.
 
 ### GitHub
 
@@ -172,5 +180,5 @@ For privacy questions or requests, contact [ha1baraa11@pm.me](mailto:ha1baraa11@
 
 ## 12. Project inspiration and affiliation
 
-ChatScribe is developed independently by its maintainer. The project idea was inspired by [AI Exporter by Grant Totinov](https://github.com/GrantTotinov/AIExporter); thanks to Grant for the inspiration. ChatScribe is not affiliated with or endorsed by Grant Totinov, ChatGPT, or OpenAI, and is not an official product of any of them.
+ChatScribe is developed independently by its maintainer. The project idea was inspired by [AI Exporter by Grant Totinov](https://github.com/GrantTotinov/AIExporter); thanks to Grant for the inspiration. ChatScribe is not affiliated with or endorsed by Grant Totinov, ChatGPT, OpenAI, Anthropic, or Claude, and is not an official product of any of them.
 

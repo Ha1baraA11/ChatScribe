@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/brand/chatscribe-logo-master.png" width="180" alt="ChatScribe のカメレオン書き出しアイコン" />
   <h1>ChatScribe</h1>
-  <p><strong>chatgpt.com の会話をコピーまたはエクスポートできます。</strong><br />
+  <p><strong>chatgpt.com と claude.ai の会話をコピーまたはエクスポートできます。</strong><br />
   会話全体、最新の回答、または選択したメッセージをコピーできます。</p>
   <p>Markdown、テキスト、JSON、CSV で保存でき、Markdown は GitHub にも保存できます。</p>
   <p><a href="https://chrome.google.com/webstore/detail/aapnhkibnnhppanchcfngalkkojjfcmf">Chrome ウェブストアから ChatScribe を入手</a></p>
@@ -15,6 +15,7 @@
 - 会話全体、最新のアシスタント回答、または選択したメッセージをクリップボードにコピーできます。
 - メッセージを個別に選択できます。ユーザーまたはアシスタントで絞り込み、全選択、全解除、選択の反転、プレビューの展開ができます。
 - 会話全体または選択したメッセージを Markdown、テキスト、JSON、CSV でエクスポートできます。
+- Claude のウェブ版は、利用を選んだときだけ任意のサイトアクセスを要求します。Artifact は最終版をエクスポートし、思考要約は任意で含められます。
 - 必要に応じて、ページ上で取得できる生成画像を含む会話内の画像をダウンロードし、Markdown と一緒に ZIP にまとめられます。Markdown から画像ファイルへは相対パスでリンクします。
 - Markdown のエクスポートでは、対応する SVG 図テンプレートを PNG 画像として出力できます。テキスト出力では `[Diagram]` と表示し、未対応のテンプレートはそのまま残します。
 - 選択した GitHub リポジトリの `exports/` ディレクトリに Markdown を保存できます。画像を含む場合は ZIP で保存します。
@@ -64,7 +65,7 @@ CI では Node.js 22 でこれらのチェックを実行します。ブラウ�
 
 ## 謝辞
 
-ChatScribe はメンテナーが独立して開発しています。プロジェクトの着想は Grant Totinov の [AI Exporter](https://github.com/GrantTotinov/AIExporter) によるものです。Grant に感謝します。ChatScribe は AI Exporter のソースコードに依存しておらず、Grant Totinov、ChatGPT、OpenAI と提携・公認関係になく、いずれの公式製品でもありません。
+ChatScribe はメンテナーが独立して開発しています。プロジェクトの着想は Grant Totinov の [AI Exporter](https://github.com/GrantTotinov/AIExporter) によるものです。Grant に感謝します。ChatScribe は AI Exporter のソースコードに依存しておらず、Grant Totinov、ChatGPT、OpenAI と提携・公認関係になく、いずれの公式製品でもありません。Anthropic や Claude と提携・公認関係にあるものでもありません。
 
 ## ライセンス
 

@@ -384,12 +384,48 @@ export function formatMarkdown(
  * this only handles the subset we produce.
  */
 export function stripMarkdown(md: string): string {
-  let t = md;
+  const codeBlocks: string[] = [];
+  const markdownLines: string[] = [];
+  let activeFence: { marker: string; length: number } | null = null;
+  let activeCodeLines: string[] = [];
 
-  // Fenced code blocks — remove fences, keep content
-  t = t.replace(/```[^\n]*\n([\s\S]*?)```/g, (_m, code: string) =>
-    code.replace(/\n$/, ""),
-  );
+  // Protect code before stripping inline Markdown so headings, list markers,
+  // and shorter backtick runs inside an Artifact remain literal code.
+  for (const line of md.split("\n")) {
+    const match = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (!activeFence) {
+      if (match) {
+        activeFence = { marker: match[1][0], length: match[1].length };
+        activeCodeLines = [];
+      } else {
+        markdownLines.push(line);
+      }
+      continue;
+    }
+
+    if (
+      match &&
+      match[1][0] === activeFence.marker &&
+      match[1].length >= activeFence.length &&
+      match[2].trim() === ""
+    ) {
+      const placeholder = `\u0000CHATSCRIBE_CODE_${codeBlocks.length}\u0000`;
+      codeBlocks.push(activeCodeLines.join("\n"));
+      markdownLines.push(placeholder);
+      activeFence = null;
+      activeCodeLines = [];
+    } else {
+      activeCodeLines.push(line);
+    }
+  }
+
+  if (activeFence) {
+    const placeholder = `\u0000CHATSCRIBE_CODE_${codeBlocks.length}\u0000`;
+    codeBlocks.push(activeCodeLines.join("\n"));
+    markdownLines.push(placeholder);
+  }
+
+  let t = markdownLines.join("\n");
 
   // Inline code
   t = t.replace(/`([^`]+)`/g, "$1");
@@ -433,6 +469,10 @@ export function stripMarkdown(md: string): string {
 
   // Collapse 3+ blank lines
   t = t.replace(/\n{3,}/g, "\n\n");
+
+  codeBlocks.forEach((code, index) => {
+    t = t.replaceAll(`\u0000CHATSCRIBE_CODE_${index}\u0000`, () => code);
+  });
 
   return t.trim();
 }

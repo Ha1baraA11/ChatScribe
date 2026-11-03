@@ -142,5 +142,13 @@
   "github.error.cancelled": "El inicio de sesión de GitHub fue cancelado.",
   "github.error.unknown": "El inicio de sesión de GitHub falló por razón desconocida.",
   "popup.githubProfile": "Visitar el perfil de GitHub",
-  "options.appearance.themeHint": "El tema del sistema sigue la configuración del navegador o del sistema operativo."
+  "options.appearance.themeHint": "El tema del sistema sigue la configuración del navegador o del sistema operativo.",
+  "popup.error.notSupportedSite": "Abre primero una conversación en chatgpt.com o claude.ai",
+  "popup.permission.claude.title": "Permitir acceso a Claude",
+  "popup.permission.claude.body": "ChatScribe necesita acceso opcional a claude.ai para leer la conversación abierta. Solo solicitará el permiso cuando pulses el botón para continuar.",
+  "popup.permission.claude.button": "Permitir acceso a Claude",
+  "popup.permission.claude.denied": "No se concedió acceso a Claude.",
+  "popup.permission.claude.failed": "No se pudo solicitar acceso a Claude.",
+  "options.downloads.includeClaudeThinking": "Incluir bloques de pensamiento de Claude",
+  "options.downloads.claudeThinkingHint": "Desactivado de forma predeterminada. Claude puede ofrecer solo un resumen parcial del pensamiento en algunas respuestas."
 }

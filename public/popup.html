@@ -283,7 +283,7 @@
         background: transparent;
         font-size: 13px;
         font-weight: 500;
-        text-align: left;
+        text-align: center;
       }
 
       #copy-options button:hover:not(:disabled) {
@@ -304,6 +304,36 @@
 
       #export:hover:not(:disabled) {
         background: var(--accent-hover);
+      }
+
+      #claude-permission {
+        margin-top: 14px;
+        padding: 12px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--canvas);
+      }
+
+      #claude-permission[hidden] {
+        display: none;
+      }
+
+      #claude-permission h2 {
+        margin: 0 0 6px;
+        font-size: 13px;
+      }
+
+      #claude-permission p {
+        margin: 0 0 10px;
+        color: var(--text-muted);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      #claude-permission-button {
+        background: var(--accent);
+        color: var(--accent-text);
+        border-color: var(--accent);
       }
 
       .footer-link {
@@ -812,6 +842,14 @@
         </div>
       </div>
     </div>
+
+    <section id="claude-permission" role="region" aria-labelledby="claude-permission-title" hidden>
+      <h2 id="claude-permission-title" data-i18n="popup.permission.claude.title">Allow access to Claude</h2>
+      <p data-i18n="popup.permission.claude.body">
+        ChatScribe needs optional access to claude.ai to read the conversation you opened. Access is requested only when you choose to continue.
+      </p>
+      <button id="claude-permission-button" type="button" data-i18n="popup.permission.claude.button">Allow Claude access</button>
+    </section>
 
     <a
       class="footer-link"

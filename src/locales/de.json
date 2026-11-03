@@ -142,5 +142,13 @@
   "github.error.cancelled": "GitHub-Anmeldung wurde abgebrochen.",
   "github.error.unknown": "GitHub-Anmeldung aus unbekanntem Grund fehlgeschlagen.",
   "popup.githubProfile": "GitHub-Profil ansehen",
-  "options.appearance.themeHint": "Die Systemeinstellung folgt dem Design deines Browsers oder Betriebssystems."
+  "options.appearance.themeHint": "Die Systemeinstellung folgt dem Design deines Browsers oder Betriebssystems.",
+  "popup.error.notSupportedSite": "Öffnen Sie zuerst ein Gespräch auf chatgpt.com oder claude.ai",
+  "popup.permission.claude.title": "Zugriff auf Claude erlauben",
+  "popup.permission.claude.body": "ChatScribe benötigt optionalen Zugriff auf claude.ai, um das geöffnete Gespräch zu lesen. Die Berechtigung wird erst angefordert, wenn Sie unten fortfahren.",
+  "popup.permission.claude.button": "Claude-Zugriff erlauben",
+  "popup.permission.claude.denied": "Der Claude-Zugriff wurde nicht erlaubt.",
+  "popup.permission.claude.failed": "Der Claude-Zugriff konnte nicht angefordert werden.",
+  "options.downloads.includeClaudeThinking": "Claude-Denkblöcke einschließen",
+  "options.downloads.claudeThinkingHint": "Standardmäßig deaktiviert. Claude stellt für manche Antworten möglicherweise nur eine teilweise Denkzusammenfassung bereit."
 }

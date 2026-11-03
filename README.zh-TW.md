@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/brand/chatscribe-logo-master.png" width="180" alt="ChatScribe 變色龍匯出圖示" />
   <h1>ChatScribe</h1>
-  <p><strong>複製或匯出 chatgpt.com 上的對話。</strong><br />
+  <p><strong>複製或匯出 chatgpt.com 和 claude.ai 上的對話。</strong><br />
   可複製整段對話、最近一則回答，或自行選取的訊息。</p>
   <p>支援 Markdown、純文字、JSON 和 CSV，也可將 Markdown 匯出內容儲存至 GitHub。</p>
   <p><a href="https://chrome.google.com/webstore/detail/aapnhkibnnhppanchcfngalkkojjfcmf">在 Chrome 線上應用程式商店取得 ChatScribe</a></p>
@@ -15,6 +15,7 @@
 - 將整段對話、最近一則助理回答或選取的訊息複製到剪貼簿。
 - 可逐則選取訊息，依使用者或助理篩選、全選、取消全選、反向選取，並展開訊息預覽。
 - 將整段對話或選取的訊息匯出為 Markdown、純文字、JSON 或 CSV。
+- Claude 網頁版僅在你選擇啟用時要求可選的網站存取權限。匯出 Artifact 時會收錄最終版本；思考摘要預設停用，可自行啟用。
 - 可選擇下載對話中的圖片（包含頁面上可取得的生成圖片），並與 Markdown 一起打包成 ZIP。Markdown 會以相對路徑連結圖片檔案。
 - 匯出 Markdown 時，可將支援的 SVG 圖表範本轉換為 PNG 圖片。純文字會以 `[Diagram]` 作為佔位；不支援的範本則保留原樣。
 - 將 Markdown 匯出內容儲存至自行選取的 GitHub 儲存庫 `exports/` 目錄。若匯出包含圖片，會以 ZIP 儲存。
@@ -64,7 +65,7 @@ CI 工作流程使用 Node.js 22 執行這些檢查。若要產生特定瀏覽�
 
 ## 致謝
 
-ChatScribe 由維護者獨立開發。專案構想受到 Grant Totinov 的 [AI Exporter](https://github.com/GrantTotinov/AIExporter) 啟發，感謝 Grant。ChatScribe 不依賴 AI Exporter 的原始碼，也與 Grant Totinov、ChatGPT 或 OpenAI 均無官方關聯或背書，並非其中任何一方的官方產品。
+ChatScribe 由維護者獨立開發。專案構想受到 Grant Totinov 的 [AI Exporter](https://github.com/GrantTotinov/AIExporter) 啟發，感謝 Grant。ChatScribe 不依賴 AI Exporter 的原始碼，也與 Grant Totinov、ChatGPT 或 OpenAI 均無官方關聯或背書，並非其中任何一方的官方產品。ChatScribe 也與 Anthropic 或 Claude 無官方關聯或背書，並非其官方產品。
 
 ## 授權
 

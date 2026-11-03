@@ -142,5 +142,13 @@
   "github.error.cancelled": "O login do GitHub foi cancelado.",
   "github.error.unknown": "O login do GitHub falhou por um motivo desconhecido.",
   "popup.githubProfile": "Visitar perfil do GitHub",
-  "options.appearance.themeHint": "A opção do sistema acompanha o tema do navegador ou do sistema operacional."
+  "options.appearance.themeHint": "A opção do sistema acompanha o tema do navegador ou do sistema operacional.",
+  "popup.error.notSupportedSite": "Abra uma conversa em chatgpt.com ou claude.ai primeiro",
+  "popup.permission.claude.title": "Permitir acesso ao Claude",
+  "popup.permission.claude.body": "O ChatScribe precisa de acesso opcional a claude.ai para ler a conversa aberta. A permissão será solicitada somente se você escolher continuar no botão abaixo.",
+  "popup.permission.claude.button": "Permitir acesso ao Claude",
+  "popup.permission.claude.denied": "O acesso ao Claude não foi concedido.",
+  "popup.permission.claude.failed": "Não foi possível solicitar acesso ao Claude.",
+  "options.downloads.includeClaudeThinking": "Incluir blocos de pensamento do Claude",
+  "options.downloads.claudeThinkingHint": "Desativado por padrão. O Claude pode fornecer apenas um resumo parcial do pensamento em algumas respostas."
 }

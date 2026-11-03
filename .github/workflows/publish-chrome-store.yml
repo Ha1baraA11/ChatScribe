@@ -1,0 +1,202 @@
+name: Submit Chrome Web Store review
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_mode:
+        description: What should happen after Chrome Web Store review approves this version?
+        type: choice
+        options:
+          - staged
+          - automatic
+        default: staged
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: chrome-web-store-publish
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Build and package Chrome extension
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the main branch
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "Run this workflow from the main branch." >&2
+          exit 1
+
+      - name: Require a successful CI run for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          runs="$(gh run list --workflow ci.yml --branch main --commit "$GITHUB_SHA" \
+            --event push --status completed --json conclusion,databaseId --limit 20)"
+          if ! jq -e 'any(.[]; .conclusion == "success")' <<< "$runs" >/dev/null; then
+            echo "A successful CI push run for $GITHUB_SHA on main is required before store submission." >&2
+            exit 1
+          fi
+
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Build Chrome extension
+        run: npm run build:chrome
+
+      - name: Package extension files
+        run: |
+          set -euo pipefail
+          cd dist
+          zip -q -r "$RUNNER_TEMP/ChatScribe-chrome.zip" .
+          unzip -l "$RUNNER_TEMP/ChatScribe-chrome.zip"
+
+      - name: Save package for the review submission job
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatscribe-chrome-package
+          path: ${{ runner.temp }}/ChatScribe-chrome.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  submit:
+    name: Upload package and submit for review
+    needs: package
+    runs-on: ubuntu-latest
+    environment:
+      name: chrome-web-store
+      url: https://chromewebstore.google.com/
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out source for Google authentication
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download Chrome package
+        uses: actions/download-artifact@v4
+        with:
+          name: chatscribe-chrome-package
+          path: ${{ runner.temp }}/cws-package
+
+      - name: Check publishing configuration
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          CWS_PUBLISHER_ID: ${{ vars.CWS_PUBLISHER_ID }}
+          CWS_EXTENSION_ID: ${{ vars.CWS_EXTENSION_ID }}
+        run: |
+          set -euo pipefail
+          test -n "$GCP_PROJECT_ID" || { echo "Missing GitHub variable GCP_PROJECT_ID." >&2; exit 1; }
+          test -n "$GCP_WORKLOAD_IDENTITY_PROVIDER" || { echo "Missing GitHub variable GCP_WORKLOAD_IDENTITY_PROVIDER." >&2; exit 1; }
+          test -n "$GCP_SERVICE_ACCOUNT" || { echo "Missing GitHub variable GCP_SERVICE_ACCOUNT." >&2; exit 1; }
+          test -n "$CWS_PUBLISHER_ID" || { echo "Missing GitHub variable CWS_PUBLISHER_ID." >&2; exit 1; }
+          test -n "$CWS_EXTENSION_ID" || { echo "Missing GitHub variable CWS_EXTENSION_ID." >&2; exit 1; }
+          test -s "$RUNNER_TEMP/cws-package/ChatScribe-chrome.zip" || { echo "Chrome package artifact is missing or empty." >&2; exit 1; }
+
+      - name: Authenticate to Google Cloud
+        id: google-auth
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/chromewebstore
+          create_credentials_file: false
+
+      - name: Upload package and submit it for review
+        env:
+          ACCESS_TOKEN: ${{ steps.google-auth.outputs.access_token }}
+          CWS_PUBLISHER_ID: ${{ vars.CWS_PUBLISHER_ID }}
+          CWS_EXTENSION_ID: ${{ vars.CWS_EXTENSION_ID }}
+          PUBLISH_MODE: ${{ inputs.publish_mode }}
+          PACKAGE_PATH: ${{ runner.temp }}/cws-package/ChatScribe-chrome.zip
+        run: |
+          set -euo pipefail
+
+          item="publishers/$CWS_PUBLISHER_ID/items/$CWS_EXTENSION_ID"
+          upload_url="https://chromewebstore.googleapis.com/upload/v2/$item:upload"
+          status_url="https://chromewebstore.googleapis.com/v2/$item:fetchStatus"
+          publish_url="https://chromewebstore.googleapis.com/v2/$item:publish"
+
+          upload_response="$(curl --fail-with-body --silent --show-error \
+            --request POST --upload-file "$PACKAGE_PATH" \
+            --header "Authorization: Bearer $ACCESS_TOKEN" \
+            --header "Content-Type: application/zip" \
+            "$upload_url")"
+          printf '%s\n' "$upload_response" | jq .
+
+          upload_state="$(jq -r '.uploadState // "UNKNOWN"' <<< "$upload_response")"
+          if [[ "$upload_state" == "IN_PROGRESS" ]]; then
+            for attempt in $(seq 1 24); do
+              sleep 5
+              status_response="$(curl --fail-with-body --silent --show-error \
+                --header "Authorization: Bearer $ACCESS_TOKEN" \
+                "$status_url")"
+              upload_state="$(jq -r '.lastAsyncUploadState // "UNKNOWN"' <<< "$status_response")"
+              echo "Chrome Web Store upload state: $upload_state (check $attempt/24)"
+              [[ "$upload_state" == "IN_PROGRESS" ]] || break
+            done
+          fi
+
+          if [[ "$upload_state" != "SUCCEEDED" ]]; then
+            echo "Chrome Web Store package upload did not complete (state: $upload_state)." >&2
+            exit 1
+          fi
+
+          case "$PUBLISH_MODE" in
+            staged)
+              publish_body='{"publishType":"STAGED_PUBLISH","blockOnWarnings":true}'
+              ;;
+            automatic)
+              publish_body='{"blockOnWarnings":true}'
+              ;;
+            *)
+              echo "Unknown publish mode: $PUBLISH_MODE" >&2
+              exit 1
+              ;;
+          esac
+
+          publish_response="$(curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $ACCESS_TOKEN" \
+            --header "Content-Type: application/json" \
+            --data "$publish_body" \
+            "$publish_url")"
+          submission_state="$(jq -r '.state // "UNKNOWN"' <<< "$publish_response")"
+          if [[ "$submission_state" != "PENDING_REVIEW" ]]; then
+            echo "Chrome Web Store did not confirm a pending review (state: $submission_state)." >&2
+            printf '%s\n' "$publish_response" | jq .
+            exit 1
+          fi
+          echo "Chrome Web Store accepted the review submission:"
+          printf '%s\n' "$publish_response" | jq .
+
+          status_response="$(curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $ACCESS_TOKEN" \
+            "$status_url")"
+          echo "Submission status readback:"
+          printf '%s\n' "$status_response" | jq '{
+            submittedItemRevisionStatus,
+            lastAsyncUploadState,
+            warned,
+            takenDown
+          }'

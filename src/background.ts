@@ -69,6 +69,26 @@ function isPanelMode(value: unknown): value is PanelMode {
   return value === "popup" || value === "sidebar";
 }
 
+function getConversationProvider(urlValue: unknown): "chatgpt" | "claude" | null {
+  if (typeof urlValue !== "string") return null;
+  try {
+    const url = new URL(urlValue);
+    if (url.protocol !== "https:") return null;
+    if (url.hostname === "chatgpt.com") return "chatgpt";
+    if (
+      url.hostname === "claude.ai" &&
+      /^\/chat\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:\/|$)/i.test(url.pathname)
+    ) return "claude";
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function isClaudePermissionGranted(): Promise<boolean> {
+  return await chrome.permissions.contains({ origins: ["https://claude.ai/*"] });
+}
+
 // Keep the popup as the default. The selected sidebar mode removes the action
 // popup so the toolbar click can open the browser's persistent panel instead.
 async function applyPanelMode(mode: PanelMode): Promise<void> {
@@ -242,15 +262,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   const tabId = message.tabId;
   if (!Number.isInteger(tabId)) {
-    sendResponse({ success: false, error: "Invalid ChatGPT tab." });
+    sendResponse({ success: false, error: "Invalid conversation tab." });
     return false;
   }
 
   (async () => {
     try {
       const tab = await chrome.tabs.get(tabId as number);
-      if (!tab.url?.startsWith("https://chatgpt.com/")) {
-        throw new Error("Open a ChatGPT conversation before exporting.");
+      const provider = getConversationProvider(tab.url);
+      if (!provider) {
+        throw new Error("Open a supported ChatGPT or Claude conversation before exporting.");
       }
 
       if (!chromeCapabilities.scripting?.executeScript) {
@@ -258,6 +279,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       const targetTabId = tab.id ?? tabId as number;
+
+      if (provider === "claude") {
+        if (!await isClaudePermissionGranted()) {
+          throw new Error("CLAUDE_PERMISSION_REQUIRED");
+        }
+
+        let contentReady = false;
+        try {
+          const ping = await chrome.tabs.sendMessage(targetTabId, {
+            type: CONTENT_PING_TYPE,
+          }) as { ready?: boolean; buildId?: string } | undefined;
+          contentReady = ping?.ready === true && ping.buildId === CHATSCRIBE_BUILD_ID;
+        } catch {
+          // The optional listener has not been injected in this page yet.
+        }
+
+        if (!contentReady) {
+          await chromeCapabilities.scripting.executeScript({
+            target: { tabId: targetTabId },
+            files: ["claude-content.js"],
+          });
+          const ping = await chrome.tabs.sendMessage(targetTabId, {
+            type: CONTENT_PING_TYPE,
+          }) as { ready?: boolean; buildId?: string } | undefined;
+          if (!ping?.ready || ping.buildId !== CHATSCRIBE_BUILD_ID) {
+            throw new Error("ChatScribe could not connect to Claude. Refresh the conversation and retry.");
+          }
+        }
+        sendResponse({ success: true });
+        return;
+      }
 
       // bridge.js is idempotent, so this also repairs tabs that were already
       // open when the extension was reloaded without wrapping fetch twice.
@@ -325,15 +377,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
       } else {
         // Firefox does not expose Chrome's Offscreen API. Copy through the
-        // ChatGPT tab currently represented by the persistent panel, which
+        // conversation tab currently represented by the persistent panel, which
         // may no longer be the browser's active tab.
         const tabId = message.tabId;
         if (!Number.isInteger(tabId)) {
-          throw new Error("No ChatGPT tab is available for clipboard access.");
+          throw new Error("No conversation tab is available for clipboard access.");
         }
         const tab = await chrome.tabs.get(tabId as number);
-        if (!tab.url?.startsWith("https://chatgpt.com/")) {
-          throw new Error("Open a ChatGPT conversation before copying.");
+        if (getConversationProvider(tab.url) === null) {
+          throw new Error("Open a supported ChatGPT or Claude conversation before copying.");
         }
         result = await chrome.tabs.sendMessage(tabId as number, {
           type: "COPY_TO_CLIPBOARD",

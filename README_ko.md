@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/brand/chatscribe-logo-master.png" width="180" alt="ChatScribe 카멜레온 내보내기 아이콘" />
   <h1>ChatScribe</h1>
-  <p><strong>chatgpt.com 대화를 복사하거나 내보내세요.</strong><br />
+  <p><strong>chatgpt.com 및 claude.ai 대화를 복사하거나 내보내세요.</strong><br />
   전체 대화, 최신 답변 또는 선택한 메시지만 복사할 수 있습니다.</p>
   <p>Markdown, 텍스트, JSON, CSV로 저장하거나 Markdown 내보내기를 GitHub에 저장할 수 있습니다.</p>
   <p><a href="https://chrome.google.com/webstore/detail/aapnhkibnnhppanchcfngalkkojjfcmf">Chrome 웹 스토어에서 ChatScribe 설치</a></p>
@@ -15,6 +15,7 @@
 - 전체 대화, 가장 최근의 어시스턴트 답변 또는 선택한 메시지를 클립보드에 복사합니다.
 - 메시지를 하나씩 선택할 수 있습니다. 사용자 또는 어시스턴트 메시지로 필터링하고, 전체 선택·해제, 선택 반전, 미리 보기 펼치기를 사용할 수 있습니다.
 - 전체 대화 또는 선택한 메시지를 Markdown, 텍스트, JSON, CSV로 내보냅니다.
+- Claude 웹은 사용자가 선택할 때만 사이트 선택적 접근 권한을 요청합니다. Claude Artifact는 최종 버전을 내보내며 사고 요약은 선택적으로 포함할 수 있습니다.
 - 필요하면 페이지에서 확인할 수 있는 생성 이미지를 포함해 대화 이미지를 다운로드하고 Markdown과 함께 ZIP으로 묶습니다. Markdown은 상대 경로로 이미지 파일을 연결합니다.
 - Markdown 내보내기에서 지원되는 SVG 다이어그램 템플릿을 PNG 이미지로 렌더링합니다. 텍스트 내보내기에서는 `[Diagram]`으로 표시하며, 지원되지 않는 템플릿은 원문 그대로 둡니다.
 - 선택한 GitHub 저장소의 `exports/` 디렉터리에 Markdown 내보내기를 저장합니다. 이미지가 포함된 경우 ZIP으로 저장됩니다.
@@ -64,7 +65,7 @@ CI는 Node.js 22에서 위 확인을 실행합니다. 브라우저별 확장 프
 
 ## 감사의 말
 
-ChatScribe는 유지 관리자가 독립적으로 개발합니다. 프로젝트 아이디어는 Grant Totinov의 [AI Exporter](https://github.com/GrantTotinov/AIExporter)에서 영감을 받았습니다. Grant에게 감사드립니다. ChatScribe는 AI Exporter의 소스 코드에 의존하지 않으며 Grant Totinov, ChatGPT 또는 OpenAI와 공식 제휴·보증 관계가 없고 어느 쪽의 공식 제품도 아닙니다.
+ChatScribe는 유지 관리자가 독립적으로 개발합니다. 프로젝트 아이디어는 Grant Totinov의 [AI Exporter](https://github.com/GrantTotinov/AIExporter)에서 영감을 받았습니다. Grant에게 감사드립니다. ChatScribe는 AI Exporter의 소스 코드에 의존하지 않으며 Grant Totinov, ChatGPT 또는 OpenAI와 공식 제휴·보증 관계가 없고 어느 쪽의 공식 제품도 아닙니다. Anthropic 또는 Claude와 공식 제휴·보증 관계도 없습니다.
 
 ## 라이선스
 

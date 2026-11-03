@@ -25,7 +25,7 @@ function addFiles(hash, directory) {
 export function computeBuildId() {
   const hash = createHash("sha256");
   addFiles(hash, join(root, "src"));
-  for (const name of ["scripts/build-id.mjs", "vite.config.ts", "vite.content.config.ts", "vite.bridge.config.ts", "manifest.chrome.json", "manifest.firefox.json"]) {
+  for (const name of ["scripts/build-id.mjs", "vite.config.ts", "vite.content.config.ts", "vite.bridge.config.ts", "vite.claude-content.config.ts", "manifest.chrome.json", "manifest.firefox.json"]) {
     hash.update(name);
     hash.update("\0");
     hash.update(readFileSync(join(root, name)));

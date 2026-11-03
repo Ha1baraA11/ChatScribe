@@ -4,7 +4,7 @@
  * Shared Chrome Side Panel / Firefox Sidebar UI logic.
  *
  * Flow:
- *  1. On open, load settings and messages from the active ChatGPT tab.
+ *  1. On open, load settings and messages from the active supported conversation tab.
  *  2. Keep the panel and its progress visible while users switch tabs.
  *  3. On success, make full-copy, latest-answer, and message-selection actions available.
  *  4. Copy the conversation or latest answer, or choose a subset to copy/export.
@@ -27,6 +27,7 @@ import {
 import { buildZipBlob, blobToBase64 } from "./zip.ts";
 import { selectHydratedExport } from "./export-selection.ts";
 import { getInitialSelectorScrollPosition } from "./selector-scroll.ts";
+import { getClaudeConversationId } from "./claude-conversation.ts";
 import {
   CONTENT_LOAD_TYPE,
   CONTENT_CHECK_REVISION_TYPE,
@@ -103,6 +104,8 @@ const copyControl = $id<HTMLDivElement>("copy-control");
 const copyOptions = $id<HTMLDivElement>("copy-options");
 const exportBtn = $id<HTMLButtonElement>("export-btn");
 const optionsLink = $id<HTMLAnchorElement>("options-link");
+const claudePermissionCard = $id<HTMLDivElement>("claude-permission");
+const claudePermissionButton = $id<HTMLButtonElement>("claude-permission-button");
 
 const loadingOverlay = $id<HTMLDivElement>("loading-overlay");
 const loadingMessage = $id<HTMLParagraphElement>("loading-message");
@@ -173,8 +176,23 @@ function isMissingReceiver(error: unknown): boolean {
     .test(message);
 }
 
+function getConversationProvider(urlValue: string | undefined): "chatgpt" | "claude" | null {
+  if (!urlValue) return null;
+  try {
+    const url = new URL(urlValue);
+    if (url.protocol !== "https:") return null;
+    if (url.hostname === "chatgpt.com") return "chatgpt";
+    return getClaudeConversationId(urlValue) ? "claude" : null;
+  } catch {
+    return null;
+  }
+}
+
 function getConversationIdFromUrl(url: string | undefined): string | null {
-  const match = url?.match(/\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[/?#]|$)/i);
+  const provider = getConversationProvider(url);
+  if (provider === "claude" && url) return getClaudeConversationId(url);
+  if (provider !== "chatgpt" || !url) return null;
+  const match = url.match(/\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[/?#]|$)/i);
   return match?.[1] ?? null;
 }
 
@@ -185,6 +203,7 @@ async function requestConversation(
   fetchImages = downloadImages,
   selectedMessageIds?: string[],
   forceRefresh = false,
+  includeClaudeThinking = false,
 ): Promise<{
   success: boolean;
   data?: ConversationData;
@@ -198,16 +217,20 @@ async function requestConversation(
     fetchImages,
     selectedMessageIds,
     forceRefresh,
+    includeClaudeThinking,
   };
 
-  // Ensure both the isolated content script and MAIN-world bridge. The content
-  // listener can still be alive after an extension reload even when its bridge
-  // has disappeared, so a successful content ping alone is not sufficient.
+  // Ensure the provider's content listener is available, repairing stale
+  // injections after an extension reload when necessary.
   const ensured = await chrome.runtime.sendMessage({
     type: "ENSURE_CONTENT_SCRIPT",
     tabId,
   }) as { success?: boolean; error?: string } | undefined;
   if (!ensured?.success) {
+    if (ensured?.error === "CLAUDE_PERMISSION_REQUIRED") {
+      claudePermissionCard.hidden = false;
+      throw new Error(t("popup.permission.claude.denied"));
+    }
     throw new Error(ensured?.error ?? "ChatScribe could not reconnect to this tab.");
   }
 
@@ -360,6 +383,25 @@ optionsLink.addEventListener("click", (event) => {
   void chrome.runtime.openOptionsPage();
 });
 
+claudePermissionButton.addEventListener("click", () => {
+  // Invoke the optional-host request synchronously from the click gesture so
+  // Chrome and Firefox can show their permission prompt.
+  const permissionRequest = chrome.permissions.request({
+    origins: ["https://claude.ai/*"],
+  });
+  void permissionRequest.then((granted) => {
+    if (!granted) {
+      setBusy(false);
+      showToast(t("popup.permission.claude.denied"), 4000);
+      return;
+    }
+    if (sourceTabId !== null) void loadConversationForTab(sourceTabId);
+  }).catch(() => {
+    setBusy(false);
+    showToast(t("popup.permission.claude.failed"), 4000);
+  });
+});
+
 // -----------------------------------------------------------------------
 // INITIALISE: get active tab + load conversation
 // -----------------------------------------------------------------------
@@ -367,6 +409,7 @@ optionsLink.addEventListener("click", (event) => {
 async function loadConversationForTab(tabId: number): Promise<void> {
   const requestId = ++loadSequence;
   setBusy(false);
+  claudePermissionCard.hidden = true;
   if (!settings) {
     settings = await loadSettings();
     applyTheme(settings.theme);
@@ -381,17 +424,30 @@ async function loadConversationForTab(tabId: number): Promise<void> {
 
   try {
     const tab = await chrome.tabs.get(tabId);
-    if (!tab.url?.includes("chatgpt.com")) {
-      throw new Error(t("popup.error.notChatGpt"));
+    const provider = getConversationProvider(tab.url);
+    if (!provider) {
+      throw new Error(t("popup.error.notSupportedSite"));
+    }
+    if (
+      provider === "claude" &&
+      !await chrome.permissions.contains({ origins: ["https://claude.ai/*"] })
+    ) {
+      claudePermissionCard.hidden = false;
+      setBusy(true);
+      hideLoading();
+      return;
     }
 
     sourceConversationId = getConversationIdFromUrl(tab.url);
-    pageTitle = tab.title ?? "ChatGPT Conversation";
+    pageTitle = tab.title ?? (provider === "claude" ? "Claude Conversation" : "ChatGPT Conversation");
     const response = await requestConversation(
       tabId,
       settings?.downloadImages ?? false,
       settings?.includeGeneratedImages ?? true,
       false,
+      undefined,
+      false,
+      settings?.includeClaudeThinking ?? false,
     );
 
     if (!response?.success || !response.data) {
@@ -419,6 +475,12 @@ async function loadConversationForTab(tabId: number): Promise<void> {
     const isChatGptConnectionNotReady =
       errorMessage === "CHATGPT_CONNECTION_NOT_READY" ||
       /ChatScribe bridge did not start/i.test(errorMessage);
+
+    if (errorMessage === "CLAUDE_PERMISSION_REQUIRED") {
+      claudePermissionCard.hidden = false;
+      setBusy(true);
+      return;
+    }
 
     showToast(
       isChatGptConnectionNotReady
@@ -546,8 +608,8 @@ async function copyFullConversation(): Promise<void> {
     settings = copySettings;
 
     const tab = await chrome.tabs.get(tabId);
-    if (!tab.url?.startsWith("https://chatgpt.com/")) {
-      throw new Error(t("popup.error.notChatGpt"));
+    if (!getConversationProvider(tab.url)) {
+      throw new Error(t("popup.error.notSupportedSite"));
     }
     const response = await requestConversation(
       tabId,
@@ -556,6 +618,7 @@ async function copyFullConversation(): Promise<void> {
       false,
       undefined,
       true,
+      copySettings.includeClaudeThinking,
     );
     if (requestId !== loadSequence || sourceTabId !== tabId) return;
     if (!response?.success || !response.data) {
@@ -608,8 +671,8 @@ async function copyLatestAnswer(): Promise<void> {
   showLoading(t("popup.loading"));
   try {
     const tab = await chrome.tabs.get(tabId);
-    if (!tab.url?.startsWith("https://chatgpt.com/")) {
-      throw new Error(t("popup.error.notChatGpt"));
+    if (!getConversationProvider(tab.url)) {
+      throw new Error(t("popup.error.notSupportedSite"));
     }
 
     // Copying text does not need export-only image fallbacks. Excluding them
@@ -622,6 +685,7 @@ async function copyLatestAnswer(): Promise<void> {
       false,
       undefined,
       true,
+      copySettings.includeClaudeThinking,
     );
     if (requestId !== loadSequence || sourceTabId !== tabId) return;
     if (!response?.success || !response.data) {
@@ -753,6 +817,7 @@ async function refreshConversationForSelector(selectAll: boolean): Promise<void>
       false,
       undefined,
       true,
+      selectorSettings.includeClaudeThinking,
     );
     if (requestId !== loadSequence || sourceTabId !== tabId) return;
     if (!response?.success || !response.data) {
@@ -935,6 +1000,7 @@ async function checkSelectorRevision(): Promise<void> {
         false,
         undefined,
         true,
+        settings.includeClaudeThinking,
       );
       if (requestId !== loadSequence || sourceTabId !== tabId) return;
       if (!response?.success || !response.data) {
@@ -1111,6 +1177,8 @@ async function hydrateSelectedImages(
       settings.includeGeneratedImages,
       true,
       messages.map((message) => message.id),
+      false,
+      settings.includeClaudeThinking,
     );
     if (!response?.success || !response.data) {
       const reason = response?.error ?? t("popup.error.loadFailed");
