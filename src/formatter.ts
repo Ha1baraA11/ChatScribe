@@ -22,6 +22,13 @@ const ANSWER_GROUP_SEPARATOR = "\n\n---\n\n---\n\n";
 const DATAVIEW_SAFE_CODE_STYLE =
   "font-family: var(--font-monospace, monospace); background-color: rgba(135, 131, 120, 0.15); padding: 0 0.25em; border-radius: 3px;";
 
+function getExportMessageContent(message: ExportMessage): string {
+  if (message.content.trim()) return message.content;
+  if (!message.imageCount) return message.content;
+  const noun = message.imageCount === 1 ? "image" : "images";
+  return `[Image attachment: ${message.imageCount} ${noun}]`;
+}
+
 function formatMarkdownImage(path: string, index: number): string {
   const safePath = path
     .replace(/&/g, "&amp;")
@@ -44,8 +51,10 @@ function protectDataviewInlineCodeOperators(markdown: string): string {
   const lines = markdown.split("\n");
   const output: string[] = [];
   let fence: { marker: string; length: number } | null = null;
+  let inTable = false;
 
-  for (const line of lines) {
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
     const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})/);
     if (fence) {
       output.push(line);
@@ -62,23 +71,36 @@ function protectDataviewInlineCodeOperators(markdown: string): string {
 
     if (fenceMatch) {
       fence = { marker: fenceMatch[1][0], length: fenceMatch[1].length };
+      inTable = false;
       output.push(line);
       continue;
     }
 
-    output.push(protectDataviewTableEqualityCells(protectLine(line)));
+    if (!inTable) {
+      inTable = line.includes("|") && isMarkdownTableDelimiter(lines[index + 1] ?? "");
+    }
+    if (inTable && line.includes("|")) {
+      output.push(protectDataviewTableEqualityCells(line));
+    } else {
+      inTable = false;
+      output.push(protectLine(line));
+    }
   }
 
   return output.join("\n");
 
   function protectDataviewTableEqualityCells(line: string): string {
-    const pipeCount = line.replace(/\\\|/g, "").match(/\|/g)?.length ?? 0;
-    if (pipeCount < 2) return line;
-
     return line.replace(
       /(^|\|)([ \t]*)(=+)([ \t]*)(?=\||$)/g,
       (_match, boundary: string, before: string, operator: string, after: string) =>
         `${boundary}${before}$\\mathtt{${operator}}$${after}`,
+    );
+  }
+
+  function isMarkdownTableDelimiter(line: string): boolean {
+    const cells = line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|");
+    return cells.length >= 2 && cells.every((cell) =>
+      /^\s*:?-{3,}:?\s*$/.test(cell)
     );
   }
 
@@ -226,8 +248,15 @@ function formatHeadingLine(prefix: string, title: string): string {
   return `${prefix}${alreadyBold ? trimmed : `**${trimmed}**`}`;
 }
 
-function formatQuestionGroup(messages: string[], number: number, separator: string): string {
-  return `## Question ${number}\n\n${messages.join(separator)}`;
+function formatQuestionGroup(
+  messages: string[],
+  number: number,
+  separator: string,
+  includeQuestionHeading = true,
+): string {
+  return includeQuestionHeading
+    ? `## Question ${number}\n\n${messages.join(separator)}`
+    : messages.join(separator);
 }
 
 /**
@@ -330,6 +359,7 @@ export function formatMarkdown(
   const parts: string[] = [];
   const groups: string[] = [];
   let currentGroup: string[] = [];
+  let currentGroupHasUser = false;
 
   const documentTitle = makeDocumentTitle(options.title);
   if (documentTitle) parts.push(documentTitle);
@@ -340,16 +370,40 @@ export function formatMarkdown(
 
   for (const msg of messages) {
     if (msg.role === "user" && currentGroup.length > 0) {
-      groups.push(formatQuestionGroup(currentGroup, groups.length + 1, sep));
+      groups.push(formatQuestionGroup(
+        currentGroup,
+        groups.length + 1,
+        sep,
+        includeRoleHeadings || currentGroupHasUser,
+      ));
       currentGroup = [];
+      currentGroupHasUser = false;
     }
 
     let body = msg.content;
+    if (!body.trim() && msg.imageCount) {
+      if (msg.imagePaths.length === 0) {
+        const noun = msg.imageCount === 1 ? "image" : "images";
+        body = `[Image not bundled: ${msg.imageCount} ${noun}]`;
+      } else {
+        body = "[Image attachment]";
+      }
+    }
     let heading = includeRoleHeadings
       ? makeHeading(msg.role, settings.headingStyle)
       : "";
 
     if (msg.role === "user") body = formatQuotedRequestLabels(body);
+
+    const missingImageCount = Math.max(0, (msg.imageCount ?? 0) - msg.imagePaths.length);
+    if (
+      missingImageCount > 0 &&
+      !/\[\d+ images? could not be bundled\.?\]/i.test(body) &&
+      !/\[Image not bundled:/i.test(body)
+    ) {
+      const noun = missingImageCount === 1 ? "image" : "images";
+      body = `${body}${body ? "\n\n" : ""}[Image not bundled: ${missingImageCount} ${noun}]`;
+    }
 
     body = formatMessageHeadingsAsText(body);
 
@@ -363,10 +417,16 @@ export function formatMarkdown(
     }
 
     currentGroup.push(`${heading}${body}`);
+    if (msg.role === "user") currentGroupHasUser = true;
   }
 
   if (currentGroup.length > 0) {
-    groups.push(formatQuestionGroup(currentGroup, groups.length + 1, sep));
+    groups.push(formatQuestionGroup(
+      currentGroup,
+      groups.length + 1,
+      sep,
+      includeRoleHeadings || currentGroupHasUser,
+    ));
   }
   if (groups.length > 0) parts.push(groups.join(ANSWER_GROUP_SEPARATOR));
 
@@ -426,9 +486,10 @@ export function stripMarkdown(md: string): string {
   }
 
   let t = markdownLines.join("\n");
-
-  // Inline code
-  t = t.replace(/`([^`]+)`/g, "$1");
+  t = restoreTableEqualityOperators(t);
+  const literalSegments: string[] = [];
+  const literalPrefix = `\u0000CHATSCRIBE_TEXT_LITERAL_${Math.random().toString(36).slice(2)}_`;
+  t = maskInlineLiterals(t, literalPrefix, literalSegments);
   t = t.replace(
     /<span class="chatscribe-inline-code"[^>]*>([\s\S]*?)<\/span>/g,
     (_match, code: string) => code
@@ -437,8 +498,6 @@ export function stripMarkdown(md: string): string {
       .replace(/&lt;/g, "<")
       .replace(/&amp;/g, "&"),
   );
-  t = t.replace(/\$\\mathtt\{(=+)\}\$/g, "$1");
-
   // Bold then italic (order matters)
   t = t.replace(/\*\*([^*]+)\*\*/g, "$1");
   t = t.replace(/\*([^*]+)\*/g, "$1");
@@ -470,11 +529,171 @@ export function stripMarkdown(md: string): string {
   // Collapse 3+ blank lines
   t = t.replace(/\n{3,}/g, "\n\n");
 
+  // Unescape prose dollars while code and math are still hidden behind
+  // placeholders; escaped dollars inside literal content must stay intact.
+  t = t.replace(/\\\$/g, "$");
+
   codeBlocks.forEach((code, index) => {
     t = t.replaceAll(`\u0000CHATSCRIBE_CODE_${index}\u0000`, () => code);
   });
+  literalSegments.forEach((literal, index) => {
+    t = t.replaceAll(`${literalPrefix}${index}\u0000`, () => {
+      if (literal.startsWith("`")) return literal.slice(literal.match(/^`+/)?.[0].length ?? 0, -(
+        literal.match(/`+$/)?.[0].length ?? 0
+      ));
+      return literal;
+    });
+  });
 
   return t.trim();
+}
+
+function restoreTableEqualityOperators(markdown: string): string {
+  const lines = markdown.split("\n");
+  let inTable = false;
+
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    if (!inTable) {
+      inTable = line.includes("|") && isMarkdownTableDelimiter(lines[index + 1] ?? "");
+    }
+    if (inTable && line.includes("|")) {
+      lines[index] = line.replace(/\$\\mathtt\{(=+)\}\$/g, "$1");
+    } else {
+      inTable = false;
+    }
+  }
+
+  return lines.join("\n");
+
+  function isMarkdownTableDelimiter(line: string): boolean {
+    const cells = line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|");
+    return cells.length >= 2 && cells.every((cell) => /^\s*:?-{3,}:?\s*$/.test(cell));
+  }
+}
+
+function maskInlineLiterals(
+  source: string,
+  prefix: string,
+  literals: string[],
+): string {
+  let output = "";
+  let cursor = 0;
+  while (cursor < source.length) {
+    const codeStart = findUnescapedBacktick(source, cursor);
+    const math = findMathOpener(source, cursor);
+    if (codeStart < 0 && !math) return output + source.slice(cursor);
+
+    if (codeStart >= 0 && (!math || codeStart < math.index)) {
+      let runEnd = codeStart + 1;
+      while (source[runEnd] === "`") runEnd++;
+      const delimiterLength = runEnd - codeStart;
+      const closeEnd = findClosingBacktick(source, runEnd, delimiterLength);
+      if (closeEnd >= 0) {
+        output += source.slice(cursor, codeStart);
+        output += addLiteral(source.slice(codeStart, closeEnd));
+        cursor = closeEnd;
+      } else {
+        output += source.slice(cursor, runEnd);
+        cursor = runEnd;
+      }
+      continue;
+    }
+
+    if (math) {
+      const close = findMathCloser(source, math.index + math.opener.length, math.opener);
+      if (close >= 0) {
+        const end = close + math.closer.length;
+        output += source.slice(cursor, math.index);
+        output += addLiteral(source.slice(math.index, end));
+        cursor = end;
+      } else {
+        output += source.slice(cursor, math.index + math.opener.length);
+        cursor = math.index + math.opener.length;
+      }
+    }
+  }
+  return output;
+
+  function addLiteral(value: string): string {
+    const placeholder = `${prefix}${literals.length}\u0000`;
+    literals.push(value);
+    return placeholder;
+  }
+}
+
+function findUnescapedBacktick(source: string, from: number): number {
+  let index = source.indexOf("`", from);
+  while (index >= 0 && isEscapedDelimiter(source, index)) {
+    index = source.indexOf("`", index + 1);
+  }
+  return index;
+}
+
+function findClosingBacktick(source: string, from: number, length: number): number {
+  let index = source.indexOf("`", from);
+  while (index >= 0) {
+    let runEnd = index + 1;
+    while (source[runEnd] === "`") runEnd++;
+    if (runEnd - index === length) return runEnd;
+    index = source.indexOf("`", runEnd);
+  }
+  return -1;
+}
+
+function findMathOpener(
+  source: string,
+  from: number,
+): { index: number; opener: string; closer: string } | null {
+  for (let index = from; index < source.length; index++) {
+    if (source[index] === "$" && !isEscapedDelimiter(source, index)) {
+      const run = source[index + 1] === "$" ? 2 : 1;
+      if (run === 2 && source[index + 2] === "$") continue;
+      return { index, opener: "$".repeat(run), closer: "$".repeat(run) };
+    }
+    if (
+      source[index] === "\\" && !isEscapedDelimiter(source, index) &&
+      (source[index + 1] === "(" || source[index + 1] === "[")
+    ) {
+      const opener = source.slice(index, index + 2);
+      return { index, opener, closer: opener === "\\(" ? "\\)" : "\\]" };
+    }
+    if (source[index] === "`") return null;
+  }
+  return null;
+}
+
+function findMathCloser(source: string, from: number, opener: string): number {
+  if (opener === "\\(" || opener === "\\[") {
+    const closer = opener === "\\(" ? "\\)" : "\\]";
+    let index = source.indexOf(closer, from);
+    while (index >= 0 && isEscapedDelimiter(source, index)) {
+      index = source.indexOf(closer, index + closer.length);
+    }
+    return index;
+  }
+
+  const delimiterLength = opener.length;
+  let index = source.indexOf("$", from);
+  while (index >= 0) {
+    if (isEscapedDelimiter(source, index)) {
+      index = source.indexOf("$", index + 1);
+      continue;
+    }
+    let runEnd = index + 1;
+    while (source[runEnd] === "$") runEnd++;
+    if (runEnd - index === delimiterLength) return index;
+    index = source.indexOf("$", runEnd);
+  }
+  return -1;
+}
+
+function isEscapedDelimiter(source: string, index: number): boolean {
+  let slashCount = 0;
+  for (let cursor = index - 1; cursor >= 0 && source[cursor] === "\\"; cursor--) {
+    slashCount++;
+  }
+  return slashCount % 2 === 1;
 }
 
 export function formatPlainText(
@@ -492,7 +711,7 @@ export function formatPlainText(
 export function formatJson(messages: ExportMessage[]): string {
   const data = messages.map((m) => ({
     role: m.role,
-    content: m.content,
+    content: getExportMessageContent(m),
     timestamp: m.timestamp ?? null,
     imagePaths: m.imagePaths,
   }));
@@ -521,7 +740,7 @@ export function formatCsv(messages: ExportMessage[]): string {
   const rows = messages.map((m) =>
     [
       m.role,
-      m.content.replaceAll("\r\n", "\n"),
+      getExportMessageContent(m).replaceAll("\r\n", "\n"),
       m.timestamp !== undefined ? String(m.timestamp) : "",
       m.imagePaths.join("; "),
     ]

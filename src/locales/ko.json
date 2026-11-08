@@ -1,6 +1,9 @@
 {
   "popup.copy": "대화 복사",
   "popup.copyLatest": "최신 답변 복사",
+  "popup.copyLatest.status.preparing": "최신 답변을 준비하는 중…",
+  "popup.copyLatest.status.checking": "새 답변이 있는지 확인하는 중…",
+  "popup.copyLatest.status.writing": "클립보드에 복사하는 중…",
   "popup.copySelect": "메시지 선택…",
   "popup.copyOptions.toggle": "추가 복사 옵션",
   "popup.copyOptions.group": "복사 옵션",
@@ -63,6 +66,7 @@
   "popup.error.noCopyableContent": "선택한 메시지에 복사할 텍스트가 없습니다",
   "popup.error.copyFailed": "Markdown을 복사하지 못했습니다",
   "popup.error.githubFailed": "GitHub에 저장하지 못했습니다",
+  "popup.error.githubTooLarge": "내보내기 파일이 ChatScribe의 GitHub 저장 한도를 초과했습니다. 먼저 로컬로 다운로드한 뒤 GitHub에 업로드하세요.",
   "options.title": "ChatScribe 설정",
   "options.subtitle": "ChatScribe의 모양과 내보내기 동작을 설정합니다.",
   "options.preferences.legend": "환경설정",

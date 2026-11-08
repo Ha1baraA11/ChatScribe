@@ -121,6 +121,79 @@ describe("formatter", () => {
     expect(stripMarkdown("~~~text\n**literal**\n~~~")).toBe("**literal**");
   });
 
+  it("keeps formula pipes intact unless the line is part of a real Markdown table", () => {
+    const formula = String.raw`$|x|=|y|$`;
+    const output = formatMarkdown([
+      { ...sampleMessages[1], content: formula },
+      { ...sampleMessages[1], id: "msg-3", content: "| x | = | y |\n|---|---|---|" },
+    ], DEFAULT_SETTINGS);
+
+    expect(output).toContain(formula);
+    expect(output).toContain("| x | $\\mathtt{=}$ | y |");
+
+    const plain = formatPlainText([
+      { ...sampleMessages[1], content: formula },
+      { ...sampleMessages[1], id: "msg-3", content: "| x | = | y |\n|---|---|---|" },
+    ], DEFAULT_SETTINGS);
+    expect(plain).toContain(formula);
+    expect(plain).toContain("| x | = | y |");
+  });
+
+  it("preserves multiplication inside formulas and inline code in plain text", () => {
+    const code = String.fromCharCode(96);
+    const message = {
+      ...sampleMessages[1],
+      content: `$a*b*c$ and ${code}a*b*c${code} and \\$5 and ${code}\\$5${code}`,
+    };
+    const output = formatPlainText([message], DEFAULT_SETTINGS);
+
+    expect(output).toContain("$a*b*c$");
+    expect(output).toContain("a*b*c");
+    expect(output).toContain("$5");
+    expect(output).toContain(String.raw`\$5`);
+  });
+
+  it("preserves the original fraction expression across all four export formats", () => {
+    const formula = String.raw`$P(A\mid A\cup B\cup C)=\dfrac{0.3333333333333333}{0.8888888888888888}=\dfrac{3}{8}$`;
+    const message = { ...sampleMessages[1], content: formula };
+
+    expect(formatMarkdown([message], DEFAULT_SETTINGS)).toContain(formula);
+    expect(formatPlainText([message], DEFAULT_SETTINGS)).toContain(formula);
+    expect(JSON.parse(formatJson([message]))[0].content).toBe(formula);
+    expect(formatCsv([message])).toContain(formula);
+  });
+
+  it("copies a lone latest answer without a synthetic question heading", () => {
+    const output = formatMarkdown(
+      [sampleMessages[1]],
+      DEFAULT_SETTINGS,
+      { includeRoleHeadings: false },
+    );
+    expect(output).toContain("Here is your function:");
+    expect(output).not.toContain("## Question");
+    expect(output).not.toContain("**Assistant:**");
+  });
+
+  it("reports image-only messages when their image was not bundled", () => {
+    const imageMessage: ExportMessage = {
+      ...sampleMessages[0],
+      content: "",
+      imageCount: 1,
+      imagePaths: [],
+    };
+
+    expect(formatMarkdown([imageMessage], DEFAULT_SETTINGS)).toContain(
+      "[Image not bundled: 1 image]",
+    );
+    expect(formatPlainText([imageMessage], DEFAULT_SETTINGS)).toContain(
+      "[Image not bundled: 1 image]",
+    );
+    expect(JSON.parse(formatJson([imageMessage]))[0].content).toContain(
+      "Image attachment: 1 image",
+    );
+    expect(formatCsv([imageMessage])).toContain("Image attachment: 1 image");
+  });
+
   it("builds clean filenames", () => {
     const filename = buildFilename("My Test: Chat / Conversation?", "md");
     expect(filename).toMatch(/^My_Test_Chat_Conversation/);

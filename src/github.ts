@@ -14,6 +14,10 @@
  */
 
 import { t } from "./i18n.ts";
+import {
+  assertGitHubPayloadSize,
+  base64LengthForText,
+} from "./export-limits.ts";
 
 // Public client ID for ChatScribe's GitHub OAuth App (Device Flow enabled).
 const GITHUB_CLIENT_ID = "Ov23livM5zFifnOcvad6";
@@ -236,28 +240,10 @@ export async function saveFileToRepo(
   filename: string,
   content: string,
   alreadyBase64 = false,
-): Promise<{ htmlUrl: string }> {
-  const filePath = `exports/${filename}`;
-  const encodedPath = encodeURIComponent(filePath);
-
-  // Check for existing file to get its SHA (required for updates)
-  const checkRes = await githubFetch(
-    `/repos/${fullName}/contents/${encodedPath}`,
-  );
-
-  let existingSha: string | undefined;
-
-  if (checkRes.ok) {
-    const existing = await checkRes.json() as { sha?: string };
-    existingSha = existing.sha;
-  } else if (checkRes.status !== 404) {
-    throw new Error(`Failed to check existing file: ${checkRes.status}`);
-  }
-
-  // Encode content to base64 if not already encoded
+): Promise<{ htmlUrl: string; path: string; filename: string }> {
   let base64Content = content;
-
   if (!alreadyBase64) {
+    assertGitHubPayloadSize(base64LengthForText(content));
     const bytes = new TextEncoder().encode(content);
     const CHUNK = 8192;
     let binary = "";
@@ -266,70 +252,67 @@ export async function saveFileToRepo(
     }
     base64Content = btoa(binary);
   }
+  assertGitHubPayloadSize(base64Content.length);
 
-  const commitMessage = existingSha
-    ? `Update ${filename} via ChatScribe`
-    : `Add ${filename} via ChatScribe`;
+  const filenameForAttempt = (attempt: number): string => {
+    if (attempt === 1) return filename;
+    const extensionIndex = filename.lastIndexOf(".");
+    const hasExtension = extensionIndex > 0;
+    const stem = hasExtension ? filename.slice(0, extensionIndex) : filename;
+    const extension = hasExtension ? filename.slice(extensionIndex) : "";
+    return `${stem}-${attempt}${extension}`;
+  };
 
-  const putRes = await githubFetch(
-    `/repos/${fullName}/contents/${encodedPath}`,
-    {
-      method: "PUT",
-      body: JSON.stringify({
-        message: commitMessage,
-        content: base64Content,
-        sha: existingSha,
-      }),
-    },
-  );
+  for (let attempt = 1; attempt <= 100; attempt++) {
+    const actualFilename = filenameForAttempt(attempt);
+    const filePath = `exports/${actualFilename}`;
+    const encodedPath = encodeURIComponent(filePath);
+    const checkRes = await githubFetch(`/repos/${fullName}/contents/${encodedPath}`);
 
-  // Handle 409 Conflict (SHA changed between GET and PUT — race condition)
-  if (putRes.status === 409) {
-    const retryCheck = await githubFetch(
-      `/repos/${fullName}/contents/${encodedPath}`,
-    );
-    const retrySha = retryCheck.ok
-      ? ((await retryCheck.json()) as { sha?: string }).sha
-      : undefined;
+    if (checkRes.ok) continue;
+    if (checkRes.status !== 404) {
+      throw new Error(`Failed to check existing file: ${checkRes.status}`);
+    }
 
-    const retryPut = await githubFetch(
+    // Create-only request: never send a SHA, so this operation cannot update
+    // an existing conversation export.
+    const putRes = await githubFetch(
       `/repos/${fullName}/contents/${encodedPath}`,
       {
         method: "PUT",
         body: JSON.stringify({
-          message: `Update ${filename} via ChatScribe`,
+          message: `Add ${actualFilename} via ChatScribe`,
           content: base64Content,
-          sha: retrySha,
         }),
       },
     );
 
-    if (!retryPut.ok) {
-      throw new Error(
-        "Conflict saving the file (another write happened simultaneously). Please try again.",
-      );
+    if (putRes.ok) {
+      const putData = await putRes.json() as {
+        content?: { html_url?: string; path?: string };
+      };
+      return {
+        htmlUrl: putData.content?.html_url ?? `https://github.com/${fullName}`,
+        path: putData.content?.path ?? filePath,
+        filename: actualFilename,
+      };
     }
 
-    const retryData = await retryPut.json() as {
-      content?: { html_url?: string };
-    };
-    return { htmlUrl: retryData.content?.html_url ?? `https://github.com/${fullName}` };
-  }
+    if (putRes.status === 409 || putRes.status === 422) {
+      const collisionCheck = await githubFetch(`/repos/${fullName}/contents/${encodedPath}`);
+      if (collisionCheck.ok) continue;
+      if (collisionCheck.status === 404) {
+        const body = await putRes.json().catch(() => null) as { message?: string } | null;
+        throw new Error(body?.message ?? `Failed to create file: ${putRes.status}`);
+      }
+      throw new Error(`Failed to verify a filename collision: ${collisionCheck.status}`);
+    }
 
-  if (!putRes.ok) {
     const body = await putRes.json().catch(() => null) as { message?: string } | null;
-    throw new Error(
-      body?.message ?? `Failed to save file: ${putRes.status}`,
-    );
+    throw new Error(body?.message ?? `Failed to save file: ${putRes.status}`);
   }
 
-  const putData = await putRes.json() as {
-    content?: { html_url?: string };
-  };
-
-  return {
-    htmlUrl: putData.content?.html_url ?? `https://github.com/${fullName}`,
-  };
+  throw new Error("Could not find an unused GitHub filename after 100 attempts.");
 }
 
 // -----------------------------------------------------------------------

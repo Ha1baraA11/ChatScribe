@@ -3830,9 +3830,14 @@ function showExportSuccess(message: string): void {
 // CHROME MESSAGE LISTENER
 // -----------------------------------------------------------------------
 
-async function checkConversationRevision(): Promise<{
+async function checkConversationRevision(options: {
+  knownRevision?: string;
+  returnDataIfChanged?: boolean;
+} = {}): Promise<{
   conversationId: string;
   revision: string;
+  changed?: boolean;
+  data?: ConversationData;
 }> {
   const requestPath = window.location.pathname;
   const conversationId = extractConversationId(requestPath);
@@ -3850,7 +3855,24 @@ async function checkConversationRevision(): Promise<{
     throw new Error("The ChatGPT conversation changed while it was being checked.");
   }
 
-  return { conversationId, revision: getConversationRevision(page) };
+  const checkedRevision = getConversationRevision(page);
+  const changed = options.knownRevision !== checkedRevision;
+  if (options.returnDataIfChanged === true && changed) {
+    const data = await loadConversation(false, false, false, undefined, true);
+    if (window.location.pathname !== requestPath) {
+      throw new Error("The ChatGPT conversation changed while it was being checked.");
+    }
+    if (!data.revision) {
+      throw new Error("ChatGPT did not return a conversation revision.");
+    }
+    return {
+      conversationId,
+      revision: data.revision,
+      changed: true,
+      data,
+    };
+  }
+  return { conversationId, revision: checkedRevision };
 }
 
 const CONVERSATION_MARKER_SELECTOR =
@@ -3930,6 +3952,8 @@ const onContentMessage: Parameters<typeof chrome.runtime.onMessage.addListener>[
       includeGeneratedImages?: boolean;
       fetchImages?: boolean;
       forceRefresh?: boolean;
+      knownRevision?: string;
+      returnDataIfChanged?: boolean;
       selectedMessageIds?: string[];
       text?: string;
       message?: string;
@@ -3983,7 +4007,7 @@ const onContentMessage: Parameters<typeof chrome.runtime.onMessage.addListener>[
     }
 
     if (message.type === CONTENT_CHECK_REVISION_TYPE) {
-      void checkConversationRevision()
+      void checkConversationRevision(message)
         .then((data) => sendResponse({ success: true, ...data }))
         .catch((error: unknown) => sendResponse({
           success: false,

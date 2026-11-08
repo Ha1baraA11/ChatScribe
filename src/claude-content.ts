@@ -13,13 +13,13 @@ import {
   CONTENT_WATCH_CONVERSATION_TYPE,
 } from "./content-protocol.ts";
 import { getClaudeConversationId, parseClaudeConversation } from "./claude-conversation.ts";
+import { readResponseBytesLimited, assertNoRedirect } from "./bounded-response.ts";
 import type { ConversationData, ExportImageFile, ExportMessage } from "./types.ts";
 
 const MAX_CONVERSATION_BYTES = 100 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES = 200 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30_000;
-const REVISION_SNAPSHOT_TTL_MS = 5_000;
 
 const cleanupWindow = window as Window & {
   __chatScribeClaudeCleanupByBuild?: Map<string, () => void>;
@@ -42,8 +42,22 @@ interface ClaudeLoadRequest {
   fetchImages?: boolean;
   includeClaudeThinking?: boolean;
   selectedMessageIds?: string[];
+  forceRefresh?: boolean;
+  knownRevision?: string;
+  returnDataIfChanged?: boolean;
   text?: string;
   watch?: boolean;
+}
+
+interface FetchedClaudeConversation {
+  raw: unknown;
+  organizationId: string;
+}
+
+let cachedOrganization: { conversationId: string; organizationId: string } | null = null;
+
+function clearCachedOrganization(): void {
+  cachedOrganization = null;
 }
 
 interface DownloadedImage {
@@ -82,24 +96,23 @@ async function fetchJson(path: string): Promise<unknown> {
     method: "GET",
     credentials: "include",
     cache: "no-store",
+    redirect: "error",
     headers: { Accept: "application/json" },
     signal: timeoutSignal(),
   });
+  assertNoRedirect(response, window.location.origin, "Claude redirected an export request.");
   if (!response.ok) {
     const error = new Error(`CLAUDE_HTTP_${response.status}`);
     Object.assign(error, { status: response.status });
     throw error;
   }
-  const length = Number(response.headers.get("content-length") ?? 0);
-  if (length > MAX_CONVERSATION_BYTES) {
-    throw new Error("This Claude conversation is too large to export safely.");
-  }
-  const text = await response.text();
-  if (text.length > MAX_CONVERSATION_BYTES) {
-    throw new Error("This Claude conversation is too large to export safely.");
-  }
+  const bytes = await readResponseBytesLimited(
+    response,
+    MAX_CONVERSATION_BYTES,
+    "This Claude conversation is too large to export safely.",
+  );
   try {
-    return JSON.parse(text) as unknown;
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
   } catch {
     throw new Error("Claude returned an unreadable conversation response.");
   }
@@ -128,7 +141,43 @@ function getHttpStatus(error: unknown): number | undefined {
     : undefined;
 }
 
-async function fetchClaudeConversation(conversationId: string): Promise<unknown> {
+async function fetchConversationFromOrganization(
+  conversationId: string,
+  organizationId: string,
+): Promise<unknown> {
+  const path = `/api/organizations/${encodeURIComponent(organizationId)}` +
+    `/chat_conversations/${encodeURIComponent(conversationId)}` +
+    // Read the complete message tree from a strongly consistent snapshot.
+    "?tree=True&rendering_mode=messages&render_all_tools=true&consistency=strong";
+  const value = await fetchJson(path);
+  ensureCurrentConversation(conversationId);
+  const record = asRecord(value);
+  return asRecord(record?.conversation) ?? value;
+}
+
+async function fetchClaudeConversation(
+  conversationId: string,
+): Promise<FetchedClaudeConversation> {
+  if (cachedOrganization && cachedOrganization.conversationId !== conversationId) {
+    clearCachedOrganization();
+  }
+
+  const cached = cachedOrganization;
+  if (cached) {
+    try {
+      return {
+        raw: await fetchConversationFromOrganization(conversationId, cached.organizationId),
+        organizationId: cached.organizationId,
+      };
+    } catch (error) {
+      const status = getHttpStatus(error);
+      if (status !== 401 && status !== 403 && status !== 404) throw error;
+      // Organization membership can change while the tab stays open. Drop
+      // only this in-memory lookup and rediscover it once below.
+      clearCachedOrganization();
+    }
+  }
+
   const organizations = getOrganizationIds(await fetchJson("/api/organizations"));
   ensureCurrentConversation(conversationId);
   if (organizations.length === 0) {
@@ -137,15 +186,11 @@ async function fetchClaudeConversation(conversationId: string): Promise<unknown>
 
   let notFoundCount = 0;
   for (const organizationId of organizations) {
-    const path = `/api/organizations/${encodeURIComponent(organizationId)}` +
-      `/chat_conversations/${encodeURIComponent(conversationId)}` +
-      // Read the complete message tree from a strongly consistent snapshot.
-      "?tree=True&rendering_mode=messages&render_all_tools=true&consistency=strong";
     try {
-      const value = await fetchJson(path);
-      ensureCurrentConversation(conversationId);
-      const record = asRecord(value);
-      return asRecord(record?.conversation) ?? value;
+      return {
+        raw: await fetchConversationFromOrganization(conversationId, organizationId),
+        organizationId,
+      };
     } catch (error) {
       const status = getHttpStatus(error);
       if (status === 404) {
@@ -188,7 +233,11 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-async function downloadImage(url: string, index: number): Promise<DownloadedImage> {
+async function downloadImage(
+  url: string,
+  index: number,
+  remainingTotalBytes: number,
+): Promise<DownloadedImage> {
   const parsed = new URL(url, window.location.origin);
   if (parsed.origin !== window.location.origin || parsed.protocol !== "https:") {
     throw new Error("external-host");
@@ -196,23 +245,28 @@ async function downloadImage(url: string, index: number): Promise<DownloadedImag
   const response = await fetch(parsed.href, {
     credentials: "include",
     cache: "no-store",
+    redirect: "error",
     signal: timeoutSignal(),
   });
+  assertNoRedirect(response, window.location.origin, "Claude redirected an image request.");
   if (!response.ok) throw new Error("download-failed");
-  const declaredLength = Number(response.headers.get("content-length") ?? 0);
-  if (declaredLength > MAX_IMAGE_BYTES) throw new Error("image-too-large");
-  const blob = await response.blob();
-  if (blob.size === 0 || blob.size > MAX_IMAGE_BYTES) {
+  const bytes = await readResponseBytesLimited(
+    response,
+    Math.min(MAX_IMAGE_BYTES, remainingTotalBytes),
+    "image-too-large",
+  );
+  if (bytes.length === 0) {
     throw new Error("image-too-large");
   }
-  const mimeType = blob.type.toLowerCase().split(";")[0].trim();
+  const mimeType = (response.headers.get("content-type") ?? "")
+    .toLowerCase().split(";")[0].trim();
   if (!mimeType.startsWith("image/")) throw new Error("not-an-image");
   const path = `images/claude-image-${String(index).padStart(3, "0")}.${extensionForMimeType(mimeType)}`;
   const image: ExportImageFile = {
     path,
     mimeType,
-    base64: bytesToBase64(new Uint8Array(await blob.arrayBuffer())),
-    sizeBytes: blob.size,
+    base64: bytesToBase64(bytes),
+    sizeBytes: bytes.length,
   };
   return { image, path };
 }
@@ -234,10 +288,11 @@ async function attachImages(
     let result = byUrl.get(reference.url);
     if (result === undefined) {
       try {
-        const next = await downloadImage(reference.url, images.length + 1);
-        if (totalBytes + next.image.sizeBytes > MAX_TOTAL_IMAGE_BYTES) {
-          throw new Error("total-too-large");
-        }
+        const next = await downloadImage(
+          reference.url,
+          images.length + 1,
+          MAX_TOTAL_IMAGE_BYTES - totalBytes,
+        );
         totalBytes += next.image.sizeBytes;
         images.push(next.image);
         result = next;
@@ -269,7 +324,7 @@ async function attachImages(
 
 async function readConversation(
   includeThinking: boolean,
-  rawValue?: unknown,
+  fetchedValue?: FetchedClaudeConversation,
   conversationIdValue?: string,
 ): Promise<{
   data: ConversationData;
@@ -277,35 +332,30 @@ async function readConversation(
   imageReferences: Array<{ messageId: string; url: string }>;
 }> {
   const conversationId = conversationIdValue ?? currentConversationId();
-  const raw = rawValue ?? await fetchClaudeConversation(conversationId);
-  const parsed = parseClaudeConversation(raw, {
+  const fetched = fetchedValue ?? await fetchClaudeConversation(conversationId);
+  const parsed = parseClaudeConversation(fetched.raw, {
     includeThinking,
     expectedConversationId: conversationId,
   });
+  ensureCurrentConversation(conversationId);
+  cachedOrganization = { conversationId, organizationId: fetched.organizationId };
   return {
     conversationId,
-    data: { messages: parsed.messages, images: [], revision: parsed.revision },
+    data: {
+      messages: parsed.messages,
+      images: [],
+      revision: parsed.revision,
+      artifacts: parsed.artifacts,
+    },
     imageReferences: parsed.imageReferences,
   };
 }
 
-let revisionSnapshot: {
-  conversationId: string;
-  raw: unknown;
-  createdAt: number;
-} | null = null;
-
 async function handleLoad(message: ClaudeLoadRequest): Promise<ConversationData> {
   const conversationId = currentConversationId();
-  const snapshot = revisionSnapshot &&
-      revisionSnapshot.conversationId === conversationId &&
-      Date.now() - revisionSnapshot.createdAt <= REVISION_SNAPSHOT_TTL_MS
-    ? revisionSnapshot
-    : null;
-  revisionSnapshot = null;
   const { data, imageReferences } = await readConversation(
     message.includeClaudeThinking === true,
-    snapshot?.raw,
+    undefined,
     conversationId,
   );
   if (message.downloadImages === true && message.fetchImages !== false) {
@@ -315,13 +365,27 @@ async function handleLoad(message: ClaudeLoadRequest): Promise<ConversationData>
   return data;
 }
 
-async function handleRevision(): Promise<{ conversationId: string; revision: string }> {
+async function handleRevision(message: ClaudeLoadRequest): Promise<{
+  conversationId: string;
+  revision: string;
+  changed?: boolean;
+  data?: ConversationData;
+}> {
   const conversationId = currentConversationId();
-  const raw = await fetchClaudeConversation(conversationId);
-  const { data } = await readConversation(false, raw, conversationId);
+  const fetched = await fetchClaudeConversation(conversationId);
+  const { data } = await readConversation(
+    message.returnDataIfChanged === true && message.includeClaudeThinking === true,
+    fetched,
+    conversationId,
+  );
   if (!data.revision) throw new Error("Claude did not return a conversation revision.");
-  revisionSnapshot = { conversationId, raw, createdAt: Date.now() };
-  return { conversationId, revision: data.revision };
+  const revisionChanged = message.knownRevision !== data.revision;
+  return {
+    conversationId,
+    revision: data.revision,
+    ...(message.returnDataIfChanged === true ? { changed: revisionChanged } : {}),
+    ...(message.returnDataIfChanged === true && revisionChanged ? { data } : {}),
+  };
 }
 
 let watchObserver: MutationObserver | null = null;
@@ -344,6 +408,12 @@ function startWatching(): void {
       const conversationId = getClaudeConversationId(window.location.href);
       if (!conversationId) return;
       const locationChanged = lastWatchLocation !== window.location.href;
+      if (
+        locationChanged &&
+        getClaudeConversationId(lastWatchLocation) !== conversationId
+      ) {
+        clearCachedOrganization();
+      }
       lastWatchLocation = window.location.href;
       void chrome.runtime.sendMessage({
         type: CONTENT_CONVERSATION_CHANGED_TYPE,
@@ -386,7 +456,7 @@ const onMessage: Parameters<typeof chrome.runtime.onMessage.addListener>[0] =
       return true;
     }
     if (message.type === CONTENT_CHECK_REVISION_TYPE) {
-      void handleRevision()
+      void handleRevision(message)
         .then((data) => sendResponse({ success: true, ...data }))
         .catch((error: unknown) => sendResponse({
           success: false,
@@ -407,11 +477,15 @@ const onMessage: Parameters<typeof chrome.runtime.onMessage.addListener>[0] =
   };
 
 chrome.runtime.onMessage.addListener(onMessage);
-window.addEventListener("pagehide", stopWatching, { once: true });
+const onPageHide = (): void => {
+  stopWatching();
+  clearCachedOrganization();
+};
+window.addEventListener("pagehide", onPageHide, { once: true });
 
 cleanupByBuild.set(CHATSCRIBE_BUILD_ID, () => {
   chrome.runtime.onMessage.removeListener(onMessage);
-  window.removeEventListener("pagehide", stopWatching);
+  window.removeEventListener("pagehide", onPageHide);
   stopWatching();
-  revisionSnapshot = null;
+  clearCachedOrganization();
 });

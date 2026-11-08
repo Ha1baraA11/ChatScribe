@@ -13,13 +13,13 @@ describe("SVG diagram export", () => {
     vi.unstubAllGlobals();
   });
 
-  it("omits diagrams from text exports", async () => {
+  it("keeps a diagram placeholder in text exports", async () => {
     const result = await renderSvgTemplatesAsMarkdown(
       `Before ${diagram} after`,
       "text",
     );
 
-    expect(result.markdown).toBe("Before  after");
+    expect(result.markdown).toBe("Before [Diagram] after");
     expect(result.assets).toEqual([]);
   });
 
@@ -72,16 +72,19 @@ describe("SVG diagram export", () => {
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:svg");
   });
 
-  it("omits unsafe SVG markup from Markdown exports", async () => {
+  it("keeps unsafe SVG source inert in Markdown exports", async () => {
     const unsafeDiagram =
       '<box><svg viewBox="0 0 10 10"><script>alert(1)</script></svg></box>';
     const result = await renderSvgTemplatesAsMarkdown(unsafeDiagram, "assets");
 
-    expect(result.markdown).toBe("");
+    expect(result.markdown).toContain("[Diagram could not be rendered.");
+    expect(result.markdown).toContain("```xml\n<svg");
+    expect(result.markdown).not.toContain("\n<script>");
+    expect(result.markdown).toContain("<script>alert(1)</script>");
     expect(result.assets).toEqual([]);
   });
 
-  it("omits an unsupported diagram while preserving adjacent prose", async () => {
+  it("preserves unsupported source inertly beside adjacent prose", async () => {
     const unsafeDiagram =
       '<box><svg viewBox="0 0 10 10"><script>alert(1)</script></svg></box>';
     const result = await renderSvgTemplatesAsMarkdown(
@@ -89,7 +92,8 @@ describe("SVG diagram export", () => {
       "assets",
     );
 
-    expect(result.markdown).toBe("Before\n\nAfter");
+    expect(result.markdown).toContain("Before\n\n[Diagram could not be rendered.");
+    expect(result.markdown).toContain("After");
     expect(result.assets).toEqual([]);
   });
 
@@ -384,6 +388,7 @@ describe("ChatGPT visualization normalization", () => {
       "\\]",
       "",
       "Use `\\(literal\\)` as text.",
+      String.raw`Literal \\(not math\\).`,
       "```latex",
       "\\[",
       "code",
@@ -395,7 +400,26 @@ describe("ChatGPT visualization normalization", () => {
 
     expect(result).toContain("Inline $x^2$ and display:\n\n$$\n\\boxed{x}\n$$");
     expect(result).toContain("Use `\\(literal\\)` as text.");
+    expect(result).toContain(String.raw`Literal \\(not math\\).`);
     expect(result).toContain("```latex\n\\[\ncode\n\\]\n```");
+  });
+
+  it("preserves numeric LaTeX groups during Svelte component normalization", () => {
+    const formula = String.raw`$P(A\mid A\cup B\cup C)=\dfrac{0.3333333333333333}{0.8888888888888888}=\dfrac{3}{8}$`;
+
+    expect(normalizeChatGptComponents(formula)).toBe(formula);
+  });
+
+  it("does not evaluate ordinary braces, code, or escaped dollar text", () => {
+    const code = String.fromCharCode(96);
+    const source = String.raw`Price: \$5. Formula: $P(A)=\dfrac{1/3}{8/9}=\dfrac{3}{8}$. Literal {1/3}, {2}, and ` +
+      `${code}{1/3}${code}.`;
+    expect(normalizeChatGptComponents(source)).toBe(source);
+  });
+
+  it("preserves absolute-value and nested math delimiters exactly", () => {
+    const source = String.raw`$|x|=|y|$ and $\left|\dfrac{1}{\left(1+x\right)}\right|$`;
+    expect(normalizeChatGptComponents(source)).toBe(source);
   });
 
   it("preserves LearningViz examples inside fenced code", () => {

@@ -403,8 +403,8 @@ export async function renderSvgDataUrlToPngBase64(
 }
 
 /**
- * Turns ChatGPT's boxed, Svelte-style SVG snippets into PNG assets. Visuals
- * that cannot be reconstructed are omitted from Markdown exports.
+ * Turns ChatGPT's boxed, Svelte-style SVG snippets into PNG assets. Unsupported
+ * source is retained only in a fenced code block, never as active markup.
  */
 export async function renderSvgTemplatesAsMarkdown(
   markdown: string,
@@ -453,8 +453,7 @@ export async function renderSvgTemplatesAsMarkdown(
     cursor = replacementEnd;
 
     if (mode === "text") {
-      // A text placeholder is not a useful substitute for a diagram. Keep
-      // the surrounding explanation and omit the visual itself.
+      output.push("[Diagram]");
       continue;
     }
 
@@ -463,12 +462,14 @@ export async function renderSvgTemplatesAsMarkdown(
       const staticSvg = compileStaticSvg(svgTemplate, canvasBackgroundColor);
 
       if (!staticSvg) {
+        output.push(formatUnsupportedSvgSource(svgTemplate));
         continue;
       }
 
       const base64 = await renderSvgToPngBase64(staticSvg, canvasBackgroundColor);
 
       if (!base64) {
+        output.push(formatUnsupportedSvgSource(svgTemplate));
         continue;
       }
 
@@ -481,8 +482,7 @@ export async function renderSvgTemplatesAsMarkdown(
       });
       output.push(`![Diagram](${path})`);
     } catch {
-      // Do not leak unsupported JSX/Svelte markup or placeholder text into
-      // Markdown when the visual cannot be reconstructed.
+      output.push(formatUnsupportedSvgSource(svgTemplate));
     }
   }
 
@@ -494,6 +494,21 @@ export async function renderSvgTemplatesAsMarkdown(
     markdown: restoreCodeBlocks(renderedMarkdown, placeholderPrefix, codeBlocks),
     assets,
   };
+}
+
+function formatUnsupportedSvgSource(source: string): string {
+  let longestFence = 0;
+  let currentFence = 0;
+  for (const character of source) {
+    if (character === "`") {
+      currentFence++;
+      longestFence = Math.max(longestFence, currentFence);
+    } else {
+      currentFence = 0;
+    }
+  }
+  const fence = "`".repeat(Math.max(3, longestFence + 1));
+  return `[Diagram could not be rendered. Source is preserved as text.]\n\n${fence}xml\n${source}\n${fence}`;
 }
 
 function decodeSvgDataUrl(dataUrl: string): string | null {
@@ -550,6 +565,12 @@ const COMPONENT_WRAPPERS = new Set([
   "text",
   "title",
   "caption",
+  "math",
+  "chart",
+  "asyncimage",
+  "cite",
+  "learningviz",
+  "button",
   "radio-group",
   "list",
 ]);
@@ -561,11 +582,21 @@ const COMPONENT_WRAPPERS = new Set([
 export function normalizeChatGptComponents(markdown: string): string {
   const codeBlocks: string[] = [];
   const placeholderPrefix = `\u0000CHATSCRIBE_COMPONENT_CODE_${Math.random().toString(36).slice(2)}_`;
-  const maskedMarkdown = markdown.replace(FENCED_CODE_PATTERN, (block) => {
+  let maskedMarkdown = markdown.replace(FENCED_CODE_PATTERN, (block) => {
     const placeholder = `${placeholderPrefix}${codeBlocks.length}\u0000`;
     codeBlocks.push(block);
     return placeholder;
   });
+  maskedMarkdown = maskInlineCodeSpans(maskedMarkdown, placeholderPrefix, codeBlocks);
+  maskedMarkdown = normalizeMarkdownMathDelimiters(maskedMarkdown);
+  maskedMarkdown = maskMathExpressions(maskedMarkdown, placeholderPrefix, codeBlocks);
+  // expandBindings() is meant for ChatGPT's serialized Svelte components. Do
+  // not interpret ordinary brace groups in the surrounding answer text.
+  maskedMarkdown = maskOrdinaryBraceExpressions(
+    maskedMarkdown,
+    placeholderPrefix,
+    codeBlocks,
+  );
 
   const templateSource = { markdown: maskedMarkdown, scope: {} };
   let expanded = normalizeStaticGridTemplateLoops(
@@ -587,15 +618,11 @@ export function normalizeChatGptComponents(markdown: string): string {
   expanded = normalizeUnsafeMarkdownIndentation(
     stripUnresolvedTemplateExpressions(expanded),
   );
-
   // Some numbered grids only become plain text after their ChatGPT component
   // wrappers are removed. Normalize those sequences after both component-grid
   // conversion and tag cleanup so the row structure is still recognizable.
-  const normalizedComponents = normalizeMarkdownMathDelimiters(
-    normalizeComponentTags(normalizeGridBlocks(expanded)),
-  );
-  return restoreCodeBlocks(
-    normalizeLinearizedFloatFieldTables(
+  const normalizedComponents = normalizeComponentTags(normalizeGridBlocks(expanded));
+  const normalizedMarkdown = normalizeLinearizedFloatFieldTables(
       normalizeLinearizedPipelineMatrices(
         normalizeLinearizedLinkedListSequences(
           normalizeLinearizedAddressGroupDiagrams(
@@ -615,10 +642,226 @@ export function normalizeChatGptComponents(markdown: string): string {
           ),
         ),
       ),
-    ),
-    placeholderPrefix,
-    codeBlocks,
-  );
+    );
+  return restoreCodeBlocks(normalizedMarkdown, placeholderPrefix, codeBlocks);
+}
+
+function protectSegment(
+  segment: string,
+  placeholderPrefix: string,
+  protectedSegments: string[],
+): string {
+  const placeholder = `${placeholderPrefix}${protectedSegments.length}\u0000`;
+  protectedSegments.push(segment);
+  return placeholder;
+}
+
+function isEscapedAt(source: string, index: number): boolean {
+  let slashes = 0;
+  for (let cursor = index - 1; cursor >= 0 && source[cursor] === "\\"; cursor--) {
+    slashes++;
+  }
+  return slashes % 2 === 1;
+}
+
+function maskInlineCodeSpans(
+  source: string,
+  placeholderPrefix: string,
+  protectedSegments: string[],
+): string {
+  let output = "";
+  let cursor = 0;
+  while (cursor < source.length) {
+    const start = source.indexOf("`", cursor);
+    if (start < 0) return output + source.slice(cursor);
+    let delimiterEnd = start + 1;
+    while (source[delimiterEnd] === "`") delimiterEnd++;
+    if (isEscapedAt(source, start)) {
+      output += source.slice(cursor, delimiterEnd);
+      cursor = delimiterEnd;
+      continue;
+    }
+    const delimiterLength = delimiterEnd - start;
+    let close = delimiterEnd;
+    let closeEnd = -1;
+    while (close < source.length) {
+      close = source.indexOf("`", close);
+      if (close < 0) break;
+      let runEnd = close + 1;
+      while (source[runEnd] === "`") runEnd++;
+      if (runEnd - close === delimiterLength) {
+        closeEnd = runEnd;
+        break;
+      }
+      close = runEnd;
+    }
+    if (closeEnd < 0) {
+      output += source.slice(cursor, delimiterEnd);
+      cursor = delimiterEnd;
+      continue;
+    }
+    output += source.slice(cursor, start);
+    output += protectSegment(
+      source.slice(start, closeEnd),
+      placeholderPrefix,
+      protectedSegments,
+    );
+    cursor = closeEnd;
+  }
+  return output;
+}
+
+function maskMathExpressions(
+  source: string,
+  placeholderPrefix: string,
+  protectedSegments: string[],
+): string {
+  let output = "";
+  let cursor = 0;
+  while (cursor < source.length) {
+    const nextDollar = source.indexOf("$", cursor);
+    const nextSlash = source.indexOf("\\", cursor);
+    const start = [nextDollar, nextSlash].filter((index) => index >= 0)
+      .sort((left, right) => left - right)[0] ?? -1;
+    if (start < 0) return output + source.slice(cursor);
+
+    let opener = "";
+    let closer = "";
+    if (source[start] === "$" && !isEscapedAt(source, start)) {
+      const display = source[start + 1] === "$";
+      opener = display ? "$$" : "$";
+      closer = opener;
+    } else if (source[start] === "\\" && !isEscapedAt(source, start)) {
+      if (source[start + 1] === "(") {
+        opener = "\\(";
+        closer = "\\)";
+      } else if (source[start + 1] === "[") {
+        opener = "\\[";
+        closer = "\\]";
+      }
+    }
+    if (!opener) {
+      output += source.slice(cursor, start + 1);
+      cursor = start + 1;
+      continue;
+    }
+
+    let close = source.indexOf(closer, start + opener.length);
+    while (close >= 0 && isEscapedAt(source, close)) {
+      close = source.indexOf(closer, close + closer.length);
+    }
+    if (close < 0) {
+      output += source.slice(cursor, start + opener.length);
+      cursor = start + opener.length;
+      continue;
+    }
+    if (opener === "$" && (source[close - 1] === "\\" || source[close + 1] === "$")) {
+      output += source.slice(cursor, close + closer.length);
+      cursor = close + closer.length;
+      continue;
+    }
+    const end = close + closer.length;
+    output += source.slice(cursor, start);
+    output += protectSegment(source.slice(start, end), placeholderPrefix, protectedSegments);
+    cursor = end;
+  }
+  return output;
+}
+
+function maskOrdinaryBraceExpressions(
+  source: string,
+  placeholderPrefix: string,
+  protectedSegments: string[],
+): string {
+  let output = "";
+  let cursor = 0;
+  let componentDepth = 0;
+  let svgDepth = 0;
+  let templateDepth = 0;
+  const hasSvelteTemplate = /\{@body\b|\{#(?:each|if)\b/.test(source);
+
+  while (cursor < source.length) {
+    if (source[cursor] === "<") {
+      const end = findMarkupTagEnd(source, cursor);
+      if (end >= 0) {
+        const tag = source.slice(cursor, end + 1);
+        const match = tag.match(/^<\s*(\/)?\s*([A-Za-z][\w:-]*)/);
+        if (match) {
+          const closing = Boolean(match[1]);
+          const name = match[2].toLowerCase();
+          const selfClosing = /\/\s*>$/.test(tag);
+          const isComponent = COMPONENT_WRAPPERS.has(name);
+          if (name === "svg") {
+            if (closing) svgDepth = Math.max(0, svgDepth - 1);
+            else if (!selfClosing) svgDepth++;
+          }
+          if (isComponent) {
+            if (closing) componentDepth = Math.max(0, componentDepth - 1);
+            else if (!selfClosing) componentDepth++;
+          }
+          if (isComponent || name === "svg" || name === "math" || componentDepth > 0 || svgDepth > 0) {
+            output += tag;
+          } else {
+            output += maskBraceExpressionsInText(tag, placeholderPrefix, protectedSegments);
+          }
+          cursor = end + 1;
+          continue;
+        }
+      }
+    }
+
+    if (source[cursor] === "{") {
+      const end = findExpressionEnd(source, cursor);
+      if (end >= 0) {
+        const expression = source.slice(cursor, end + 1);
+        const body = expression.slice(1, -1).trimStart();
+        const opensTemplateBlock = /^(?:#each\b|#if\b)/.test(body);
+        const closesTemplateBlock = /^(?:\/each\s*$|\/if\s*$)/.test(body);
+        const isTemplateDeclaration = /^@body\b/.test(body);
+        const isTemplateElse = /^:else\s*$/.test(body);
+        const isLiteralNumber = /^-?\d+(?:\.\d+)?(?:\s*\/\s*-?\d+(?:\.\d+)?)?$/.test(body.trim());
+        if (
+          ((componentDepth > 0 || svgDepth > 0 || templateDepth > 0 || hasSvelteTemplate) &&
+            !isLiteralNumber) ||
+          opensTemplateBlock || closesTemplateBlock || isTemplateDeclaration || isTemplateElse
+        ) {
+          output += expression;
+          if (opensTemplateBlock) templateDepth++;
+          else if (closesTemplateBlock) templateDepth = Math.max(0, templateDepth - 1);
+        } else {
+          output += protectSegment(expression, placeholderPrefix, protectedSegments);
+        }
+        cursor = end + 1;
+        continue;
+      }
+    }
+    output += source[cursor];
+    cursor++;
+  }
+  return output;
+}
+
+function maskBraceExpressionsInText(
+  source: string,
+  placeholderPrefix: string,
+  protectedSegments: string[],
+): string {
+  let output = "";
+  let cursor = 0;
+  while (cursor < source.length) {
+    if (source[cursor] !== "{") {
+      output += source[cursor++];
+      continue;
+    }
+    const end = findExpressionEnd(source, cursor);
+    if (end < 0) {
+      output += source[cursor++];
+      continue;
+    }
+    output += protectSegment(source.slice(cursor, end + 1), placeholderPrefix, protectedSegments);
+    cursor = end + 1;
+  }
+  return output;
 }
 
 /** Use dollar delimiters supported by Obsidian and Typora for ChatGPT math. */
@@ -631,17 +874,46 @@ function normalizeMarkdownMathDelimiters(markdown: string): string {
     return placeholder;
   });
 
-  const normalized = maskedMarkdown
-    .replace(/\\\[\s*([\s\S]*?)\s*\\\]/g, (_match, expression: string) =>
-      `\n\n$$\n${expression.trim()}\n$$\n\n`,
-    )
-    .replace(/\\\(([^\n]*?)\\\)/g, (_match, expression: string) =>
-      `$${expression}$`,
-    )
+  const normalized = normalizeBackslashMathDelimiters(maskedMarkdown)
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n");
 
   return restoreCodeBlocks(normalized, placeholderPrefix, codeSpans);
+}
+
+function normalizeBackslashMathDelimiters(source: string): string {
+  let output = "";
+  let cursor = 0;
+  while (cursor < source.length) {
+    const start = source.indexOf("\\", cursor);
+    if (start < 0) return output + source.slice(cursor);
+    const delimiter = source[start + 1];
+    if (
+      isEscapedAt(source, start) ||
+      (delimiter !== "(" && delimiter !== "[")
+    ) {
+      output += source.slice(cursor, start + 1);
+      cursor = start + 1;
+      continue;
+    }
+    const closer = delimiter === "(" ? "\\)" : "\\]";
+    let end = source.indexOf(closer, start + 2);
+    while (end >= 0 && isEscapedAt(source, end)) {
+      end = source.indexOf(closer, end + closer.length);
+    }
+    if (end < 0) {
+      output += source.slice(cursor, start + 2);
+      cursor = start + 2;
+      continue;
+    }
+    const expression = source.slice(start + 2, end);
+    output += source.slice(cursor, start);
+    output += delimiter === "("
+      ? `$${expression}$`
+      : `\n\n$$\n${expression.trim()}\n$$\n\n`;
+    cursor = end + closer.length;
+  }
+  return output;
 }
 
 function stripUnresolvedTemplateExpressions(markdown: string): string {

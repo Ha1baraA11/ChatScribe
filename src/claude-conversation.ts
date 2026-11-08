@@ -1,4 +1,5 @@
 import type { ExportMessage } from "./types.ts";
+import type { ExportArtifactData } from "./types.ts";
 
 export interface ClaudeImageReference {
   messageId: string;
@@ -8,6 +9,7 @@ export interface ClaudeImageReference {
 export interface ParsedClaudeConversation {
   messages: ExportMessage[];
   imageReferences: ClaudeImageReference[];
+  artifacts: Record<string, ExportArtifactData>;
   revision: string;
 }
 
@@ -27,10 +29,10 @@ interface ClaudeMessageRecord {
 interface ClaudeArtifactEvent {
   messageId: string;
   artifactId: string;
-  title: string;
+  title?: string;
   language: string;
   command: string;
-  content: string;
+  content?: string;
   oldText?: string;
   newText?: string;
 }
@@ -74,8 +76,8 @@ function getParentReference(message: ClaudeMessageRecord): ClaudeParentReference
   if (parent === undefined) return { kind: "missing" };
   if (typeof parent !== "string") return { kind: "invalid" };
   const normalized = parent.trim();
-  if (!normalized) return { kind: "root" };
-  if (normalized === CLAUDE_ROOT_PARENT_UUID) return { kind: "sentinel-root" };
+  if (!normalized) return { kind: "invalid" };
+  if (normalized.toLowerCase() === CLAUDE_ROOT_PARENT_UUID) return { kind: "sentinel-root" };
   return { kind: "parent", id: normalized };
 }
 
@@ -112,15 +114,20 @@ function getActiveMessages(value: unknown): {
   let leafId = explicitLeaf;
   const parentReferences = messages.map(getParentReference);
   const hasParentLinks = parentReferences.some((parent) => parent.kind === "parent");
-  const hasClaudeRootMarker = parentReferences.some((parent) => parent.kind === "sentinel-root");
-  const linearFallback = !hasParentLinks && !hasClaudeRootMarker;
+  const hasExplicitStructure = parentReferences.some((parent) =>
+    parent.kind === "parent" || parent.kind === "root" || parent.kind === "sentinel-root"
+  );
+  const hasInvalidParent = parentReferences.some((parent) => parent.kind === "invalid");
+  const legacyLinearFallback = !hasExplicitStructure && !hasInvalidParent;
+  const nullRootCount = parentReferences.filter((parent) => parent.kind === "root").length;
+  const hasSentinelRoot = parentReferences.some((parent) => parent.kind === "sentinel-root");
 
   if (!leafId) {
-    if (!linearFallback) {
+    if (!legacyLinearFallback) {
       throw new Error("Claude did not identify the active conversation branch.");
     }
     leafId = getMessageId(messages.at(-1) ?? {});
-  } else if (!hasParentLinks && leafId !== getMessageId(messages.at(-1) ?? {})) {
+  } else if (legacyLinearFallback && leafId !== getMessageId(messages.at(-1) ?? {})) {
     throw new Error("Claude did not return enough structure to verify the active branch.");
   }
 
@@ -128,7 +135,7 @@ function getActiveMessages(value: unknown): {
     throw new Error("Claude's active branch marker does not match its returned messages.");
   }
 
-  if (linearFallback) return { messages, leafId };
+  if (legacyLinearFallback) return { messages, leafId };
 
   const reversed: ClaudeMessageRecord[] = [];
   const visited = new Set<string>();
@@ -159,6 +166,24 @@ function getActiveMessages(value: unknown): {
   }
 
   const active = reversed.reverse();
+  const activeIds = new Set(active.map(getMessageId));
+  const hasUnknownOffBranchParent = messages.some((message, index) =>
+    !activeIds.has(getMessageId(message)) &&
+    (parentReferences[index].kind === "missing" || parentReferences[index].kind === "invalid")
+  );
+
+  // Multiple explicit null roots without ancestry links do not identify one
+  // trustworthy path. A virtual-root marker is different: the active leaf can
+  // be traced to its own sentinel-rooted branch. Unknown parent fields outside
+  // an otherwise valid active path still make the returned roots ambiguous.
+  if (
+    !hasParentLinks &&
+    (nullRootCount > 1 || (nullRootCount > 0 && hasSentinelRoot) ||
+      (hasExplicitStructure && hasUnknownOffBranchParent))
+  ) {
+    throw new Error("Claude returned ambiguous conversation roots.");
+  }
+
   const childCounts = new Map<string, number>();
   for (const message of messages) {
     const parent = getParentId(message);
@@ -217,13 +242,15 @@ function artifactEventFromBlock(
   const command = stringValue(input.command || input.action).toLowerCase();
   if (!artifactId || !["create", "update", "rewrite"].includes(command)) return null;
 
+  const titleValue = stringValue(input.title || input.name).trim();
+
   return {
     messageId,
     artifactId,
-    title: stringValue(input.title || input.name) || "Untitled Artifact",
+    ...(titleValue ? { title: titleValue } : {}),
     language: stringValue(input.language || input.type),
     command,
-    content: stringValue(input.content),
+    ...(typeof input.content === "string" ? { content: input.content } : {}),
     ...(typeof input.old_str === "string" ? { oldText: input.old_str } : {}),
     ...(typeof input.new_str === "string" ? { newText: input.new_str } : {}),
   };
@@ -244,7 +271,16 @@ function formatArtifactBlock(state: ClaudeArtifactState): string {
     return `**Artifact: ${title} (final contents unavailable)**`;
   }
 
-  const longestFence = Math.max(0, ...Array.from(state.content.matchAll(/`+/g), (m) => m[0].length));
+  let longestFence = 0;
+  let currentFence = 0;
+  for (const character of state.content) {
+    if (character === "`") {
+      currentFence++;
+      longestFence = Math.max(longestFence, currentFence);
+    } else {
+      currentFence = 0;
+    }
+  }
   const fence = "`".repeat(Math.max(3, longestFence + 1));
   const language = /^[\p{L}\p{N}_+-]+$/u.test(state.language)
     ? state.language
@@ -254,9 +290,12 @@ function formatArtifactBlock(state: ClaudeArtifactState): string {
 
 function buildArtifactContent(
   activeMessages: ClaudeMessageRecord[],
-): Map<string, string[]> {
+): {
+  referencesByMessage: Map<string, string[]>;
+  artifacts: Record<string, ExportArtifactData>;
+} {
   const states = new Map<string, ClaudeArtifactState>();
-  const eventsByMessage = new Map<string, ClaudeArtifactEvent[]>();
+  const referencesByMessage = new Map<string, string[]>();
 
   for (const message of activeMessages) {
     const messageId = getMessageId(message);
@@ -264,14 +303,14 @@ function buildArtifactContent(
     for (const block of message.content) {
       const event = artifactEventFromBlock(messageId, block);
       if (!event) continue;
-      const events = eventsByMessage.get(messageId) ?? [];
-      events.push(event);
-      eventsByMessage.set(messageId, events);
+      const references = referencesByMessage.get(messageId) ?? [];
+      if (!references.includes(event.artifactId)) references.push(event.artifactId);
+      referencesByMessage.set(messageId, references);
 
       let state = states.get(event.artifactId);
       if (!state) {
         state = {
-          title: event.title,
+          title: event.title ?? "Untitled Artifact",
           language: event.language,
           content: null,
           failed: false,
@@ -284,12 +323,12 @@ function buildArtifactContent(
       state.events.push(event);
 
       if (event.command === "create" || event.command === "rewrite") {
-        state.content = event.content || null;
+        state.content = event.content ?? null;
         state.failed = state.content === null;
         continue;
       }
 
-      if (state.content === null || !event.oldText || event.newText === undefined) {
+      if (state.content === null || event.oldText === undefined || event.newText === undefined) {
         state.failed = true;
         state.content = null;
         continue;
@@ -305,20 +344,18 @@ function buildArtifactContent(
     }
   }
 
-  const additions = new Map<string, string[]>();
+  const artifacts: Record<string, ExportArtifactData> = {};
   for (const state of states.values()) {
-    const lastEvent = state.events.at(-1);
-    if (!lastEvent) continue;
-    for (const event of state.events) {
-      const content = event === lastEvent
-        ? formatArtifactBlock(state)
-        : `**Artifact: ${escapeMarkdownInline(safeArtifactTitle(state.title))} (modified later; final version appears below)**`;
-      const list = additions.get(event.messageId) ?? [];
-      list.push(content);
-      additions.set(event.messageId, list);
-    }
+    artifacts[state.events[0].artifactId] = {
+      title: safeArtifactTitle(state.title),
+      language: state.language,
+      content: state.content,
+      failed: state.failed,
+      finalBlock: formatArtifactBlock(state),
+      modifiedLaterBlock: `**Artifact: ${escapeMarkdownInline(safeArtifactTitle(state.title))} (modified later; final version appears below)**`,
+    };
   }
-  return additions;
+  return { referencesByMessage, artifacts };
 }
 
 function findImageUrls(value: unknown, output: Set<string>): void {
@@ -350,6 +387,31 @@ function findImageUrls(value: unknown, output: Set<string>): void {
     }
   };
   visit(value, 0);
+}
+
+function countImageResources(...values: unknown[]): number {
+  const seen = new WeakSet<object>();
+  let count = 0;
+  const visit = (current: unknown, depth: number): void => {
+    if (depth > 8 || current === null || typeof current !== "object") return;
+    if (seen.has(current)) return;
+    seen.add(current);
+    if (Array.isArray(current)) {
+      for (const item of current) visit(item, depth + 1);
+      return;
+    }
+    const record = current as Record<string, unknown>;
+    const type = stringValue(record.type).toLowerCase();
+    const fileKind = stringValue(record.file_kind).toLowerCase();
+    if (type === "image" || fileKind === "image") count++;
+    for (const [key, child] of Object.entries(record)) {
+      if (["content", "attachments", "files", "source", "image", "images"].includes(key)) {
+        visit(child, depth + 1);
+      }
+    }
+  };
+  values.forEach((value) => visit(value, 0));
+  return count;
 }
 
 function findAttachmentNotes(message: ClaudeMessageRecord): string[] {
@@ -473,7 +535,8 @@ export function parseClaudeConversation(
   }
 
   const { messages: activeMessages, leafId } = getActiveMessages(value);
-  const artifactContent = buildArtifactContent(activeMessages);
+  const { referencesByMessage: artifactReferencesByMessage, artifacts } =
+    buildArtifactContent(activeMessages);
   const imageReferences: ClaudeImageReference[] = [];
   const exportMessages: ExportMessage[] = [];
 
@@ -500,15 +563,18 @@ export function parseClaudeConversation(
       }
     }
 
-    const artifactBlocks = artifactContent.get(id) ?? [];
+    const artifactReferences = artifactReferencesByMessage.get(id) ?? [];
     const attachmentNotes = findAttachmentNotes(message);
     bodyParts.push(...attachmentNotes);
-    bodyParts.push(...artifactBlocks);
 
     const urls = new Set<string>();
     findImageUrls(message.content, urls);
     findImageUrls(message.attachments, urls);
     findImageUrls(message.files, urls);
+    const imageCount = Math.max(
+      urls.size,
+      countImageResources(message.content, message.attachments, message.files),
+    );
     for (const rawUrl of urls) {
       try {
         const imageUrl = new URL(rawUrl, "https://claude.ai");
@@ -529,11 +595,15 @@ export function parseClaudeConversation(
     }
 
     const content = bodyParts.filter(Boolean).join("\n\n");
-    if (!content.trim() && urls.size === 0) continue;
+    if (!content.trim() && imageCount === 0 && artifactReferences.length === 0) continue;
     exportMessages.push({
       id,
       role,
       content,
+      ...(artifactReferences.length > 0
+        ? { artifactBaseContent: content, artifactReferences }
+        : {}),
+      ...(imageCount > 0 ? { imageCount } : {}),
       index: exportMessages.length,
       imagePaths: [],
       ...(getTimestamp(message.created_at) !== undefined
@@ -546,21 +616,73 @@ export function parseClaudeConversation(
     throw new Error("No messages found in this Claude conversation.");
   }
 
+  const materializedMessages = materializeClaudeArtifactSelection(
+    exportMessages,
+    artifacts,
+  );
+
   const revisionSource = [
     responseId || "",
     leafId,
-    activeMessages.map((message) => [
-      getMessageId(message),
-      getParentId(message),
-      stringValue(message.sender),
-      stringValue(message.status),
-      message.truncated === true,
-      message.content ?? message.text ?? null,
-    ]),
+    activeMessages.map((message) => {
+      const imageUrls = new Set<string>();
+      findImageUrls(message.content, imageUrls);
+      findImageUrls(message.attachments, imageUrls);
+      findImageUrls(message.files, imageUrls);
+      return [
+        getMessageId(message),
+        getParentReference(message),
+        stringValue(message.sender),
+        stringValue(message.status),
+        stringValue(message.stop_reason),
+        message.truncated === true,
+        // Keep both fields: Claude may return an empty structured body while
+        // the exported text is available in the fallback field.
+        message.content ?? null,
+        message.text ?? null,
+        findAttachmentNotes(message),
+        Math.max(
+          imageUrls.size,
+          countImageResources(message.content, message.attachments, message.files),
+        ),
+        [...imageUrls].sort(),
+        getTimestamp(message.created_at) ?? null,
+      ];
+    }),
   ];
   const revision = fingerprint(revisionSource);
 
-  return { messages: exportMessages, imageReferences, revision };
+  return { messages: materializedMessages, imageReferences, artifacts, revision };
+}
+
+/** Rebuild Artifact blocks for only the messages included in one export. */
+export function materializeClaudeArtifactSelection(
+  messages: ExportMessage[],
+  artifacts: Record<string, ExportArtifactData> = {},
+): ExportMessage[] {
+  const lastReferenceIndex = new Map<string, number>();
+  messages.forEach((message, index) => {
+    for (const artifactId of message.artifactReferences ?? []) {
+      lastReferenceIndex.set(artifactId, index);
+    }
+  });
+
+  return messages.map((message, index) => {
+    if (!message.artifactReferences?.length || message.artifactBaseContent === undefined) {
+      return message;
+    }
+    const blocks = message.artifactReferences.flatMap((artifactId) => {
+      const artifact = artifacts[artifactId];
+      if (!artifact) return [];
+      return [lastReferenceIndex.get(artifactId) === index
+        ? artifact.finalBlock
+        : artifact.modifiedLaterBlock];
+    });
+    return {
+      ...message,
+      content: [message.artifactBaseContent, ...blocks].filter(Boolean).join("\n\n"),
+    };
+  });
 }
 
 export function getClaudeConversationId(url: string): string | null {

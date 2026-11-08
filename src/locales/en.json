@@ -1,6 +1,9 @@
 {
   "popup.copy": "Copy Conversation",
   "popup.copyLatest": "Copy latest answer",
+  "popup.copyLatest.status.preparing": "Preparing the latest answer…",
+  "popup.copyLatest.status.checking": "Checking for a newer answer…",
+  "popup.copyLatest.status.writing": "Copying to clipboard…",
   "popup.copySelect": "Choose messages…",
   "popup.copyOptions.toggle": "More copy options",
   "popup.copyOptions.group": "Copy options",
@@ -69,6 +72,7 @@
   "popup.error.noCopyableContent": "No copyable text in the selected messages",
   "popup.error.copyFailed": "Could not copy Markdown",
   "popup.error.githubFailed": "Could not save to GitHub",
+  "popup.error.githubTooLarge": "This export exceeds ChatScribe's GitHub save limit. Download it locally, then upload it to GitHub.",
   "options.title": "ChatScribe Settings",
   "options.subtitle": "Customize ChatScribe's appearance and export behavior.",
   "options.preferences.legend": "Preferences",

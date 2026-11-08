@@ -25,9 +25,25 @@ import {
   type ExportFormat,
 } from "./formatter.ts";
 import { buildZipBlob, blobToBase64 } from "./zip.ts";
-import { selectHydratedExport } from "./export-selection.ts";
+import {
+  assertGitHubPayloadSize,
+  base64LengthForByteCount,
+  base64LengthForText,
+} from "./export-limits.ts";
+import {
+  assertSelectedMessagesUnchanged,
+  captureSelectedMessageSnapshots,
+  selectHydratedExport,
+} from "./export-selection.ts";
 import { getInitialSelectorScrollPosition } from "./selector-scroll.ts";
-import { getClaudeConversationId } from "./claude-conversation.ts";
+import {
+  getClaudeConversationId,
+  materializeClaudeArtifactSelection,
+} from "./claude-conversation.ts";
+import {
+  runLatestCopyTransaction,
+  type LatestCopyRevisionResponse,
+} from "./latest-copy-transaction.ts";
 import {
   CONTENT_LOAD_TYPE,
   CONTENT_CHECK_REVISION_TYPE,
@@ -102,6 +118,8 @@ const copyLatestBtn = $id<HTMLButtonElement>("copy-latest");
 const copySelectBtn = $id<HTMLButtonElement>("copy-select");
 const copyControl = $id<HTMLDivElement>("copy-control");
 const copyOptions = $id<HTMLDivElement>("copy-options");
+const latestCopyStatus = $id<HTMLDivElement>("copy-latest-status");
+const latestCopyStatusMessage = $id<HTMLSpanElement>("copy-latest-status-message");
 const exportBtn = $id<HTMLButtonElement>("export-btn");
 const optionsLink = $id<HTMLAnchorElement>("options-link");
 const claudePermissionCard = $id<HTMLDivElement>("claude-permission");
@@ -154,10 +172,15 @@ const ALL_BUTTONS = [
 // -----------------------------------------------------------------------
 
 let conversationData: ConversationData | null = null;
+let conversationThinkingSetting: boolean | null = null;
+let conversationDownloadImages: boolean | null = null;
 let settings: Settings | null = null;
 let pageTitle = "ChatGPT Conversation";
 let sourceTabId: number | null = null;
 let sourceConversationId: string | null = null;
+type ConversationProvider = "chatgpt" | "claude";
+let sourceProvider: ConversationProvider | null = null;
+let latestCopyInFlight = false;
 let loadSequence = 0;
 let githubReturnSelection: Set<string> | null = null;
 let selectorRevisionCheckTimer: number | undefined;
@@ -170,9 +193,97 @@ let selectorWatchTabId: number | null = null;
 const PANEL_TARGET_TAB_KEY = "chatscribePanelTargetTabId";
 const SELECTOR_REVISION_RETRY_DELAYS_MS = [5_000, 10_000, 20_000, 30_000];
 
+interface ExportOperationContext {
+  provider: ConversationProvider;
+  tabId: number;
+  conversationId: string | null;
+  revision?: string;
+  loadSequence: number;
+  title: string;
+  selectedIds: string[];
+  selectedSnapshots: Map<string, string>;
+  knownMessageIds: Set<string>;
+}
+
+function captureExportContext(
+  messages: ExportMessage[],
+  sourceData: ConversationData | null = conversationData,
+): ExportOperationContext {
+  if (sourceTabId === null || sourceProvider === null || !sourceData) {
+    throw new Error(t("popup.error.loadFailed"));
+  }
+  return {
+    provider: sourceProvider,
+    tabId: sourceTabId,
+    conversationId: sourceConversationId,
+    revision: sourceData.revision,
+    loadSequence,
+    title: pageTitle,
+    selectedIds: messages.map((message) => message.id),
+    selectedSnapshots: captureSelectedMessageSnapshots(messages),
+    knownMessageIds: new Set(sourceData.messages.map((message) => message.id)),
+  };
+}
+
+async function assertExportContext(
+  context: ExportOperationContext,
+  candidateData?: ConversationData,
+  verifySourceRevision = false,
+): Promise<void> {
+  if (
+    loadSequence !== context.loadSequence ||
+    sourceTabId !== context.tabId ||
+    sourceConversationId !== context.conversationId ||
+    sourceProvider !== context.provider
+  ) {
+    throw new Error("The conversation changed while the export was being prepared. Select the messages again.");
+  }
+
+  const tab = await chrome.tabs.get(context.tabId);
+  if (
+    getConversationProvider(tab.url) !== context.provider ||
+    getConversationIdFromUrl(tab.url) !== context.conversationId
+  ) {
+    throw new Error("The conversation changed while the export was being prepared. Select the messages again.");
+  }
+
+  const currentData = candidateData ?? conversationData;
+  if (currentData) {
+    assertSelectedMessagesUnchanged(
+      context.selectedSnapshots,
+      currentData,
+      context.revision,
+    );
+  }
+
+  if (verifySourceRevision) {
+    if (!context.revision) {
+      throw new Error("Could not verify the active conversation branch before export.");
+    }
+    const currentHead = await requestConversationRevision(context.tabId);
+    if (!currentHead.success || !currentHead.revision) {
+      throw new Error(currentHead.error ?? "Could not verify the active conversation branch before export.");
+    }
+    if (
+      currentHead.conversationId !== context.conversationId ||
+      currentHead.revision !== context.revision
+    ) {
+      throw new Error("The conversation branch changed while the export was being prepared. Select the messages again.");
+    }
+    if (loadSequence !== context.loadSequence || sourceTabId !== context.tabId) {
+      throw new Error("The conversation changed while the export was being prepared. Select the messages again.");
+    }
+  }
+}
+
+function isExportContextChanged(error: unknown): boolean {
+  return error instanceof Error && /conversation|branch|selected message/i.test(error.message) &&
+    /changed/i.test(error.message);
+}
+
 function isMissingReceiver(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /receiving end does not exist|no receiver|could not establish connection/i
+  return /receiving end does not exist|no receiver|could not establish connection|could not reconnect/i
     .test(message);
 }
 
@@ -247,10 +358,17 @@ async function requestConversation(
 async function requestConversationRevision(
   tabId: number,
   ensureContentScript = true,
+  options: {
+    knownRevision?: string;
+    returnDataIfChanged?: boolean;
+    includeClaudeThinking?: boolean;
+  } = {},
 ): Promise<{
   success: boolean;
   conversationId?: string;
   revision?: string;
+  changed?: boolean;
+  data?: ConversationData;
   error?: string;
 }> {
   if (ensureContentScript) {
@@ -264,12 +382,17 @@ async function requestConversationRevision(
   }
 
   try {
-    return await chrome.tabs.sendMessage(tabId, {
+    const response = await chrome.tabs.sendMessage(tabId, {
       type: CONTENT_CHECK_REVISION_TYPE,
+      ...options,
     });
+    if (response === undefined || response === null) {
+      throw new Error("ChatScribe could not reconnect to this tab.");
+    }
+    return response;
   } catch (error) {
     if (isMissingReceiver(error)) {
-      if (!ensureContentScript) return requestConversationRevision(tabId, true);
+      if (!ensureContentScript) return requestConversationRevision(tabId, true, options);
       throw new Error("ChatScribe could not reconnect to this tab.");
     }
     throw error;
@@ -361,6 +484,16 @@ function setBusy(busy: boolean): void {
   ALL_BUTTONS.forEach((b) => { b.disabled = busy; });
 }
 
+function setLatestCopyStatus(phase: "preparing" | "checking" | "writing" | null): void {
+  if (!phase) {
+    latestCopyStatus.hidden = true;
+    latestCopyStatusMessage.textContent = "";
+    return;
+  }
+  latestCopyStatusMessage.textContent = t(`popup.copyLatest.status.${phase}`);
+  latestCopyStatus.hidden = false;
+}
+
 // -----------------------------------------------------------------------
 // LOADING OVERLAY
 // -----------------------------------------------------------------------
@@ -418,7 +551,11 @@ async function loadConversationForTab(tabId: number): Promise<void> {
   if (requestId !== loadSequence) return;
   sourceTabId = tabId;
   sourceConversationId = null;
+  sourceProvider = null;
   conversationData = null;
+  conversationThinkingSetting = null;
+  conversationDownloadImages = null;
+  setLatestCopyStatus(null);
   closeSelector();
   showLoading(t("popup.loading"));
 
@@ -428,6 +565,7 @@ async function loadConversationForTab(tabId: number): Promise<void> {
     if (!provider) {
       throw new Error(t("popup.error.notSupportedSite"));
     }
+    sourceProvider = provider;
     if (
       provider === "claude" &&
       !await chrome.permissions.contains({ origins: ["https://claude.ai/*"] })
@@ -458,6 +596,8 @@ async function loadConversationForTab(tabId: number): Promise<void> {
 
     const loaded = response.data;
     conversationData = loaded;
+    conversationThinkingSetting = settings?.includeClaudeThinking ?? false;
+    conversationDownloadImages = settings?.downloadImages ?? false;
     if (loaded.messages.length === 0) {
       throw new Error(t("popup.error.noMessages"));
     }
@@ -608,7 +748,8 @@ async function copyFullConversation(): Promise<void> {
     settings = copySettings;
 
     const tab = await chrome.tabs.get(tabId);
-    if (!getConversationProvider(tab.url)) {
+    const provider = getConversationProvider(tab.url);
+    if (!provider) {
       throw new Error(t("popup.error.notSupportedSite"));
     }
     const response = await requestConversation(
@@ -629,10 +770,14 @@ async function copyFullConversation(): Promise<void> {
     }
 
     conversationData = response.data;
+    conversationThinkingSetting = copySettings.includeClaudeThinking;
+    conversationDownloadImages = copySettings.downloadImages;
+    sourceProvider = provider;
     sourceConversationId = getConversationIdFromUrl(tab.url);
     pageTitle = tab.title ?? pageTitle;
     hideLoading();
-    await copyMessages(response.data.messages, { title: pageTitle });
+    const context = captureExportContext(response.data.messages);
+    await copyMessages(response.data.messages, { title: context.title }, context);
   } catch (error) {
     if (requestId !== loadSequence || sourceTabId !== tabId) return;
     devError("Failed to refresh conversation before copying:", error);
@@ -659,25 +804,74 @@ copyLatestBtn.addEventListener("click", () => {
 });
 
 async function copyLatestAnswer(): Promise<void> {
+  if (latestCopyInFlight) return;
   const tabId = sourceTabId;
-  const copySettings = settings;
   const requestId = loadSequence;
-  if (tabId === null || !copySettings) {
+  if (tabId === null || !settings) {
     showToast(t("popup.error.loadFailed"));
     return;
   }
 
+  latestCopyInFlight = true;
   setBusy(true);
-  showLoading(t("popup.loading"));
+  setLatestCopyStatus("preparing");
   try {
+    const copySettings = await loadSettings();
+    if (requestId !== loadSequence || sourceTabId !== tabId) return;
+    settings = copySettings;
+
     const tab = await chrome.tabs.get(tabId);
-    if (!getConversationProvider(tab.url)) {
+    const provider = getConversationProvider(tab.url);
+    if (!provider) {
       throw new Error(t("popup.error.notSupportedSite"));
     }
+    const conversationId = getConversationIdFromUrl(tab.url);
+    pageTitle = tab.title ?? pageTitle;
+    if (provider === "claude" && conversationId) {
+      hideLoading();
+      setLatestCopyStatus("preparing");
+      await copyLatestClaudeAnswer(tabId, conversationId, copySettings, requestId);
+      return;
+    }
+    if (provider === "chatgpt" && conversationId) {
+      hideLoading();
+      setLatestCopyStatus("preparing");
+      await copyLatestChatGptAnswer(tabId, conversationId, copySettings, requestId);
+      return;
+    }
+    throw new Error(t("popup.error.loadFailed"));
+  } catch (error) {
+    if (requestId !== loadSequence || sourceTabId !== tabId) return;
+    devError("Failed to refresh conversation for latest-answer copy:", error);
+    const message = error instanceof Error ? error.message : "";
+    showToast(message || t("popup.error.loadFailed"), 5000);
+  } finally {
+    latestCopyInFlight = false;
+    if (requestId === loadSequence && sourceTabId === tabId) {
+      hideLoading();
+      setLatestCopyStatus(null);
+      setBusy(false);
+    }
+  }
+}
 
-    // Copying text does not need export-only image fallbacks. Excluding them
-    // also prevents an older unpaired generated image from appearing after
-    // the latest text answer and being mistaken for that answer.
+async function copyLatestClaudeAnswer(
+  tabId: number,
+  conversationId: string,
+  copySettings: Settings,
+  requestId: number,
+): Promise<void> {
+  const cachedData = conversationData;
+  let initialData = cachedData;
+  const canUseCachedData =
+    sourceProvider === "claude" &&
+    sourceTabId === tabId &&
+    sourceConversationId === conversationId &&
+    cachedData?.revision &&
+    conversationThinkingSetting === copySettings.includeClaudeThinking;
+
+  if (!canUseCachedData || !initialData) {
+    setLatestCopyStatus("preparing");
     const response = await requestConversation(
       tabId,
       false,
@@ -694,32 +888,155 @@ async function copyLatestAnswer(): Promise<void> {
     if (response.data.messages.length === 0) {
       throw new Error(t("popup.error.noMessages"));
     }
-
-    conversationData = response.data;
-    pageTitle = tab.title ?? pageTitle;
-    const latestAnswer = [...response.data.messages]
-      .reverse()
-      .find((message) =>
-        message.role === "assistant" && message.content.trim().length > 0
-      );
-    if (!latestAnswer) {
-      showToast(t("popup.error.noAssistantAnswer"));
-      return;
-    }
-
-    hideLoading();
-    await copyMessages([latestAnswer], { includeRoleHeadings: false });
-  } catch (error) {
-    if (requestId !== loadSequence || sourceTabId !== tabId) return;
-    devError("Failed to refresh conversation for latest-answer copy:", error);
-    const message = error instanceof Error ? error.message : "";
-    showToast(message || t("popup.error.loadFailed"), 5000);
-  } finally {
-    if (requestId === loadSequence && sourceTabId === tabId) {
-      hideLoading();
-      setBusy(false);
-    }
+    initialData = response.data;
+    conversationData = initialData;
+    conversationThinkingSetting = copySettings.includeClaudeThinking;
+    conversationDownloadImages = false;
+    sourceProvider = "claude";
+    sourceConversationId = conversationId;
   }
+
+  if (!initialData) throw new Error(t("popup.error.loadFailed"));
+
+  await copyLatestAnswerFromData(
+    "claude",
+    tabId,
+    copySettings,
+    requestId,
+    initialData,
+    async (revision) => {
+      const response = await requestConversationRevision(tabId, false, {
+        knownRevision: revision,
+        returnDataIfChanged: true,
+        includeClaudeThinking: copySettings.includeClaudeThinking,
+      });
+      if (response.success && response.conversationId !== conversationId) {
+        throw new Error("The conversation changed while the latest answer was being prepared.");
+      }
+      return response;
+    },
+  );
+}
+
+async function copyLatestChatGptAnswer(
+  tabId: number,
+  conversationId: string,
+  copySettings: Settings,
+  requestId: number,
+): Promise<void> {
+  const cachedData = conversationData;
+  let initialData = cachedData;
+  const canUseCachedData =
+    sourceProvider === "chatgpt" &&
+    sourceTabId === tabId &&
+    sourceConversationId === conversationId &&
+    Boolean(cachedData?.revision) &&
+    conversationDownloadImages === false;
+
+  if (!canUseCachedData || !initialData) {
+    const response = await requestConversation(
+      tabId,
+      false,
+      false,
+      false,
+      undefined,
+      true,
+      copySettings.includeClaudeThinking,
+    );
+    if (requestId !== loadSequence || sourceTabId !== tabId) return;
+    if (!response?.success || !response.data) {
+      throw new Error(response?.error ?? t("popup.error.loadFailed"));
+    }
+    if (response.data.messages.length === 0) {
+      throw new Error(t("popup.error.noMessages"));
+    }
+    initialData = response.data;
+    conversationData = initialData;
+    conversationThinkingSetting = copySettings.includeClaudeThinking;
+    conversationDownloadImages = false;
+    sourceProvider = "chatgpt";
+    sourceConversationId = conversationId;
+  }
+
+  if (!initialData) throw new Error(t("popup.error.loadFailed"));
+
+  await copyLatestAnswerFromData(
+    "chatgpt",
+    tabId,
+    copySettings,
+    requestId,
+    initialData,
+    async (revision) => {
+      const response = await requestConversationRevision(tabId, false, {
+        knownRevision: revision,
+        returnDataIfChanged: true,
+      });
+      if (response.success && response.conversationId !== conversationId) {
+        throw new Error("The conversation changed while the latest answer was being prepared.");
+      }
+      return response;
+    },
+  );
+}
+
+async function copyLatestAnswerFromData(
+  provider: ConversationProvider,
+  tabId: number,
+  copySettings: Settings,
+  requestId: number,
+  initialData: ConversationData,
+  checkRevision: (revision: string) => Promise<LatestCopyRevisionResponse<ConversationData>>,
+): Promise<void> {
+
+  await runLatestCopyTransaction<ConversationData, {
+    data: ConversationData;
+    context: ExportOperationContext;
+    markdown: string;
+  }>({
+    initialData,
+    getRevision: (data) => data.revision,
+    prepare: async (data) => {
+      if (requestId !== loadSequence || sourceTabId !== tabId) {
+        throw new Error("The conversation changed while the latest answer was being prepared.");
+      }
+      if (data !== conversationData) {
+        conversationData = data;
+        conversationThinkingSetting = copySettings.includeClaudeThinking;
+        conversationDownloadImages = false;
+      }
+      if (data.messages.length === 0) throw new Error(t("popup.error.noMessages"));
+      const latestAnswer = [...data.messages].reverse().find((message) =>
+        message.role === "assistant" &&
+        (message.content.trim().length > 0 ||
+          (provider === "claude" && Boolean(message.imageCount))) &&
+        (provider !== "chatgpt" ||
+          !message.id.startsWith("rendered-generated-image:"))
+      );
+      if (!latestAnswer) throw new Error(t("popup.error.noAssistantAnswer"));
+
+      const selected = provider === "claude"
+        ? materializeClaudeArtifactSelection([latestAnswer], data.artifacts)
+        : [latestAnswer];
+      const context = captureExportContext(selected, data);
+      const prepared = await prepareDiagramMessages(selected, "text", provider);
+      const markdown = formatMarkdown(prepared.messages, copySettings, {
+        includeRoleHeadings: false,
+        title: context.title,
+      });
+      if (!markdown.trim()) throw new Error(t("popup.error.noCopyableContent"));
+      return { data, context, markdown };
+    },
+    check: checkRevision,
+    ensureCurrent: async (prepared) => {
+      if (requestId !== loadSequence || sourceTabId !== tabId) {
+        throw new Error("The conversation changed while the latest answer was being prepared.");
+      }
+      await assertExportContext(prepared.context, prepared.data);
+    },
+    write: async (prepared) => writeClipboard(prepared.markdown),
+    onPhase: setLatestCopyStatus,
+  });
+  showToast(t("popup.toast.copied"));
 }
 
 copySelectBtn.addEventListener("click", () => {
@@ -799,7 +1116,10 @@ exportBtn.addEventListener("click", () => {
   void refreshConversationForSelector(true);
 });
 
-async function refreshConversationForSelector(selectAll: boolean): Promise<void> {
+async function refreshConversationForSelector(
+  selectAll: boolean,
+  selectedIds?: ReadonlySet<string>,
+): Promise<void> {
   const requestId = loadSequence;
   const tabId = sourceTabId;
   if (!settings || tabId === null) return;
@@ -830,9 +1150,12 @@ async function refreshConversationForSelector(selectAll: boolean): Promise<void>
     const tab = await chrome.tabs.get(tabId);
     if (requestId !== loadSequence || sourceTabId !== tabId) return;
     conversationData = response.data;
+    conversationThinkingSetting = selectorSettings.includeClaudeThinking;
+    conversationDownloadImages = selectorSettings.downloadImages;
+    sourceProvider = getConversationProvider(tab.url);
     sourceConversationId = getConversationIdFromUrl(tab.url);
     pageTitle = tab.title ?? pageTitle;
-    openSelector(selectAll);
+    openSelector(selectAll, selectedIds);
   } catch (error) {
     if (requestId !== loadSequence || sourceTabId !== tabId) return;
     const message = error instanceof Error ? error.message : "";
@@ -946,6 +1269,8 @@ function refreshOpenSelector(data: ConversationData): void {
     : undefined;
 
   conversationData = data;
+  conversationThinkingSetting = settings?.includeClaudeThinking ?? conversationThinkingSetting;
+  conversationDownloadImages = settings?.downloadImages ?? conversationDownloadImages;
   populateSelector(data.messages, false, selectedIds);
   selList.scrollTop = wasAtBottom
     ? selList.scrollHeight
@@ -1159,6 +1484,7 @@ function getSelectedMessages(): ExportMessage[] {
 
 async function hydrateSelectedImages(
   messages: ExportMessage[],
+  context: ExportOperationContext,
 ): Promise<{
   messages: ExportMessage[];
   images: ExportImageFile[];
@@ -1169,10 +1495,11 @@ async function hydrateSelectedImages(
     return { messages, images: [] };
   }
 
+  await assertExportContext(context);
   showLoading(t("popup.loadingImages"));
   try {
     const response = await requestConversation(
-      sourceTabId,
+      context.tabId,
       true,
       settings.includeGeneratedImages,
       true,
@@ -1192,9 +1519,12 @@ async function hydrateSelectedImages(
       throw new Error(reason);
     }
 
+    await assertExportContext(context, response.data);
+
     return selectHydratedExport(
       response.data,
       new Set(messages.map((message) => message.id)),
+      context.knownMessageIds,
     );
   } finally {
     hideLoading();
@@ -1343,7 +1673,10 @@ function buildImageExportDiagnosticsForArchive(
 async function prepareDiagramMessages(
   messages: ExportMessage[],
   mode: SvgDiagramMode,
+  provider: ConversationProvider,
 ): Promise<{ messages: ExportMessage[]; assets: ExportImageFile[] }> {
+  if (provider === "claude") return { messages, assets: [] };
+
   if (mode === "none") {
     // Even when diagram rendering is disabled, normalize ChatGPT component
     // markup so unsupported widgets such as <LearningViz .../> do not leak
@@ -1398,6 +1731,8 @@ async function exportSelected(): Promise<void> {
 
   let chosen = getSelectedMessages();
   if (chosen.length === 0) return;
+  const context = captureExportContext(chosen);
+  chosen = materializeClaudeArtifactSelection(chosen, conversationData.artifacts);
 
   let imageDiagnostics: ImageExportDiagnostics | undefined;
   setBusy(true);
@@ -1405,6 +1740,7 @@ async function exportSelected(): Promise<void> {
 
   try {
     settings = await loadSettings();
+    await assertExportContext(context);
     const fmt = selFormatSelect.value as ExportFormat;
     const diagramMode: SvgDiagramMode =
       fmt === "md" ? "assets" : fmt === "txt" ? "text" : "none";
@@ -1412,14 +1748,16 @@ async function exportSelected(): Promise<void> {
     let selectedImages: ExportImageFile[] = [];
     let messageQuestionNumbersById: Record<string, number> | undefined;
     if (fmt === "md" && settings.downloadImages && sourceTabId !== null) {
-      const hydrated = await hydrateSelectedImages(chosen);
+      const hydrated = await hydrateSelectedImages(chosen, context);
       chosen = hydrated.messages;
       selectedImages = hydrated.images;
       imageDiagnostics = hydrated.imageDiagnostics;
       messageQuestionNumbersById = hydrated.messageQuestionNumbersById;
     }
 
-    const prepared = await prepareDiagramMessages(chosen, diagramMode);
+    await assertExportContext(context);
+    const prepared = await prepareDiagramMessages(chosen, diagramMode, context.provider);
+    await assertExportContext(context);
     const exportMessages = prepared.messages;
     const images = [...selectedImages, ...prepared.assets];
     const hasImages = images.length > 0;
@@ -1430,9 +1768,9 @@ async function exportSelected(): Promise<void> {
 
     if (fmt === "md" && (hasImages || imageDiagnostics)) {
       // Bundle Markdown + images into ZIP
-      const md = formatMarkdown(exportMessages, settings, { title: pageTitle });
-      const mdFilename = buildFilename(pageTitle, "md", settings.filenameTemplate, exportTime);
-      filename = buildFilename(pageTitle, "zip", settings.filenameTemplate, exportTime);
+      const md = formatMarkdown(exportMessages, settings, { title: context.title });
+      const mdFilename = buildFilename(context.title, "md", settings.filenameTemplate, exportTime);
+      filename = buildFilename(context.title, "zip", settings.filenameTemplate, exportTime);
       const archiveDiagnostics = buildImageExportDiagnosticsForArchive(
         imageDiagnostics,
         md,
@@ -1447,7 +1785,7 @@ async function exportSelected(): Promise<void> {
 
       switch (fmt) {
         case "md":
-          text = formatMarkdown(exportMessages, settings, { title: pageTitle });
+          text = formatMarkdown(exportMessages, settings, { title: context.title });
           ext = "md";
           break;
         case "txt":
@@ -1467,29 +1805,33 @@ async function exportSelected(): Promise<void> {
           ext = "md";
       }
 
-      filename = buildFilename(pageTitle, ext, settings.filenameTemplate, exportTime);
+      filename = buildFilename(context.title, ext, settings.filenameTemplate, exportTime);
       blob = new Blob([text], { type: getExportMimeType(fmt) });
     }
 
     const objectUrl = URL.createObjectURL(blob);
 
-    const dlResponse = await chrome.runtime.sendMessage({
-      type: "TRACKED_DOWNLOAD",
-      url: objectUrl,
-      filename: settings.promptToSave
-        ? filename
-        : buildDownloadPath(filename, settings.downloadSubfolder),
-      saveAs: settings.promptToSave,
-    }) as { success?: boolean; error?: string } | undefined;
-    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
+    try {
+      await assertExportContext(context, undefined, true);
+      const dlResponse = await chrome.runtime.sendMessage({
+        type: "TRACKED_DOWNLOAD",
+        url: objectUrl,
+        filename: settings.promptToSave
+          ? filename
+          : buildDownloadPath(filename, settings.downloadSubfolder),
+        saveAs: settings.promptToSave,
+      }) as { success?: boolean; error?: string } | undefined;
 
-    if (!dlResponse?.success) {
-      const reason = dlResponse?.error ??
-        "Chrome did not start the export download.";
-      throw new ImageExportFailure(reason, imageDiagnostics, "archive-download");
+      if (!dlResponse?.success) {
+        const reason = dlResponse?.error ??
+          "Chrome did not start the export download.";
+        throw new ImageExportFailure(reason, imageDiagnostics, "archive-download");
+      }
+
+      showToast(t("popup.toast.downloadStarted"));
+    } finally {
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
     }
-
-    showToast(t("popup.toast.downloadStarted"));
 
   } catch (err) {
     hideLoading();
@@ -1519,6 +1861,9 @@ async function exportSelected(): Promise<void> {
     } else {
       showToast(`${t("popup.toast.downloadFailed")}: ${reason}`, 6000);
     }
+    if (isExportContextChanged(err) && sourceTabId === context.tabId) {
+      await refreshConversationForSelector(false, new Set(context.selectedIds));
+    }
   } finally {
     setBusy(false);
   }
@@ -1529,13 +1874,15 @@ async function copySelected(): Promise<void> {
 
   let chosen = getSelectedMessages();
   if (chosen.length === 0) return;
-
-  await copyMessages(chosen, { title: pageTitle });
+  const context = captureExportContext(chosen);
+  chosen = materializeClaudeArtifactSelection(chosen, conversationData.artifacts);
+  await copyMessages(chosen, { title: context.title }, context);
 }
 
 async function copyMessages(
   messages: ExportMessage[],
   options: { includeRoleHeadings?: boolean; title?: string } = {},
+  context: ExportOperationContext,
 ): Promise<void> {
   if (!settings || messages.length === 0) return;
 
@@ -1543,17 +1890,23 @@ async function copyMessages(
   closeSelector();
 
   try {
-    const prepared = await prepareDiagramMessages(messages, "text");
+    await assertExportContext(context);
+    const prepared = await prepareDiagramMessages(messages, "text", context.provider);
+    await assertExportContext(context);
     const markdown = formatMarkdown(prepared.messages, settings, options);
     if (!markdown.trim()) {
       showToast(t("popup.error.noCopyableContent"));
       return;
     }
+    await assertExportContext(context, undefined, true);
     await writeClipboard(markdown);
     showToast(t("popup.toast.copied"));
   } catch (err) {
     devError("Copy failed:", err);
-    showToast(t("popup.toast.copyFailed"), 3500);
+    showToast(err instanceof Error ? err.message : t("popup.toast.copyFailed"), 5000);
+    if (isExportContextChanged(err) && sourceTabId === context.tabId) {
+      await refreshConversationForSelector(false, new Set(context.selectedIds));
+    }
   } finally {
     setBusy(false);
   }
@@ -1666,42 +2019,55 @@ async function saveToGitHub(): Promise<void> {
 
   let chosen = getSelectedMessages();
   if (chosen.length === 0) return;
+  const context = captureExportContext(chosen);
+  chosen = materializeClaudeArtifactSelection(chosen, conversationData?.artifacts);
 
   setBusy(true);
   githubPanelSave.textContent = t("popup.github.saving");
 
   try {
-    const hydrated = await hydrateSelectedImages(chosen);
+    await assertExportContext(context);
+    const hydrated = await hydrateSelectedImages(chosen, context);
     chosen = hydrated.messages;
-    const prepared = await prepareDiagramMessages(chosen, "assets");
+    await assertExportContext(context);
+    const prepared = await prepareDiagramMessages(chosen, "assets", context.provider);
+    await assertExportContext(context);
     const images = [...hydrated.images, ...prepared.assets];
     const hasImages = images.length > 0;
     const exportTime = new Date();
 
-    const md = formatMarkdown(prepared.messages, settings, { title: pageTitle });
-    const mdFilename = buildFilename(pageTitle, "md", settings.filenameTemplate, exportTime);
+    const md = formatMarkdown(prepared.messages, settings, { title: context.title });
+    const mdFilename = buildFilename(context.title, "md", settings.filenameTemplate, exportTime);
 
     let filename: string;
     let content: string;
     let isBinary = false;
 
     if (hasImages) {
-      filename = buildFilename(pageTitle, "zip", settings.filenameTemplate, exportTime);
+      filename = buildFilename(context.title, "zip", settings.filenameTemplate, exportTime);
       const zipBlob = buildZipBlob(md, mdFilename, images);
+      assertGitHubPayloadSize(base64LengthForByteCount(zipBlob.size));
       content = await blobToBase64(zipBlob);
       isBinary = true;
     } else {
       filename = mdFilename;
       content = md;
+      assertGitHubPayloadSize(base64LengthForText(content));
     }
 
+    assertGitHubPayloadSize(isBinary ? content.length : base64LengthForText(content));
+    await assertExportContext(context, undefined, true);
     const saveResp = await chrome.runtime.sendMessage({
       type: "GITHUB_SAVE_FILE",
       fullName,
       filename,
       content,
       isBinary,
-    }) as { success: boolean; error?: string; data?: { htmlUrl: string } } | undefined;
+    }) as {
+      success: boolean;
+      error?: string;
+      data?: { htmlUrl: string; path?: string; filename?: string };
+    } | undefined;
 
     if (!saveResp?.success) {
       throw new Error(saveResp?.error ?? t("popup.error.githubFailed"));
@@ -1710,7 +2076,9 @@ async function saveToGitHub(): Promise<void> {
     devLog("GitHub save complete:", saveResp.data?.htmlUrl);
 
     githubPanel.classList.remove("open");
-    showToast(t("popup.toast.githubSaved"));
+    showToast(saveResp.data?.path
+      ? `${t("popup.toast.githubSaved")} — ${saveResp.data.path}`
+      : t("popup.toast.githubSaved"));
     void sendToPage({
       type: "SHOW_EXPORT_SUCCESS",
       message: t("popup.toast.githubSaved"),
@@ -1718,7 +2086,13 @@ async function saveToGitHub(): Promise<void> {
   } catch (err) {
     devError("GitHub save failed:", err);
     const msg = err instanceof Error ? err.message : String(err);
-    showToast(msg.length < 70 ? msg : t("popup.toast.githubFailed"), 3500);
+    showToast(msg === "GITHUB_PAYLOAD_TOO_LARGE"
+      ? t("popup.error.githubTooLarge")
+      : msg.length < 70 ? msg : t("popup.toast.githubFailed"), 5000);
+    if (isExportContextChanged(err) && sourceTabId === context.tabId) {
+      githubPanel.classList.remove("open");
+      await refreshConversationForSelector(false, new Set(context.selectedIds));
+    }
   } finally {
     setBusy(false);
     githubPanelSave.textContent = t("popup.github.save");

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CHATSCRIBE_BUILD_ID,
+  CONTENT_CHECK_REVISION_TYPE,
   CONTENT_LOAD_TYPE,
   CONTENT_PING_TYPE,
 } from "../src/content-protocol.ts";
@@ -8,7 +9,7 @@ import { formatMarkdown } from "../src/formatter.ts";
 import { DEFAULT_SETTINGS } from "../src/types.ts";
 
 type MessageListener = (
-  message: { type: string },
+  message: { type: string; [key: string]: unknown },
   sender: { id: string },
   respond: (response: unknown) => void,
 ) => boolean | void;
@@ -35,7 +36,7 @@ async function installClaudeContentScript(conversation: Record<string, unknown>)
   vi.resetModules();
   const listeners: MessageListener[] = [];
   const requests: string[] = [];
-  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
     const url = new URL(String(input), "https://claude.ai");
     requests.push(`${url.pathname}${url.search}`);
     if (url.pathname === "/api/organizations") {
@@ -84,12 +85,12 @@ async function installClaudeContentScript(conversation: Record<string, unknown>)
   const listener = listeners[0];
   if (!listener) throw new Error("Claude content listener was not registered.");
 
-  const send = (type: string) => new Promise<any>((resolve, reject) => {
-    const handled = listener({ type }, { id: "chatscribe-test" }, resolve);
+  const send = (type: string, details: Record<string, unknown> = {}) => new Promise<any>((resolve, reject) => {
+    const handled = listener({ type, ...details }, { id: "chatscribe-test" }, resolve);
     if (handled !== true) reject(new Error(`Claude content did not handle ${type}.`));
   });
 
-  return { send, requests };
+  return { send, requests, fetchMock, windowListeners };
 }
 
 afterEach(() => {
@@ -148,5 +149,121 @@ describe("Claude content script integration", () => {
     expect(loaded.success).toBe(false);
     expect(loaded.error).toMatch(/parent message that Claude did not return/i);
     expect(loaded.data).toBeUndefined();
+  });
+
+  it("fetches fresh Claude data after a revision check when forceRefresh is set", async () => {
+    const raw = {
+      uuid: conversationId,
+      current_leaf_message_uuid: "a1",
+      chat_messages: [
+        message("u1", "human", rootParentId, "Question"),
+        message("a1", "assistant", "u1", "Old answer"),
+      ],
+    };
+    const { send, requests, fetchMock } = await installClaudeContentScript(raw);
+
+    await send(CONTENT_CHECK_REVISION_TYPE);
+    raw.chat_messages[1] = message("a1", "assistant", "u1", "New answer");
+    const loaded = await send(CONTENT_LOAD_TYPE, { forceRefresh: true });
+
+    expect(loaded.success).toBe(true);
+    expect(loaded.data.messages.at(-1).content).toBe("New answer");
+    expect(requests.filter((path) => path.includes(`/chat_conversations/${conversationId}`)))
+      .toHaveLength(2);
+    expect(requests.filter((path) => path === "/api/organizations")).toHaveLength(1);
+    expect(fetchMock.mock.calls.every(([, init]) => init?.redirect === "error")).toBe(true);
+    expect(fetchMock.mock.calls.every(([, init]) => init?.cache === "no-store")).toBe(true);
+  });
+
+  it("returns the fresh parsed conversation when a requested revision has changed", async () => {
+    const raw = {
+      uuid: conversationId,
+      current_leaf_message_uuid: "a1",
+      chat_messages: [
+        message("u1", "human", rootParentId, "Question"),
+        message("a1", "assistant", "u1", "Old answer"),
+      ],
+    };
+    const { send } = await installClaudeContentScript(raw);
+    const firstLoad = await send(CONTENT_LOAD_TYPE);
+    const unchanged = await send(CONTENT_CHECK_REVISION_TYPE, {
+      knownRevision: firstLoad.data.revision,
+      returnDataIfChanged: true,
+    });
+    expect(unchanged.revision).toBe(firstLoad.data.revision);
+    expect(unchanged.data).toBeUndefined();
+
+    raw.chat_messages[1] = message("a1", "assistant", "u1", "New answer");
+
+    const checked = await send(CONTENT_CHECK_REVISION_TYPE, {
+      knownRevision: firstLoad.data.revision,
+      returnDataIfChanged: true,
+    });
+
+    expect(checked.success).toBe(true);
+    expect(checked.revision).not.toBe(firstLoad.data.revision);
+    expect(checked.data.revision).toBe(checked.revision);
+    expect(checked.data.messages.at(-1).content).toBe("New answer");
+  });
+
+  it.each([401, 403, 404])(
+  "rediscovers the organization once when the cached organization returns %i",
+  async (cachedStatus) => {
+    const replacementOrganizationId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const raw = {
+      uuid: conversationId,
+      current_leaf_message_uuid: "a1",
+      chat_messages: [
+        message("u1", "human", rootParentId, "Question"),
+        message("a1", "assistant", "u1", "Answer"),
+      ],
+    };
+    const { send, fetchMock, requests } = await installClaudeContentScript(raw);
+    await send(CONTENT_LOAD_TYPE);
+
+    fetchMock.mockImplementation(async (input) => {
+      const url = new URL(String(input), "https://claude.ai");
+      requests.push(`${url.pathname}${url.search}`);
+      if (url.pathname === "/api/organizations") {
+        return new Response(JSON.stringify([{ uuid: replacementOrganizationId }]), { status: 200 });
+      }
+      if (url.pathname.includes(`/${organizationId}/chat_conversations/`)) {
+        return new Response("Organization is no longer available", { status: cachedStatus });
+      }
+      if (url.pathname.includes(`/${replacementOrganizationId}/chat_conversations/`)) {
+        return new Response(JSON.stringify(raw), { status: 200 });
+      }
+      return new Response("Not found", { status: 404 });
+    });
+
+    const refreshed = await send(CONTENT_CHECK_REVISION_TYPE);
+    const checkedAgain = await send(CONTENT_CHECK_REVISION_TYPE);
+
+    expect(refreshed.success).toBe(true);
+    expect(checkedAgain.success).toBe(true);
+    expect(requests.filter((path) => path === "/api/organizations")).toHaveLength(2);
+    expect(requests.filter((path) => path.includes(`/${replacementOrganizationId}/chat_conversations/`)))
+      .toHaveLength(2);
+    },
+  );
+
+  it("clears the organization lookup when the page is unloaded", async () => {
+    const raw = {
+      uuid: conversationId,
+      current_leaf_message_uuid: "a1",
+      chat_messages: [
+        message("u1", "human", rootParentId, "Question"),
+        message("a1", "assistant", "u1", "Answer"),
+      ],
+    };
+    const { send, requests, windowListeners } = await installClaudeContentScript(raw);
+    await send(CONTENT_LOAD_TYPE);
+    const pageHide = [...(windowListeners.get("pagehide") ?? [])][0];
+    if (!pageHide) throw new Error("Claude content did not register a pagehide handler.");
+    pageHide(new Event("pagehide"));
+
+    await send(CONTENT_CHECK_REVISION_TYPE);
+
+    expect(requests.filter((path) => path === "/api/organizations")).toHaveLength(2);
   });
 });

@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { selectHydratedExport } from "../src/export-selection.ts";
+import {
+  assertSelectedMessagesUnchanged,
+  captureSelectedMessageSnapshots,
+  selectHydratedExport,
+} from "../src/export-selection.ts";
 import { formatMarkdown } from "../src/formatter.ts";
 import { DEFAULT_SETTINGS } from "../src/types.ts";
 import { buildZipBlob } from "../src/zip.ts";
@@ -28,6 +32,12 @@ describe("selected export with generated images", () => {
         { path: "images/image-001.png", mimeType: "image/png", base64: "AA==", sizeBytes: 1 },
         { path: "images/image-002.png", mimeType: "image/png", base64: "AA==", sizeBytes: 1 },
       ],
+      messageQuestionNumbersById: {
+        "user-21": 21,
+        "rendered-generated-image:card-21": 21,
+        "user-22": 22,
+        "rendered-generated-image:card-22": 22,
+      },
     };
 
     const selected = selectHydratedExport(conversation, new Set(["user-21"]));
@@ -59,5 +69,87 @@ describe("selected export with generated images", () => {
       offset = nameStart + nameLength + extraLength + size;
     }
     expect(entryNames).toEqual(["chat.md", "images/image-001.png"]);
+  });
+
+  it("does not include a recovered image from an unrelated question", () => {
+    const conversation: ConversationData = {
+      messages: [
+        message("user-1", "user", "first question", 0),
+        message("user-2", "user", "second question", 1),
+        message("rendered-generated-image:card-2", "assistant", "", 2, ["images/image-002.png"]),
+      ],
+      images: [
+        { path: "images/image-002.png", mimeType: "image/png", base64: "AA==", sizeBytes: 1 },
+      ],
+      messageQuestionNumbersById: {
+        "user-1": 1,
+        "user-2": 2,
+        "rendered-generated-image:card-2": 2,
+      },
+    };
+
+    const selected = selectHydratedExport(conversation, new Set(["user-1"]));
+    expect(selected.messages.map((item) => item.id)).toEqual(["user-1"]);
+    expect(selected.images).toEqual([]);
+  });
+
+  it("respects an image message that was already unchecked in the selector", () => {
+    const conversation: ConversationData = {
+      messages: [
+        message("user-1", "user", "draw a picture", 0),
+        message("rendered-generated-image:card-1", "assistant", "", 1, ["images/image-001.png"]),
+      ],
+      images: [
+        { path: "images/image-001.png", mimeType: "image/png", base64: "AA==", sizeBytes: 1 },
+      ],
+      messageQuestionNumbersById: {
+        "user-1": 1,
+        "rendered-generated-image:card-1": 1,
+      },
+    };
+
+    const selected = selectHydratedExport(
+      conversation,
+      new Set(["user-1"]),
+      new Set(["user-1", "rendered-generated-image:card-1"]),
+    );
+    expect(selected.messages.map((item) => item.id)).toEqual(["user-1"]);
+    expect(selected.images).toEqual([]);
+  });
+
+  it("rejects a hydration result if the active revision or selected text changed", () => {
+    const selected = message("user-1", "user", "original text", 0);
+    const snapshots = captureSelectedMessageSnapshots([selected]);
+    const unchanged: ConversationData = {
+      messages: [{ ...selected, imagePaths: ["images/image-001.png"] }],
+      images: [],
+      revision: "revision-1",
+    };
+    expect(() => assertSelectedMessagesUnchanged(snapshots, unchanged, "revision-1"))
+      .not.toThrow();
+
+    expect(() => assertSelectedMessagesUnchanged(snapshots, {
+      ...unchanged,
+      revision: "revision-2",
+    }, "revision-1")).toThrow(/branch changed/i);
+    expect(() => assertSelectedMessagesUnchanged(snapshots, {
+      ...unchanged,
+      revision: undefined,
+    }, "revision-1")).toThrow(/branch changed/i);
+    expect(() => assertSelectedMessagesUnchanged(snapshots, {
+      ...unchanged,
+      messages: [{
+        ...selected,
+        content: "original text\n\n[1 image could not be downloaded: 403]",
+      }],
+    }, "revision-1")).not.toThrow();
+    expect(() => assertSelectedMessagesUnchanged(snapshots, {
+      ...unchanged,
+      messages: [{ ...selected, content: "changed text" }],
+    }, "revision-1")).toThrow(/selected message changed/i);
+    expect(() => assertSelectedMessagesUnchanged(snapshots, {
+      ...unchanged,
+      messages: [],
+    }, "revision-1")).toThrow(/selected message changed/i);
   });
 });

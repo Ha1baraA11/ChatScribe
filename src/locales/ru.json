@@ -1,6 +1,9 @@
 {
   "popup.copy": "Копировать беседу",
   "popup.copyLatest": "Копировать последний ответ",
+  "popup.copyLatest.status.preparing": "Подготовка последнего ответа…",
+  "popup.copyLatest.status.checking": "Проверка наличия более нового ответа…",
+  "popup.copyLatest.status.writing": "Копирование в буфер обмена…",
   "popup.copySelect": "Выбрать сообщения…",
   "popup.copyOptions.toggle": "Другие варианты копирования",
   "popup.copyOptions.group": "Варианты копирования",
@@ -63,6 +66,7 @@
   "popup.error.noCopyableContent": "В выбранных сообщениях нет текста для копирования",
   "popup.error.copyFailed": "Не удалось скопировать Markdown",
   "popup.error.githubFailed": "Не удалось сохранить на GitHub",
+  "popup.error.githubTooLarge": "Экспорт превышает лимит сохранения ChatScribe на GitHub. Скачайте его на устройство, а затем загрузите на GitHub.",
   "options.title": "Настройки ChatScribe",
   "options.subtitle": "Настройте внешний вид ChatScribe и параметры экспорта.",
   "options.preferences.legend": "Настройки",

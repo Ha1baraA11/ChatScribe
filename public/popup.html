@@ -145,6 +145,43 @@
         outline-offset: 1px;
       }
 
+      #copy-latest-status {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 10px;
+        padding: 8px 10px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        color: var(--text-muted);
+        font-size: 12px;
+        line-height: 1.35;
+      }
+
+      #copy-latest-status[hidden] {
+        display: none;
+      }
+
+      #copy-latest-status-spinner {
+        width: 13px;
+        height: 13px;
+        flex: 0 0 13px;
+        border: 2px solid var(--border);
+        border-top-color: var(--accent);
+        border-radius: 50%;
+        animation: copy-latest-spin 0.8s linear infinite;
+      }
+
+      @keyframes copy-latest-spin {
+        to { transform: rotate(360deg); }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        #copy-latest-status-spinner {
+          animation-duration: 2s;
+        }
+      }
+
       .popup-header {
         display: flex;
         align-items: center;
@@ -843,6 +880,11 @@
       </div>
     </div>
 
+    <div id="copy-latest-status" role="status" aria-live="polite" aria-atomic="true" hidden>
+      <span id="copy-latest-status-spinner" aria-hidden="true"></span>
+      <span id="copy-latest-status-message"></span>
+    </div>
+
     <section id="claude-permission" role="region" aria-labelledby="claude-permission-title" hidden>
       <h2 id="claude-permission-title" data-i18n="popup.permission.claude.title">Allow access to Claude</h2>
       <p data-i18n="popup.permission.claude.body">
@@ -1039,7 +1081,6 @@
         </p>
 
         <p
-          id="github-confirm-message"
           data-i18n="popup.githubConfirm.confirmQuestion"
         >
           Are you sure you want to continue?

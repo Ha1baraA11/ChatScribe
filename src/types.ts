@@ -21,6 +21,12 @@ export interface ExportMessage {
   role: "user" | "assistant";
   /** Markdown text content. */
   content: string;
+  /** Raw content before Claude Artifact blocks are materialized for a selection. */
+  artifactBaseContent?: string;
+  /** Runtime-only Claude Artifact IDs referenced by this message. */
+  artifactReferences?: string[];
+  /** Number of image resources represented by this message, whether bundled or not. */
+  imageCount?: number;
   /** Dark page background used to preserve contrast when exporting SVG diagrams. */
   svgBackgroundColor?: string;
   /** Markdown-only content with temporary ChatGPT image links rewritten to bundled paths. */
@@ -35,6 +41,16 @@ export interface ExportMessage {
   renderedDiagramPaths?: string[];
   /** Unix timestamp in seconds, if available. */
   timestamp?: number;
+}
+
+/** Runtime-only reconstructed Artifact state for selection-aware exports. */
+export interface ExportArtifactData {
+  title: string;
+  language: string;
+  content: string | null;
+  failed: boolean;
+  finalBlock: string;
+  modifiedLaterBlock: string;
 }
 
 /** A downloaded image file for bundling. */
@@ -117,6 +133,8 @@ export interface ConversationData {
   images: ExportImageFile[];
   /** Lightweight API revision used to detect completed conversation updates. */
   revision?: string;
+  /** Runtime-only Claude Artifact states, omitted by the public export formatters. */
+  artifacts?: Record<string, ExportArtifactData>;
   imageDiagnostics?: ImageExportDiagnostics;
   /** Runtime-only map used to align selected exports with full-conversation question numbers. */
   messageQuestionNumbersById?: Record<string, number>;
@@ -265,7 +283,12 @@ export type ChromeMessage =
       forceRefresh?: boolean;
       selectedMessageIds?: string[];
     }
-  | { type: typeof CONTENT_CHECK_REVISION_TYPE }
+  | {
+      type: typeof CONTENT_CHECK_REVISION_TYPE;
+      knownRevision?: string;
+      returnDataIfChanged?: boolean;
+      includeClaudeThinking?: boolean;
+    }
   | { type: typeof CONTENT_WATCH_CONVERSATION_TYPE; watch: boolean }
   | { type: typeof CONTENT_CONVERSATION_CHANGED_TYPE; conversationId: string }
   | { type: "COPY_TO_CLIPBOARD"; text: string; tabId?: number }

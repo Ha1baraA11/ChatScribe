@@ -17,8 +17,8 @@
 - Export the full conversation or selected messages as Markdown, plain text, JSON, or CSV.
 - Claude web support asks for optional site access only when you choose to enable it. Claude Artifacts export their final version, and thinking summaries are opt-in.
 - Optionally download conversation images, including generated images available in the page, and bundle them with Markdown in a ZIP. Markdown links to the image files with relative paths.
-- Render supported SVG diagram templates as PNG assets in Markdown exports. Plain-text output uses a `[Diagram]` placeholder; unsupported templates are kept as provided.
-- Save a Markdown export to the `exports/` directory of a GitHub repository you choose. Exports with images are saved as a ZIP.
+- Render supported SVG diagram templates as PNG assets in Markdown exports. Plain-text output uses a `[Diagram]` placeholder; unsupported source is preserved only inside an inert fenced code block.
+- Save a Markdown export to the `exports/` directory of a GitHub repository you choose. Exports with images are saved as a ZIP. If a filename already exists, ChatScribe saves a numbered copy instead of overwriting it.
 - Set the theme, interface language, message headings and spacing, export timestamps, download prompts, and image bundling.
 
 The interface is available in English, Simplified Chinese, Traditional Chinese, German, Spanish, French, Japanese, Korean, Brazilian Portuguese, and Russian. It detects a supported browser language automatically and falls back to English otherwise.

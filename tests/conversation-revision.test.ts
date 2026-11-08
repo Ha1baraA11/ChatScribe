@@ -37,6 +37,13 @@ describe("conversation revision", () => {
     );
   });
 
+  it("changes when a completed answer is edited without changing its message ID", () => {
+    const original = makePage("original answer", true);
+    const edited = makePage("edited answer", true);
+
+    expect(getConversationRevision(edited)).not.toBe(getConversationRevision(original));
+  });
+
   it("changes when the active branch moves to a new message", () => {
     const original = makePage("answer", true);
     const next: ApiConversationPage = {

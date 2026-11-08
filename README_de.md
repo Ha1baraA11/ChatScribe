@@ -17,8 +17,8 @@
 - Die gesamte Unterhaltung oder ausgewählte Nachrichten als Markdown, Text, JSON oder CSV exportieren.
 - Claude im Web benötigt optionalen Website-Zugriff erst, wenn du ihn aktivierst. Claude Artifacts werden mit ihrer letzten Version exportiert; Denkzusammenfassungen sind optional.
 - Optional Unterhaltungsbilder herunterladen, einschließlich der auf der Seite verfügbaren generierten Bilder, und zusammen mit Markdown in einer ZIP-Datei bündeln. Markdown verlinkt die Bilddateien über relative Pfade.
-- Unterstützte SVG-Diagrammvorlagen werden beim Markdown-Export in PNG-Dateien umgewandelt. In der Textausgabe erscheinen sie als `[Diagram]`; nicht unterstützte Vorlagen bleiben unverändert.
-- Einen Markdown-Export im Verzeichnis `exports/` eines GitHub-Repositories deiner Wahl speichern. Enthält der Export Bilder, wird er als ZIP gespeichert.
+- Unterstützte SVG-Diagrammvorlagen werden beim Markdown-Export in PNG-Dateien umgewandelt. In der Textausgabe erscheinen sie als `[Diagram]`; nicht unterstützter Quelltext bleibt in einem nicht ausführbaren Codeblock erhalten.
+- Einen Markdown-Export im Verzeichnis `exports/` eines GitHub-Repositories deiner Wahl speichern. Enthält der Export Bilder, wird er als ZIP gespeichert. Bei gleichem Dateinamen wird eine nummerierte Kopie erstellt, statt die vorhandene Datei zu überschreiben.
 - Design, Oberflächensprache, Nachrichtenüberschriften und -abstände, Zeitstempel, Download-Abfrage und Bildpakete konfigurieren.
 
 Die Oberfläche ist auf Englisch, vereinfachtem und traditionellem Chinesisch, Deutsch, Spanisch, Französisch, Japanisch, Koreanisch, brasilianischem Portugiesisch und Russisch verfügbar. Die Browsersprache wird automatisch erkannt; bei nicht unterstützten Sprachen wird Englisch verwendet.

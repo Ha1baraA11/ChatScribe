@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   getClaudeConversationId,
+  materializeClaudeArtifactSelection,
   parseClaudeConversation,
 } from "../src/claude-conversation.ts";
 
@@ -97,6 +98,37 @@ describe("Claude conversation parser", () => {
     expect(parsed.messages.map(({ id }) => id)).toEqual(["u2"]);
   });
 
+  it("uses the active first sentinel-rooted message even when it is not last", () => {
+    const root = "00000000-0000-4000-8000-000000000000";
+    const raw = conversation([
+      message("u1", "human", root, [{ type: "text", text: "Active root" }]),
+      message("u2", "human", root, [{ type: "text", text: "Inactive root" }]),
+    ], "u1");
+
+    expect(parseClaudeConversation(raw, parserOptions).messages.map(({ id }) => id))
+      .toEqual(["u1"]);
+  });
+
+  it("fails closed for multiple null roots without ancestry links", () => {
+    const raw = conversation([
+      message("u1", "human", null, [{ type: "text", text: "First root" }]),
+      message("u2", "human", null, [{ type: "text", text: "Second root" }]),
+    ], "u2");
+
+    expect(() => parseClaudeConversation(raw, parserOptions))
+      .toThrow(/ambiguous conversation roots/i);
+  });
+
+  it("fails closed when explicit roots are mixed with missing parent fields", () => {
+    const raw = conversation([
+      message("u1", "human", null, [{ type: "text", text: "Known root" }]),
+      { ...message("u2", "human", null, [{ type: "text", text: "Unknown root" }]), parent_message_uuid: undefined },
+    ], "u1");
+
+    expect(() => parseClaudeConversation(raw, parserOptions))
+      .toThrow(/ambiguous conversation roots/i);
+  });
+
   it("fails instead of exporting a parent chain that Claude returned incompletely", () => {
     const raw = conversation([
       message("a1", "assistant", "missing-parent", [{ type: "text", text: "Partial" }]),
@@ -118,6 +150,25 @@ describe("Claude conversation parser", () => {
         .toThrow(/parent message that Claude did not return/i);
     },
   );
+
+  it("does not use the legacy linear fallback for invalid parent fields", () => {
+    const raw = conversation([
+      { ...message("u1", "human", "", [{ type: "text", text: "Question" }]), parent_message_uuid: 42 },
+      { ...message("a1", "assistant", "", [{ type: "text", text: "Answer" }]), parent_message_uuid: {} },
+    ], "a1");
+
+    expect(() => parseClaudeConversation(raw, parserOptions))
+      .toThrow(/invalid parent reference/i);
+  });
+
+  it("does not treat a blank parent field as an explicit root", () => {
+    const raw = conversation([
+      { ...message("u1", "human", "", [{ type: "text", text: "Question" }]), parent_message_uuid: " " },
+    ], "u1");
+
+    expect(() => parseClaudeConversation(raw, parserOptions))
+      .toThrow(/invalid parent reference/i);
+  });
 
   it("fails when a linked tree message omits its parent field", () => {
     const raw = conversation([
@@ -164,6 +215,64 @@ describe("Claude conversation parser", () => {
     expect(defaultExport.messages[0].content).toBe("Public answer");
     expect(optedInExport.messages[0].content).toContain("Private reasoning summary");
     expect(optedInExport.messages[0].content).toContain("Public answer");
+    expect(optedInExport.revision).toBe(defaultExport.revision);
+  });
+
+  it("changes the revision when Claude's fallback text changes despite empty structured content", () => {
+    const raw = conversation([
+      {
+        ...message("a1", "assistant", null, []),
+        text: "First fallback",
+      },
+    ], "a1");
+    const firstRevision = parseClaudeConversation(raw, parserOptions).revision;
+    const changed = structuredClone(raw);
+    (changed.chat_messages as Array<Record<string, unknown>>)[0].text = "Updated fallback";
+
+    expect(parseClaudeConversation(changed, parserOptions).revision).not.toBe(firstRevision);
+  });
+
+  it("tracks exported attachment names, image resources, timestamps, and Artifact data", () => {
+    const raw = conversation([
+      {
+        ...message("a1", "assistant", null, [
+          { type: "text", text: "Answer" },
+          {
+            type: "tool_use",
+            name: "artifacts",
+            input: { id: "artifact-1", title: "Draft", language: "txt", command: "create", content: "one" },
+          },
+          { type: "image", source: { url: "https://claude.ai/image/one" } },
+        ]),
+        attachments: [{ type: "file", filename: "notes.txt" }],
+        created_at: "2026-11-08T10:00:00Z",
+      },
+    ], "a1");
+    const firstRevision = parseClaudeConversation(raw, parserOptions).revision;
+    const variants: Array<(value: Record<string, unknown>) => void> = [
+      (value) => {
+        (value.chat_messages as Array<Record<string, unknown>>)[0].attachments = [
+          { type: "file", filename: "updated.txt" },
+        ];
+      },
+      (value) => {
+        const blocks = (value.chat_messages as Array<Record<string, unknown>>)[0].content as Array<Record<string, unknown>>;
+        blocks[2] = { type: "image", source: { url: "https://claude.ai/image/two" } };
+      },
+      (value) => {
+        (value.chat_messages as Array<Record<string, unknown>>)[0].created_at = "2026-11-08T10:01:00Z";
+      },
+      (value) => {
+        const blocks = (value.chat_messages as Array<Record<string, unknown>>)[0].content as Array<Record<string, unknown>>;
+        (blocks[1].input as Record<string, unknown>).content = "two";
+      },
+    ];
+
+    for (const mutate of variants) {
+      const changed = structuredClone(raw);
+      mutate(changed);
+      expect(parseClaudeConversation(changed, parserOptions).revision).not.toBe(firstRevision);
+    }
   });
 
   it("places the final Artifact version in the last answer and marks its earlier mention", () => {
@@ -205,6 +314,75 @@ describe("Claude conversation parser", () => {
     expect(parsed.messages[0].content).not.toContain("const value = 1;");
     expect(parsed.messages[1].content).toContain("const value = 2;");
     expect(parsed.messages[1].content).toContain("(final version)");
+  });
+
+  it("places the active conversation's final Artifact in an earlier selected message", () => {
+    const raw = conversation([
+      message("a1", "assistant", null, [{
+        type: "tool_use",
+        name: "artifacts",
+        input: { id: "artifact-1", title: "Example", command: "create", content: "v1" },
+      }]),
+      message("a2", "assistant", "a1", [{
+        type: "tool_use",
+        name: "artifacts",
+        input: { id: "artifact-1", command: "update", old_str: "v1", new_str: "v2" },
+      }]),
+    ], "a2");
+    const parsed = parseClaudeConversation(raw, parserOptions);
+
+    const selected = materializeClaudeArtifactSelection(
+      [parsed.messages[0]],
+      parsed.artifacts,
+    );
+    expect(selected[0].content).toContain("(final version)");
+    expect(selected[0].content).toContain("\nv2\n");
+    expect(selected[0].content).not.toContain("modified later");
+  });
+
+  it("preserves an Artifact title when a later update omits the title", () => {
+    const raw = conversation([
+      message("a1", "assistant", null, [{
+        type: "tool_use",
+        name: "artifacts",
+        input: { id: "artifact-1", title: "Original Name", command: "create", content: "v1" },
+      }]),
+      message("a2", "assistant", "a1", [{
+        type: "tool_use",
+        name: "artifacts",
+        input: { id: "artifact-1", command: "update", old_str: "v1", new_str: "v2" },
+      }]),
+    ], "a2");
+
+    expect(parseClaudeConversation(raw, parserOptions).messages[1].content)
+      .toContain("Original Name");
+  });
+
+  it("keeps an empty Artifact as a valid final version", () => {
+    const raw = conversation([
+      message("a1", "assistant", null, [{
+        type: "tool_use",
+        name: "artifacts",
+        input: { id: "artifact-1", title: "Empty", command: "create", content: "" },
+      }]),
+    ], "a1");
+
+    const parsed = parseClaudeConversation(raw, parserOptions);
+    expect(parsed.messages[0].content).toContain("Artifact: Empty (final version)");
+    expect(parsed.messages[0].content).not.toContain("final contents unavailable");
+  });
+
+  it("builds a safe fence for an Artifact with a very long backtick run", () => {
+    const longRun = "`".repeat(150_000);
+    const raw = conversation([
+      message("a1", "assistant", null, [{
+        type: "tool_use",
+        name: "artifacts",
+        input: { id: "artifact-1", command: "create", content: longRun },
+      }]),
+    ], "a1");
+
+    expect(() => parseClaudeConversation(raw, parserOptions)).not.toThrow();
   });
 
   it("marks an Artifact unavailable when an update is ambiguous", () => {
@@ -257,6 +435,17 @@ describe("Claude conversation parser", () => {
     }]);
     expect(parsed.revision).toMatch(/^[0-9a-f]{16}$/);
     expect(parsed.revision).not.toContain("What is this?");
+  });
+
+  it("retains image-only messages with an explicit runtime image count", () => {
+    const raw = conversation([
+      message("u1", "human", null, [{ type: "image", source: { type: "base64", data: "AA==" } }]),
+    ], "u1");
+
+    const parsed = parseClaudeConversation(raw, parserOptions);
+    expect(parsed.messages[0].content).toBe("");
+    expect(parsed.messages[0].imageCount).toBe(1);
+    expect(parsed.imageReferences).toEqual([]);
   });
 
   it("preserves non-image attachment names and descriptions without bundling their files", () => {

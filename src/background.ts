@@ -21,6 +21,7 @@ import {
   disconnectGitHub,
   getStoredToken,
 } from "./github.ts";
+import { MAX_GITHUB_CONTENT_BASE64_LENGTH } from "./export-limits.ts";
 import {
   CHATSCRIBE_BUILD_ID,
   CONTENT_PING_TYPE,
@@ -245,7 +246,7 @@ function isValidFilename(v: unknown): v is string {
 
 /** Validates a base64-encoded content string (text or binary export). */
 function isValidContent(v: unknown): v is string {
-  return typeof v === "string" && v.length <= 10_000_000;
+  return typeof v === "string";
 }
 
 // -----------------------------------------------------------------------
@@ -550,6 +551,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     !isValidContent(content)
   ) {
     sendResponse({ success: false, error: "Invalid save request." });
+    return true;
+  }
+  if (content.length > MAX_GITHUB_CONTENT_BASE64_LENGTH) {
+    sendResponse({
+      success: false,
+      error: "GITHUB_PAYLOAD_TOO_LARGE",
+    });
     return true;
   }
 

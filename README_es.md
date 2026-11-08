@@ -17,8 +17,8 @@
 - Exporta la conversación completa o los mensajes seleccionados a Markdown, texto, JSON o CSV.
 - La versión web de Claude solo solicita acceso opcional al sitio cuando decides activarlo. Los Artifacts de Claude se exportan en su versión final y los resúmenes de pensamiento son opcionales.
 - Si quieres, descarga las imágenes de la conversación —incluidas las imágenes generadas disponibles en la página— y agrúpalas con el Markdown en un ZIP. El Markdown enlaza las imágenes mediante rutas relativas.
-- En las exportaciones Markdown, las plantillas de diagramas SVG compatibles se convierten en imágenes PNG. En texto se muestra el marcador `[Diagram]`; las plantillas no compatibles se conservan tal cual.
-- Guarda una exportación Markdown en el directorio `exports/` del repositorio de GitHub que elijas. Si incluye imágenes, se guarda como ZIP.
+- En las exportaciones Markdown, las plantillas de diagramas SVG compatibles se convierten en imágenes PNG. En texto se muestra el marcador `[Diagram]`; el código fuente no compatible se conserva en un bloque de código inerte.
+- Guarda una exportación Markdown en el directorio `exports/` del repositorio de GitHub que elijas. Si incluye imágenes, se guarda como ZIP. Si el nombre ya existe, se guarda una copia numerada sin sobrescribir el archivo existente.
 - Configura el tema, el idioma de la interfaz, los encabezados y el espacio entre mensajes, las marcas de tiempo, la confirmación de descarga y el empaquetado de imágenes.
 
 La interfaz está disponible en inglés, chino simplificado y tradicional, alemán, español, francés, japonés, coreano, portugués de Brasil y ruso. Detecta automáticamente un idioma compatible del navegador; si no lo está, usa inglés.

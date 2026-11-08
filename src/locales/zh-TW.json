@@ -1,6 +1,9 @@
 {
   "popup.copy": "複製對話",
   "popup.copyLatest": "複製最新回答",
+  "popup.copyLatest.status.preparing": "正在準備最新回答…",
+  "popup.copyLatest.status.checking": "正在檢查是否有更新的回答…",
+  "popup.copyLatest.status.writing": "正在寫入剪貼簿…",
   "popup.copySelect": "選擇訊息…",
   "popup.copyOptions.toggle": "更多複製選項",
   "popup.copyOptions.group": "複製選項",
@@ -69,6 +72,7 @@
   "popup.error.noCopyableContent": "選取的訊息沒有可複製的文字",
   "popup.error.copyFailed": "無法複製 Markdown",
   "popup.error.githubFailed": "無法儲存至 GitHub",
+  "popup.error.githubTooLarge": "匯出內容超過 ChatScribe 的 GitHub 儲存上限。請先下載到本機，再上傳至 GitHub。",
   "options.title": "ChatScribe 設定",
   "options.subtitle": "自訂 ChatScribe 的外觀與匯出行為。",
   "options.preferences.legend": "偏好設定",

@@ -5,6 +5,7 @@ import {
   BRIDGE_PING_TYPE,
   BRIDGE_PONG_TYPE,
   CHATSCRIBE_BUILD_ID,
+  CONTENT_CHECK_REVISION_TYPE,
   CONTENT_LOAD_TYPE,
 } from "../src/content-protocol.ts";
 import type { ApiConversationPage } from "../src/types.ts";
@@ -158,6 +159,28 @@ describe("conversation refresh cache", () => {
       .toEqual(["user", "assistant"]);
     expect(refreshed.data.revision).toBeDefined();
     expect(apiRequestCount).toHaveBeenCalledTimes(2);
+
+    const unchangedCheck = await load({
+      type: CONTENT_CHECK_REVISION_TYPE,
+      knownRevision: refreshed.data.revision,
+      returnDataIfChanged: true,
+    });
+    expect(unchangedCheck.success).toBe(true);
+    expect(unchangedCheck.changed).toBeUndefined();
+    expect(unchangedCheck.data).toBeUndefined();
+    expect(apiRequestCount).toHaveBeenCalledTimes(3);
+
+    apiPage.messages![1].content = { parts: ["edited after completion"] };
+    const changedCheck = await load({
+      type: CONTENT_CHECK_REVISION_TYPE,
+      knownRevision: refreshed.data.revision,
+      returnDataIfChanged: true,
+    });
+    expect(changedCheck.success).toBe(true);
+    expect(changedCheck.changed).toBe(true);
+    expect(changedCheck.data.revision).not.toBe(refreshed.data.revision);
+    expect(changedCheck.data.messages.at(-1).content).toBe("edited after completion");
+    expect(apiRequestCount).toHaveBeenCalledTimes(5);
     expect(CHATSCRIBE_BUILD_ID).toBeTruthy();
   });
 });
