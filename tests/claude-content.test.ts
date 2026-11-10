@@ -134,6 +134,162 @@ describe("Claude content script integration", () => {
     expect(markdown).not.toContain("Inactive alternate");
   });
 
+  it("recovers a page blob only when its thumbnail key matches the selected message", async () => {
+    const userMessageId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const raw = {
+      uuid: conversationId,
+      current_leaf_message_uuid: userMessageId,
+      chat_messages: [{
+        uuid: userMessageId,
+        sender: "human",
+        parent_message_uuid: null,
+        content: [{ type: "image", id: "upload-1", mime_type: "image/png" }],
+      }],
+    };
+    const { send, fetchMock } = await installClaudeContentScript(raw);
+    const image = {
+      currentSrc: "blob:https://claude.ai/preview-1",
+      getAttribute: () => "blob:https://claude.ai/preview-1",
+    };
+    const renderedMessage = { id: `_r_bf_${userMessageId}` };
+    const row = {
+      querySelector: () => renderedMessage,
+    };
+    const thumbnail = {
+      getAttribute: (name: string) => name === "data-item-key" ? `${userMessageId}:t0` : null,
+      closest: () => row,
+      querySelectorAll: () => [image],
+    };
+    vi.stubGlobal("document", {
+      body: null,
+      querySelectorAll: () => [thumbnail],
+      querySelector: () => null,
+    });
+    fetchMock.mockImplementation(async (input) => {
+      const url = new URL(String(input), "https://claude.ai");
+      if (url.protocol === "blob:") {
+        return new Response(new Uint8Array([1, 2, 3]), {
+          status: 200,
+          headers: { "content-type": "image/png" },
+        });
+      }
+      if (url.pathname === "/api/organizations") {
+        return new Response(JSON.stringify([{ uuid: organizationId }]), { status: 200 });
+      }
+      return new Response(JSON.stringify(raw), { status: 200 });
+    });
+
+    const loaded = await send(CONTENT_LOAD_TYPE, {
+      downloadImages: true,
+      selectedMessageIds: [userMessageId],
+    });
+
+    expect(loaded.success).toBe(true);
+    expect(loaded.data.messages[0].imagePaths).toEqual(["images/claude-image-001.png"]);
+    expect(loaded.data.images[0].base64).toBe("AQID");
+    expect(loaded.data.imageDiagnostics.messages[0].imageResourceKinds)
+      .toContain("page-blob-preview");
+  });
+
+  it("downloads one image when Claude repeats the same resource in content and attachments", async () => {
+    const image = { type: "image", id: "upload-1", url: "/api/images/upload-1" };
+    const raw = {
+      uuid: conversationId,
+      current_leaf_message_uuid: "u1",
+      chat_messages: [{
+        ...message("u1", "human", rootParentId, [
+          { type: "text", text: "What is this?" },
+          image,
+        ]),
+        attachments: [image],
+        files: [{ type: "image", id: "upload-1", url: image.url }],
+      }],
+    };
+    const { send, fetchMock } = await installClaudeContentScript(raw);
+    fetchMock.mockImplementation(async (input) => {
+      const url = new URL(String(input), "https://claude.ai");
+      if (url.pathname === "/api/organizations") {
+        return new Response(JSON.stringify([{ uuid: organizationId }]), { status: 200 });
+      }
+      if (url.pathname === "/api/images/upload-1") {
+        return new Response(new Uint8Array([1, 2, 3]), {
+          status: 200,
+          headers: { "content-type": "image/png" },
+        });
+      }
+      return new Response(JSON.stringify(raw), { status: 200 });
+    });
+
+    const loaded = await send(CONTENT_LOAD_TYPE, {
+      downloadImages: true,
+      selectedMessageIds: ["u1"],
+    });
+
+    expect(loaded.success).toBe(true);
+    expect(loaded.data.messages[0].imageCount).toBe(1);
+    expect(loaded.data.messages[0].imagePaths).toEqual(["images/claude-image-001.png"]);
+    expect(loaded.data.images).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([input]) =>
+      new URL(String(input), "https://claude.ai").pathname === "/api/images/upload-1"
+    )).toHaveLength(1);
+  });
+
+  it("downloads image resources concurrently in bounded batches and keeps message paths stable", async () => {
+    const messageIds = Array.from({ length: 6 }, (_, index) =>
+      `${String(index + 1).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`
+    );
+    let parent = rootParentId;
+    const messages = messageIds.map((id, index) => {
+      const item = message(id, index % 2 === 0 ? "human" : "assistant", parent, `Message ${index + 1}`);
+      item.content = [
+        { type: "text", text: `Message ${index + 1}` },
+        { type: "image", id: `image-${index + 1}`, url: `/api/images/${index + 1}` },
+      ];
+      parent = id;
+      return item;
+    });
+    const raw = {
+      uuid: conversationId,
+      current_leaf_message_uuid: messageIds.at(-1),
+      chat_messages: messages,
+    };
+    const { send, fetchMock } = await installClaudeContentScript(raw);
+    let activeRequests = 0;
+    let maximumActiveRequests = 0;
+    fetchMock.mockImplementation(async (input) => {
+      const url = new URL(String(input), "https://claude.ai");
+      if (url.pathname === "/api/organizations") {
+        return new Response(JSON.stringify([{ uuid: organizationId }]), { status: 200 });
+      }
+      if (url.pathname.endsWith(`/chat_conversations/${conversationId}`)) {
+        return new Response(JSON.stringify(raw), { status: 200 });
+      }
+      if (url.pathname.startsWith("/api/images/")) {
+        activeRequests++;
+        maximumActiveRequests = Math.max(maximumActiveRequests, activeRequests);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        activeRequests--;
+        return new Response(new Uint8Array([Number(url.pathname.split("/").at(-1))]), {
+          status: 200,
+          headers: { "content-type": "image/png" },
+        });
+      }
+      return new Response("Not found", { status: 404 });
+    });
+
+    const loaded = await send(CONTENT_LOAD_TYPE, {
+      downloadImages: true,
+      selectedMessageIds: messageIds,
+    });
+
+    expect(loaded.success).toBe(true);
+    expect(maximumActiveRequests).toBeGreaterThan(1);
+    expect(maximumActiveRequests).toBeLessThanOrEqual(4);
+    expect(loaded.data.images).toHaveLength(messageIds.length);
+    expect(loaded.data.messages.map((item: { imagePaths: string[] }) => item.imagePaths[0]))
+      .toEqual(messageIds.map((_, index) => `images/claude-image-${String(index + 1).padStart(3, "0")}.png`));
+  });
+
   it("returns an explicit error instead of partial data when a real parent is missing", async () => {
     const { send } = await installClaudeContentScript({
       uuid: conversationId,

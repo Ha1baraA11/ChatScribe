@@ -3,7 +3,12 @@ import type { ExportArtifactData } from "./types.ts";
 
 export interface ClaudeImageReference {
   messageId: string;
-  url: string;
+  /** Stable within this conversation snapshot; never included in diagnostics. */
+  resourceId: string;
+  url?: string;
+  inlineData?: string;
+  mimeType?: string;
+  source: "conversation-api" | "rendered-image-recovery";
 }
 
 export interface ParsedClaudeConversation {
@@ -233,26 +238,57 @@ function artifactEventFromBlock(
   blockValue: unknown,
 ): ClaudeArtifactEvent | null {
   const block = asRecord(blockValue);
-  if (!block || block.type !== "tool_use") return null;
+  if (!block) return null;
   const name = stringValue(block.name).toLowerCase();
-  if (name !== "artifacts" && name !== "artifact") return null;
+  const blockType = stringValue(block.type).toLowerCase();
+  const artifactNames = new Set([
+    "artifacts",
+    "artifact",
+    "create_artifact",
+    "update_artifact",
+    "rewrite_artifact",
+  ]);
+  if (blockType !== "tool_use" && blockType !== "artifact" && !artifactNames.has(name)) {
+    return null;
+  }
+  if (blockType === "tool_use" && !artifactNames.has(name)) return null;
 
-  const input = asRecord(block.input) ?? {};
+  const input = asRecord(block.input) ?? block;
   const artifactId = stringValue(input.id || input.artifact_id || input.uuid);
-  const command = stringValue(input.command || input.action).toLowerCase();
+  const commandName = name.replace(/_artifact$/, "");
+  const command = stringValue(input.command || input.action || commandName).toLowerCase();
   if (!artifactId || !["create", "update", "rewrite"].includes(command)) return null;
 
   const titleValue = stringValue(input.title || input.name).trim();
+  const source = asRecord(input.source);
 
   return {
     messageId,
     artifactId,
     ...(titleValue ? { title: titleValue } : {}),
-    language: stringValue(input.language || input.type),
+    language: stringValue(input.language || input.mime_type || input.type),
     command,
-    ...(typeof input.content === "string" ? { content: input.content } : {}),
-    ...(typeof input.old_str === "string" ? { oldText: input.old_str } : {}),
-    ...(typeof input.new_str === "string" ? { newText: input.new_str } : {}),
+    ...(typeof input.content === "string"
+      ? { content: input.content }
+      : typeof input.code === "string"
+        ? { content: input.code }
+        : typeof input.html === "string"
+          ? { content: input.html }
+          : typeof input.svg === "string"
+            ? { content: input.svg }
+            : typeof source?.text === "string"
+              ? { content: source.text }
+              : {}),
+    ...(typeof input.old_str === "string"
+      ? { oldText: input.old_str }
+      : typeof input.old_text === "string"
+        ? { oldText: input.old_text }
+        : {}),
+    ...(typeof input.new_str === "string"
+      ? { newText: input.new_str }
+      : typeof input.new_text === "string"
+        ? { newText: input.new_text }
+        : {}),
   };
 }
 
@@ -358,52 +394,114 @@ function buildArtifactContent(
   return { referencesByMessage, artifacts };
 }
 
-function findImageUrls(value: unknown, output: Set<string>): void {
+function collectImageResources(
+  messageId: string,
+  ...values: unknown[]
+): ClaudeImageReference[] {
   const seen = new WeakSet<object>();
-  const visit = (current: unknown, depth: number): void => {
-    if (depth > 8 || current === null || typeof current !== "object") return;
-    if (seen.has(current)) return;
-    seen.add(current);
+  const byAlias = new Map<string, ClaudeImageReference>();
+  const output: ClaudeImageReference[] = [];
+  let anonymousOrdinal = 0;
 
-    if (Array.isArray(current)) {
-      for (const item of current) visit(item, depth + 1);
-      return;
-    }
-    const record = current as Record<string, unknown>;
-    const type = stringValue(record.type).toLowerCase();
-    const fileKind = stringValue(record.file_kind).toLowerCase();
-    if (type === "image" || fileKind === "image") {
-      const source = asRecord(record.source);
-      const image = asRecord(record.image);
-      const url = stringValue(record.url) || stringValue(source?.url) ||
-        stringValue(image?.url) || stringValue(record.image_url);
-      if (url) output.add(url);
-    }
+  const register = (record: Record<string, unknown>): void => {
+    const source = asRecord(record.source);
+    const image = asRecord(record.image);
+    const rawMimeType = stringValue(
+      record.mime_type || record.media_type || record.mimeType ||
+        source?.media_type || source?.mime_type || image?.mime_type,
+    ).trim().toLowerCase();
+    const urlValue = record.url || record.preview_url || record.download_url ||
+      record.file_url || record.image_url || source?.url || image?.url;
+    const rawUrl = typeof urlValue === "string"
+      ? urlValue.trim()
+      : stringValue(asRecord(urlValue)?.url).trim();
+    const rawInline = record.data || record.base64 || source?.data || image?.data;
+    let inlineData: string | undefined;
+    let mimeType = rawMimeType.startsWith("image/")
+      ? rawMimeType.split(";")[0]
+      : undefined;
+    let url: string | undefined;
 
-    for (const [key, child] of Object.entries(record)) {
-      if (["content", "attachments", "files", "source", "image", "images"].includes(key)) {
-        visit(child, depth + 1);
+    if (rawUrl.startsWith("data:")) {
+      const match = rawUrl.match(/^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=]+)$/i);
+      if (match) {
+        mimeType ??= match[1].toLowerCase();
+        inlineData = match[2];
+      }
+    } else if (rawUrl) {
+      try {
+        const parsed = new URL(rawUrl, "https://claude.ai");
+        if (parsed.protocol === "https:") url = parsed.href;
+      } catch {
+        // A page-owned blob preview is recovered from the matching message DOM.
       }
     }
-  };
-  visit(value, 0);
-}
 
-function countImageResources(...values: unknown[]): number {
-  const seen = new WeakSet<object>();
-  let count = 0;
+    const inlineValue = typeof rawInline === "string" ? rawInline.trim() : "";
+    if (!inlineData && inlineValue) {
+      const dataUrl = inlineValue.match(/^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=]+)$/i);
+      if (dataUrl) {
+        mimeType ??= dataUrl[1].toLowerCase();
+        inlineData = dataUrl[2];
+      } else if (mimeType && /^[a-z0-9+/]*={0,2}$/i.test(inlineValue)) {
+        inlineData = inlineValue;
+      }
+    }
+
+    const type = stringValue(record.type).toLowerCase();
+    const fileKind = stringValue(record.file_kind || record.fileKind).toLowerCase();
+    const imageLike = type === "image" || fileKind === "image" ||
+      mimeType !== undefined ||
+      rawUrl.toLowerCase().startsWith("data:image/");
+    if (!imageLike) return;
+
+    const explicitId = stringValue(
+      record.uuid || record.file_uuid || record.file_id || record.asset_id ||
+        record.image_id || record.attachment_id || record.id,
+    ).trim();
+    const aliases = [
+      ...(explicitId ? [`id:${explicitId}`] : []),
+      ...(url ? [`url:${url}`] : []),
+      ...(inlineData ? [`data:${fingerprint([mimeType ?? "", inlineData])}`] : []),
+    ];
+    const existing = aliases.map((alias) => byAlias.get(alias)).find(Boolean);
+    if (existing) {
+      existing.url ??= url;
+      existing.inlineData ??= inlineData;
+      existing.mimeType ??= mimeType;
+      existing.source = existing.url || existing.inlineData
+        ? "conversation-api"
+        : "rendered-image-recovery";
+      for (const alias of aliases) byAlias.set(alias, existing);
+      return;
+    }
+
+    const reference: ClaudeImageReference = {
+      messageId,
+      resourceId: explicitId
+        ? `id:${explicitId}`
+        : aliases[0] ?? `anonymous:${++anonymousOrdinal}`,
+      ...(url ? { url } : {}),
+      ...(inlineData ? { inlineData } : {}),
+      ...(mimeType ? { mimeType } : {}),
+      source: url || inlineData ? "conversation-api" : "rendered-image-recovery",
+    };
+    output.push(reference);
+    for (const alias of aliases) byAlias.set(alias, reference);
+  };
+
   const visit = (current: unknown, depth: number): void => {
     if (depth > 8 || current === null || typeof current !== "object") return;
     if (seen.has(current)) return;
     seen.add(current);
+
     if (Array.isArray(current)) {
       for (const item of current) visit(item, depth + 1);
       return;
     }
     const record = current as Record<string, unknown>;
-    const type = stringValue(record.type).toLowerCase();
-    const fileKind = stringValue(record.file_kind).toLowerCase();
-    if (type === "image" || fileKind === "image") count++;
+    register(record);
+
     for (const [key, child] of Object.entries(record)) {
       if (["content", "attachments", "files", "source", "image", "images"].includes(key)) {
         visit(child, depth + 1);
@@ -411,7 +509,7 @@ function countImageResources(...values: unknown[]): number {
     }
   };
   values.forEach((value) => visit(value, 0));
-  return count;
+  return output;
 }
 
 function findAttachmentNotes(message: ClaudeMessageRecord): string[] {
@@ -567,24 +665,14 @@ export function parseClaudeConversation(
     const attachmentNotes = findAttachmentNotes(message);
     bodyParts.push(...attachmentNotes);
 
-    const urls = new Set<string>();
-    findImageUrls(message.content, urls);
-    findImageUrls(message.attachments, urls);
-    findImageUrls(message.files, urls);
-    const imageCount = Math.max(
-      urls.size,
-      countImageResources(message.content, message.attachments, message.files),
+    const imageResources = collectImageResources(
+      id,
+      message.content,
+      message.attachments,
+      message.files,
     );
-    for (const rawUrl of urls) {
-      try {
-        const imageUrl = new URL(rawUrl, "https://claude.ai");
-        if (imageUrl.protocol === "https:") {
-          imageReferences.push({ messageId: id, url: imageUrl.href });
-        }
-      } catch {
-        // Invalid image references are omitted and reported by the downloader.
-      }
-    }
+    imageReferences.push(...imageResources);
+    const imageCount = imageResources.length;
 
     const isTruncated = message.truncated === true ||
       ["streaming", "in_progress", "pending"].includes(
@@ -625,10 +713,12 @@ export function parseClaudeConversation(
     responseId || "",
     leafId,
     activeMessages.map((message) => {
-      const imageUrls = new Set<string>();
-      findImageUrls(message.content, imageUrls);
-      findImageUrls(message.attachments, imageUrls);
-      findImageUrls(message.files, imageUrls);
+      const imageResources = collectImageResources(
+        getMessageId(message),
+        message.content,
+        message.attachments,
+        message.files,
+      );
       return [
         getMessageId(message),
         getParentReference(message),
@@ -640,12 +730,15 @@ export function parseClaudeConversation(
         // the exported text is available in the fallback field.
         message.content ?? null,
         message.text ?? null,
+        message.attachments ?? null,
+        message.files ?? null,
         findAttachmentNotes(message),
-        Math.max(
-          imageUrls.size,
-          countImageResources(message.content, message.attachments, message.files),
-        ),
-        [...imageUrls].sort(),
+        imageResources.map((resource) => [
+          resource.resourceId,
+          resource.url ?? "",
+          resource.mimeType ?? "",
+          resource.inlineData ? fingerprint(resource.inlineData) : "",
+        ]).sort(([left], [right]) => left.localeCompare(right)),
         getTimestamp(message.created_at) ?? null,
       ];
     }),

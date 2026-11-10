@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  hasChatGptComponentMarkup,
   normalizeChatGptComponents,
   renderSvgTemplatesAsMarkdown,
 } from "../src/svg-template.ts";
@@ -102,6 +103,18 @@ describe("SVG diagram export", () => {
 
     expect(result.markdown).toBe(diagram);
     expect(result.assets).toEqual([]);
+  });
+});
+
+describe("ChatGPT component detection for clipboard", () => {
+  it("detects serialized components without treating code or ordinary text as markup", () => {
+    expect(hasChatGptComponentMarkup('<LearningViz type_id="SORT"/>')).toBe(true);
+    expect(hasChatGptComponentMarkup("{ordinary: text} and $x < y$"))
+      .toBe(false);
+    expect(hasChatGptComponentMarkup('```xml\n<LearningViz type_id="SORT"/>\n```'))
+      .toBe(false);
+    expect(hasChatGptComponentMarkup("`<Grid>`"))
+      .toBe(false);
   });
 });
 

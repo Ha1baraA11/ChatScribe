@@ -12,13 +12,24 @@ import {
   CONTENT_PING_TYPE,
   CONTENT_WATCH_CONVERSATION_TYPE,
 } from "./content-protocol.ts";
-import { getClaudeConversationId, parseClaudeConversation } from "./claude-conversation.ts";
+import {
+  getClaudeConversationId,
+  parseClaudeConversation,
+  type ClaudeImageReference,
+} from "./claude-conversation.ts";
 import { readResponseBytesLimited, assertNoRedirect } from "./bounded-response.ts";
-import type { ConversationData, ExportImageFile, ExportMessage } from "./types.ts";
+import type {
+  ConversationData,
+  ExportImageFile,
+  ExportMessage,
+  ImageExportDiagnosticMessage,
+  ImageExportDiagnostics,
+} from "./types.ts";
 
 const MAX_CONVERSATION_BYTES = 100 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES = 200 * 1024 * 1024;
+const MAX_PARALLEL_IMAGE_DOWNLOADS = 4;
 const REQUEST_TIMEOUT_MS = 30_000;
 
 const cleanupWindow = window as Window & {
@@ -63,6 +74,11 @@ function clearCachedOrganization(): void {
 interface DownloadedImage {
   image: ExportImageFile;
   path: string;
+}
+
+interface AttachedImagesResult {
+  images: ExportImageFile[];
+  diagnostics?: ImageExportDiagnostics;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -237,18 +253,34 @@ async function downloadImage(
   url: string,
   index: number,
   remainingTotalBytes: number,
+  source: "https" | "blob" = "https",
 ): Promise<DownloadedImage> {
   const parsed = new URL(url, window.location.origin);
-  if (parsed.origin !== window.location.origin || parsed.protocol !== "https:") {
+  const isPageBlob = source === "blob" && parsed.protocol === "blob:" &&
+    parsed.origin === window.location.origin;
+  const isClaudeHttps = source === "https" && parsed.protocol === "https:" &&
+    (parsed.hostname === "claude.ai" || parsed.hostname.endsWith(".claude.ai") ||
+      parsed.hostname === "anthropic.com" || parsed.hostname.endsWith(".anthropic.com"));
+  if (!isPageBlob && !isClaudeHttps) {
     throw new Error("external-host");
   }
   const response = await fetch(parsed.href, {
-    credentials: "include",
+    credentials: parsed.origin === window.location.origin ? "include" : "omit",
     cache: "no-store",
     redirect: "error",
     signal: timeoutSignal(),
   });
-  assertNoRedirect(response, window.location.origin, "Claude redirected an image request.");
+  if (source === "blob") {
+    if (response.redirected) throw new Error("redirected");
+    if (response.url) {
+      const finalUrl = new URL(response.url);
+      if (finalUrl.protocol !== "blob:" || finalUrl.origin !== window.location.origin) {
+        throw new Error("redirected");
+      }
+    }
+  } else {
+    assertNoRedirect(response, parsed.origin, "Claude redirected an image request.");
+  }
   if (!response.ok) throw new Error("download-failed");
   const bytes = await readResponseBytesLimited(
     response,
@@ -271,55 +303,449 @@ async function downloadImage(
   return { image, path };
 }
 
+function inlineImageBytes(
+  base64: string,
+  remainingTotalBytes: number,
+): Uint8Array {
+  const maximum = Math.min(MAX_IMAGE_BYTES, remainingTotalBytes);
+  if (base64.length === 0 || base64.length > Math.ceil(maximum / 3) * 4 + 4) {
+    throw new Error("image-too-large");
+  }
+  let binary: string;
+  try {
+    binary = atob(base64);
+  } catch {
+    throw new Error("unreadable-image");
+  }
+  if (!binary.length || binary.length > maximum) throw new Error("image-too-large");
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function createDownloadedImage(
+  bytes: Uint8Array,
+  mimeTypeValue: string,
+  index: number,
+): DownloadedImage {
+  const mimeType = mimeTypeValue.toLowerCase().split(";")[0].trim();
+  if (!mimeType.startsWith("image/")) throw new Error("not-an-image");
+  const path = `images/claude-image-${String(index).padStart(3, "0")}.${extensionForMimeType(mimeType)}`;
+  const image: ExportImageFile = {
+    path,
+    mimeType,
+    base64: bytesToBase64(bytes),
+    sizeBytes: bytes.length,
+  };
+  return { image, path };
+}
+
+function renderedBlobPreviews(messageIds: ReadonlySet<string>): Map<string, string[]> {
+  const previews = new Map<string, string[]>();
+  const uuidPattern = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const thumbnails = document.querySelectorAll<HTMLElement>(
+    '[data-testid="file-thumbnail"][data-item-key]',
+  );
+  for (const thumbnail of thumbnails) {
+    const itemKey = thumbnail.getAttribute("data-item-key") ?? "";
+    const messageId = itemKey.split(":")[0];
+    if (!uuidPattern.test(messageId) || !messageIds.has(messageId)) continue;
+
+    const row = thumbnail.closest('[data-testid="transcript-row"]');
+    const message = row?.querySelector<HTMLElement>(
+      '[data-testid="user-message"], [data-testid="assistant-message"]',
+    );
+    const renderedMessageId = message?.id.match(uuidPattern)?.[0];
+    if (renderedMessageId !== messageId) continue;
+
+    for (const image of thumbnail.querySelectorAll<HTMLImageElement>("img")) {
+      const rawUrl = image.currentSrc || image.getAttribute("src") || "";
+      try {
+        const url = new URL(rawUrl);
+        if (url.protocol !== "blob:" || url.origin !== window.location.origin) continue;
+        const existing = previews.get(messageId) ?? [];
+        if (!existing.includes(url.href)) existing.push(url.href);
+        previews.set(messageId, existing);
+      } catch {
+        // Ignore rendered assets that are not a verified same-origin blob.
+      }
+    }
+  }
+  return previews;
+}
+
+function mergeRenderedPreviews(
+  destination: Map<string, string[]>,
+  additions: Map<string, string[]>,
+): void {
+  for (const [messageId, urls] of additions) {
+    const existing = destination.get(messageId) ?? [];
+    for (const url of urls) if (!existing.includes(url)) existing.push(url);
+    destination.set(messageId, existing);
+  }
+}
+
+function findLoadEarlierButton(): HTMLButtonElement | null {
+  return [...document.querySelectorAll<HTMLButtonElement>("button")].find((button) => {
+    const label = `${button.getAttribute("aria-label") ?? ""} ${button.textContent ?? ""}`
+      .trim()
+      .toLowerCase();
+    return !button.disabled && (
+      label === "load earlier messages" ||
+      label === "load earlier" ||
+      label.includes("加载更早")
+    );
+  }) ?? null;
+}
+
+function getMessageIdFromRenderedRow(row: Element): string | null {
+  const message = row.querySelector<HTMLElement>(
+    '[data-testid="user-message"], [data-testid="assistant-message"]',
+  );
+  const match = message?.id.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+  return match?.[0] ?? null;
+}
+
+async function collectRenderedBlobPreviews(
+  requiredPreviewsByMessage: ReadonlyMap<string, number>,
+  conversationId: string,
+): Promise<Map<string, string[]>> {
+  const messageIds = new Set(requiredPreviewsByMessage.keys());
+  const previews = renderedBlobPreviews(messageIds);
+  const allFound = (): boolean => [...requiredPreviewsByMessage].every(([id, required]) =>
+    (previews.get(id)?.length ?? 0) >= required
+  );
+  if (!messageIds.size || allFound()) return previews;
+
+  const firstRow = document.querySelector<HTMLElement>('[data-testid="transcript-row"]');
+  let scroller: HTMLElement | null = null;
+  for (let ancestor = firstRow?.parentElement ?? null; ancestor; ancestor = ancestor.parentElement) {
+    const style = window.getComputedStyle(ancestor);
+    if (
+      ancestor.scrollHeight > ancestor.clientHeight + 32 &&
+      (style.overflowY === "auto" || style.overflowY === "scroll")
+    ) {
+      scroller = ancestor;
+      break;
+    }
+  }
+  if (!scroller) return previews;
+
+  const originalScrollTop = scroller.scrollTop;
+  const initialVisibleRows = [...document.querySelectorAll<HTMLElement>(
+    '[data-testid="transcript-row"]',
+  )].filter((row) => {
+    const bounds = row.getBoundingClientRect();
+    return bounds.bottom > 0 && bounds.top < window.innerHeight;
+  });
+  const anchorRow = initialVisibleRows[0];
+  const anchorMessageId = anchorRow ? getMessageIdFromRenderedRow(anchorRow) : null;
+  const anchorOffset = anchorRow?.getBoundingClientRect().top ?? 0;
+  try {
+    for (const [messageId, requiredCount] of requiredPreviewsByMessage) {
+      let row = [...document.querySelectorAll<HTMLElement>(
+        '[data-testid="transcript-row"]',
+      )].find((candidate) => getMessageIdFromRenderedRow(candidate) === messageId) ?? null;
+
+      // Older rows may be held behind Claude's explicit load-earlier control.
+      // Fetch only until this selected message appears or the bound is reached.
+      for (let page = 0; !row && page < 64; page++) {
+        const button = findLoadEarlierButton();
+        if (!button) break;
+        scroller.scrollTop = 0;
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 60));
+        button.click();
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 180));
+        ensureCurrentConversation(conversationId);
+        mergeRenderedPreviews(previews, renderedBlobPreviews(messageIds));
+        row = [...document.querySelectorAll<HTMLElement>(
+          '[data-testid="transcript-row"]',
+        )].find((candidate) => getMessageIdFromRenderedRow(candidate) === messageId) ?? null;
+      }
+
+      if (row && (previews.get(messageId)?.length ?? 0) < requiredCount) {
+        const scrollerTop = scroller.getBoundingClientRect().top;
+        scroller.scrollTop += row.getBoundingClientRect().top - scrollerTop;
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 90));
+        ensureCurrentConversation(conversationId);
+        mergeRenderedPreviews(previews, renderedBlobPreviews(messageIds));
+      }
+    }
+  } finally {
+    const anchor = anchorMessageId
+      ? [...document.querySelectorAll<HTMLElement>('[data-testid="transcript-row"]')]
+        .find((row) => getMessageIdFromRenderedRow(row) === anchorMessageId)
+      : null;
+    if (anchor) {
+      scroller.scrollTop += anchor.getBoundingClientRect().top - anchorOffset;
+    } else {
+      scroller.scrollTop = originalScrollTop;
+    }
+  }
+  return previews;
+}
+
+function safeImageFailure(error: unknown): string {
+  const code = error instanceof Error ? error.message : "";
+  if (code.includes("image-too-large")) return "over-limit";
+  if (code.includes("not-an-image")) return "unsupported-type";
+  if (code.includes("external-host")) return "unverified-source";
+  if (code.includes("redirect")) return "redirect-blocked";
+  if (code.includes("unreadable-image")) return "unreadable";
+  return "unavailable";
+}
+
 async function attachImages(
   messages: ExportMessage[],
-  references: Array<{ messageId: string; url: string }>,
+  references: ClaudeImageReference[],
+  conversationId: string,
   selectedMessageIds?: string[],
-): Promise<ExportImageFile[]> {
+): Promise<AttachedImagesResult> {
   const selected = selectedMessageIds ? new Set(selectedMessageIds) : null;
   const eligible = references.filter((reference) => !selected || selected.has(reference.messageId));
-  const byUrl = new Map<string, DownloadedImage | null>();
-  const failuresByMessage = new Map<string, number>();
+  if (eligible.length === 0) return { images: [] };
+  const startedAt = Date.now();
+  const failuresByReference = new Map<ClaudeImageReference, string>();
+  const kindsByMessage = new Map<string, Set<string>>();
+  const attemptsByMessage = new Map<string, number>();
   const messagesById = new Map(messages.map((message) => [message.id, message]));
   const images: ExportImageFile[] = [];
   let totalBytes = 0;
+  let maxConcurrentUrlDownloads = 0;
+  const uniqueReferences: ClaudeImageReference[] = [];
+  const uniqueReferenceIndexes = new Map<string, number>();
+  for (const reference of eligible) {
+    if (uniqueReferenceIndexes.has(reference.resourceId)) continue;
+    uniqueReferenceIndexes.set(reference.resourceId, uniqueReferences.length);
+    uniqueReferences.push(reference);
+  }
+  const resultsByResource = new Map<string, DownloadedImage | null>();
+  const failuresByResource = new Map<string, string>();
+  const pendingRendered = new Set<string>();
+  const resultsByReference = new Map<ClaudeImageReference, DownloadedImage | null>();
+  const messagePreviewQueues = new Map<string, string[]>();
+  const messagePreviewOffsets = new Map<string, number>();
+
+  const addImage = (reference: ClaudeImageReference, result: DownloadedImage): void => {
+    const message = messagesById.get(reference.messageId);
+    if (message && !message.imagePaths.includes(result.path)) message.imagePaths.push(result.path);
+  };
+
+  const recordFailure = (reference: ClaudeImageReference, reason: string): void => {
+    failuresByReference.set(reference, reason);
+  };
+
+  const addKind = (reference: ClaudeImageReference, kind: string): void => {
+    const kinds = kindsByMessage.get(reference.messageId) ?? new Set<string>();
+    kinds.add(kind);
+    kindsByMessage.set(reference.messageId, kinds);
+  };
+
+  for (let offset = 0; offset < uniqueReferences.length;) {
+    const remainingTotalBytes = MAX_TOTAL_IMAGE_BYTES - totalBytes;
+    if (remainingTotalBytes <= 0) {
+      for (const reference of uniqueReferences.slice(offset)) {
+        resultsByResource.set(reference.resourceId, null);
+        failuresByResource.set(reference.resourceId, "over-limit");
+        pendingRendered.add(reference.messageId);
+      }
+      break;
+    }
+
+    // Each request can use at most 20 MB. Batch width is capped so the sum of
+    // per-request limits never exceeds the 200 MB conversation budget.
+    const batchWidth = Math.max(
+      1,
+      Math.floor(remainingTotalBytes / MAX_IMAGE_BYTES),
+    );
+    const batchSize = Math.min(
+      MAX_PARALLEL_IMAGE_DOWNLOADS,
+      batchWidth,
+      uniqueReferences.length - offset,
+    );
+    const batch = uniqueReferences.slice(offset, offset + batchSize);
+    maxConcurrentUrlDownloads = Math.max(
+      maxConcurrentUrlDownloads,
+      batch.filter((reference) => Boolean(reference.url)).length,
+    );
+    const batchResults = await Promise.all(batch.map(async (reference, batchIndex) => {
+      const resourceIndex = offset + batchIndex;
+      attemptsByMessage.set(
+        reference.messageId,
+        (attemptsByMessage.get(reference.messageId) ?? 0) + 1,
+      );
+      try {
+        if (reference.inlineData) {
+          const bytes = inlineImageBytes(reference.inlineData, remainingTotalBytes);
+          return {
+            reference,
+            resourceIndex,
+            result: createDownloadedImage(
+              bytes,
+              reference.mimeType ?? "image/png",
+              resourceIndex + 1,
+            ),
+          };
+        }
+        if (reference.url) {
+          return {
+            reference,
+            resourceIndex,
+            result: await downloadImage(
+              reference.url,
+              resourceIndex + 1,
+              remainingTotalBytes,
+            ),
+          };
+        }
+        return { reference, resourceIndex, result: null };
+      } catch (error) {
+        return { reference, resourceIndex, error };
+      }
+    }));
+
+    for (const item of batchResults) {
+      const { reference } = item;
+      if ("error" in item) {
+        const reason = safeImageFailure(item.error);
+        resultsByResource.set(reference.resourceId, null);
+        failuresByResource.set(reference.resourceId, reason);
+        pendingRendered.add(reference.messageId);
+        continue;
+      }
+      const result = item.result;
+      resultsByResource.set(reference.resourceId, result);
+      if (!result) {
+        pendingRendered.add(reference.messageId);
+        continue;
+      }
+      totalBytes += result.image.sizeBytes;
+      images.push(result.image);
+    }
+    offset += batchSize;
+  }
 
   for (const reference of eligible) {
-    let result = byUrl.get(reference.url);
-    if (result === undefined) {
+    const result = resultsByResource.get(reference.resourceId) ?? null;
+    resultsByReference.set(reference, result);
+    if (!result) {
+      const failure = failuresByResource.get(reference.resourceId);
+      if (failure) recordFailure(reference, failure);
+      pendingRendered.add(reference.messageId);
+      continue;
+    }
+    addImage(reference, result);
+    addKind(reference, reference.inlineData ? "api-inline" : "api-url");
+  }
+
+  if (pendingRendered.size > 0) {
+    const requiredPreviewsByMessage = new Map<string, number>();
+    for (const reference of eligible) {
+      if (pendingRendered.has(reference.messageId) && !resultsByReference.get(reference)) {
+        requiredPreviewsByMessage.set(
+          reference.messageId,
+          (requiredPreviewsByMessage.get(reference.messageId) ?? 0) + 1,
+        );
+      }
+    }
+    const previews = await collectRenderedBlobPreviews(
+      requiredPreviewsByMessage,
+      conversationId,
+    );
+    for (const messageId of pendingRendered) {
+      messagePreviewQueues.set(messageId, previews.get(messageId) ?? []);
+    }
+
+    for (const reference of eligible) {
+      if (!pendingRendered.has(reference.messageId) || resultsByReference.get(reference)) continue;
+      const cachedResult = resultsByResource.get(reference.resourceId);
+      if (cachedResult) {
+        resultsByReference.set(reference, cachedResult);
+        addImage(reference, cachedResult);
+        addKind(reference, "page-blob-preview");
+        continue;
+      }
+      const queue = messagePreviewQueues.get(reference.messageId) ?? [];
+      const offset = messagePreviewOffsets.get(reference.messageId) ?? 0;
+      const blobUrl = queue[offset];
+      if (blobUrl) messagePreviewOffsets.set(reference.messageId, offset + 1);
+      if (!blobUrl) continue;
+      const imageIndex = (uniqueReferenceIndexes.get(reference.resourceId) ?? 0) + 1;
       try {
         const next = await downloadImage(
-          reference.url,
-          images.length + 1,
+          blobUrl,
+          imageIndex,
           MAX_TOTAL_IMAGE_BYTES - totalBytes,
+          "blob",
         );
         totalBytes += next.image.sizeBytes;
         images.push(next.image);
-        result = next;
-      } catch {
-        result = null;
+        resultsByResource.set(reference.resourceId, next);
+        resultsByReference.set(reference, next);
+        addKind(reference, "page-blob-preview");
+        addImage(reference, next);
+        failuresByReference.delete(reference);
+      } catch (error) {
+        recordFailure(reference, safeImageFailure(error));
+        resultsByResource.set(reference.resourceId, null);
+        resultsByReference.set(reference, null);
       }
-      byUrl.set(reference.url, result);
-    }
-
-    if (result) {
-      const message = messagesById.get(reference.messageId);
-      if (message && !message.imagePaths.includes(result.path)) message.imagePaths.push(result.path);
-    } else {
-      failuresByMessage.set(
-        reference.messageId,
-        (failuresByMessage.get(reference.messageId) ?? 0) + 1,
-      );
     }
   }
 
-  for (const [messageId, count] of failuresByMessage) {
-    const message = messagesById.get(messageId);
-    if (message) {
-      message.content += `\n\n[${count} image${count === 1 ? "" : "s"} could not be bundled.]`;
+  for (const reference of eligible) {
+    if (!resultsByReference.get(reference)) {
+      if (!failuresByReference.has(reference)) {
+        recordFailure(reference, "unavailable");
+      }
     }
   }
-  return images;
+
+  const diagnosticMessages: ImageExportDiagnosticMessage[] = messages
+    .filter((message) => eligible.some((reference) => reference.messageId === message.id))
+    .map((message) => {
+      const resources = eligible.filter((reference) => reference.messageId === message.id);
+      const failures = resources.flatMap((reference) => {
+        const reason = failuresByReference.get(reference);
+        return reason ? [reason] : [];
+      });
+      return {
+        questionNumber: null,
+        role: message.role,
+        origin: resources.some((reference) => reference.source === "rendered-image-recovery")
+          ? "rendered-image-recovery"
+          : "conversation-api",
+        includedBySettings: true,
+        imageResourceCount: resources.length,
+        imageResourceKinds: [...(kindsByMessage.get(message.id) ?? new Set<string>())],
+        sandboxReferenceCount: 0,
+        downloadAttemptedCount: attemptsByMessage.get(message.id) ?? 0,
+        downloadedPaths: [...message.imagePaths],
+        downloadFailures: failures,
+      };
+    });
+  const diagnostics: ImageExportDiagnostics = {
+    schemaVersion: 1,
+    buildId: CHATSCRIBE_BUILD_ID,
+    startedAt: new Date(startedAt).toISOString(),
+    settings: {
+      bundleImages: true,
+      includeGeneratedImages: true,
+      fetchImages: true,
+      selectedMessagesOnly: selectedMessageIds !== undefined,
+    },
+    events: [{
+      elapsedMs: Math.max(0, Date.now() - startedAt),
+      stage: "claude-image-recovery",
+      details: {
+        resourceCount: eligible.length,
+        downloadedCount: images.length,
+        failureCount: diagnosticMessages.reduce((sum, item) => sum + item.downloadFailures.length, 0),
+        maxConcurrentUrlDownloads,
+        renderedPreviewScan: pendingRendered.size > 0,
+      },
+    }],
+    messages: diagnosticMessages,
+  };
+  return { images, diagnostics };
 }
 
 async function readConversation(
@@ -329,7 +755,7 @@ async function readConversation(
 ): Promise<{
   data: ConversationData;
   conversationId: string;
-  imageReferences: Array<{ messageId: string; url: string }>;
+  imageReferences: ClaudeImageReference[];
 }> {
   const conversationId = conversationIdValue ?? currentConversationId();
   const fetched = fetchedValue ?? await fetchClaudeConversation(conversationId);
@@ -346,6 +772,7 @@ async function readConversation(
       images: [],
       revision: parsed.revision,
       artifacts: parsed.artifacts,
+      imageMetadataIncluded: true,
     },
     imageReferences: parsed.imageReferences,
   };
@@ -359,7 +786,14 @@ async function handleLoad(message: ClaudeLoadRequest): Promise<ConversationData>
     conversationId,
   );
   if (message.downloadImages === true && message.fetchImages !== false) {
-    data.images = await attachImages(data.messages, imageReferences, message.selectedMessageIds);
+    const attached = await attachImages(
+      data.messages,
+      imageReferences,
+      conversationId,
+      message.selectedMessageIds,
+    );
+    data.images = attached.images;
+    if (attached.diagnostics) data.imageDiagnostics = attached.diagnostics;
     ensureCurrentConversation(conversationId);
   }
   return data;

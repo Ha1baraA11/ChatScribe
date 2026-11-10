@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   BRIDGE_API_REQUEST_TYPE,
   BRIDGE_API_RESPONSE_TYPE,
+  BRIDGE_IMAGE_REQUEST_TYPE,
   BRIDGE_PING_TYPE,
   BRIDGE_PONG_TYPE,
   CHATSCRIBE_BUILD_ID,
@@ -89,9 +90,11 @@ describe("conversation refresh cache", () => {
       ],
     };
     const apiRequestCount = vi.fn();
+    const imageRequestCount = vi.fn();
     const originalPostMessage = fakeWindow.postMessage;
     fakeWindow.postMessage = (message) => {
       if (message.type === BRIDGE_API_REQUEST_TYPE) apiRequestCount();
+      if (message.type === BRIDGE_IMAGE_REQUEST_TYPE) imageRequestCount();
       originalPostMessage(message);
     };
 
@@ -181,6 +184,48 @@ describe("conversation refresh cache", () => {
     expect(changedCheck.data.revision).not.toBe(refreshed.data.revision);
     expect(changedCheck.data.messages.at(-1).content).toBe("edited after completion");
     expect(apiRequestCount).toHaveBeenCalledTimes(5);
+
+    apiPage.current_node = "assistant-image";
+    apiPage.messages!.push({
+      id: "assistant-image",
+      parent: "assistant-1",
+      author: { role: "assistant" },
+      end_turn: true,
+      content: { parts: [{ asset_pointer: "file-service://file-generated-image" }] },
+    });
+    const copySnapshot = await load({
+      type: CONTENT_LOAD_TYPE,
+      downloadImages: false,
+      includeGeneratedImages: false,
+      fetchImages: false,
+      forceRefresh: true,
+      includeImageMetadata: true,
+    });
+    expect(copySnapshot.data.messages.at(-1)).toMatchObject({
+      id: "assistant-image",
+      content: "",
+      imageCount: 1,
+      imagePaths: [],
+    });
+    expect(copySnapshot.data.imageMetadataIncluded).toBe(true);
+    expect(imageRequestCount).not.toHaveBeenCalled();
+    expect(apiRequestCount).toHaveBeenCalledTimes(6);
+
+    const imageMessage = apiPage.messages!.at(-1)!;
+    imageMessage.content = {
+      parts: [{ asset_pointer: "file-service://file-generated-image-v2" }],
+    };
+    const changedImageCheck = await load({
+      type: CONTENT_CHECK_REVISION_TYPE,
+      knownRevision: copySnapshot.data.revision,
+      returnDataIfChanged: true,
+      includeImageMetadata: true,
+    });
+    expect(changedImageCheck.changed).toBe(true);
+    expect(changedImageCheck.data.imageMetadataIncluded).toBe(true);
+    expect(changedImageCheck.data.messages.at(-1).imageCount).toBe(1);
+    expect(imageRequestCount).not.toHaveBeenCalled();
+    expect(apiRequestCount).toHaveBeenCalledTimes(8);
     expect(CHATSCRIBE_BUILD_ID).toBeTruthy();
   });
 });

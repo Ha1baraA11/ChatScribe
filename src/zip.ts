@@ -10,7 +10,7 @@
  * and broad compatibility.
  */
 
-import type { ExportImageFile, ImageExportDiagnostics } from "./types.ts";
+import type { ExportArchiveFile, ImageExportDiagnostics } from "./types.ts";
 
 // -----------------------------------------------------------------------
 // LOW-LEVEL ZIP HELPERS
@@ -28,6 +28,21 @@ function u32(view: DataView, offset: number, value: number): void {
 
 function encodeUtf8(str: string): Uint8Array {
   return new TextEncoder().encode(str);
+}
+
+function validateArchivePath(path: string): string {
+  const normalized = path.replaceAll("\\", "/");
+  const segments = normalized.split("/");
+  if (
+    !normalized ||
+    normalized.startsWith("/") ||
+    /^[a-z]:/i.test(normalized) ||
+    segments.some((segment) => !segment || segment === "." || segment === "..") ||
+    /[\u0000-\u001f]/.test(normalized)
+  ) {
+    throw new Error("The archive contains an unsafe file path.");
+  }
+  return normalized;
 }
 
 /**
@@ -148,30 +163,34 @@ function buildEndOfCentralDirectory(
 /**
  * Build a ZIP Blob containing:
  *   - `conversationFilename` at the root (the text/Markdown file)
- *   - each image in images/ (from `imageFiles`)
+ *   - each binary or source file in its validated archive directory
  *
  * Everything uses STORE compression (no deflate) so we don't need pako.
  */
 export function buildZipBlob(
   conversationText: string,
   conversationFilename: string,
-  imageFiles: ExportImageFile[],
+  imageFiles: ExportArchiveFile[],
   diagnostics?: ImageExportDiagnostics,
 ): Blob {
   const encoder = encodeUtf8;
 
+  const archivePaths = new Set<string>();
+  const addEntry = (name: string, data: Uint8Array): ZipEntry => {
+    const safeName = validateArchivePath(name);
+    if (archivePaths.has(safeName)) {
+      throw new Error("The archive contains duplicate file paths.");
+    }
+    archivePaths.add(safeName);
+    return { name: safeName, data };
+  };
+
   // Build entries array
   const entries: ZipEntry[] = [
-    { name: conversationFilename, data: encoder(conversationText) },
-    ...imageFiles.map((img) => ({
-      name: img.path,
-      data: base64ToUint8Array(img.base64),
-    })),
+    addEntry(conversationFilename, encoder(conversationText)),
+    ...imageFiles.map((file) => addEntry(file.path, base64ToUint8Array(file.base64))),
     ...(diagnostics
-      ? [{
-          name: "diagnostics/image-export.json",
-          data: encoder(JSON.stringify(diagnostics, null, 2)),
-        }]
+      ? [addEntry("diagnostics/image-export.json", encoder(JSON.stringify(diagnostics, null, 2)))]
       : []),
   ];
 

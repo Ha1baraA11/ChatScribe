@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   assertSelectedMessagesUnchanged,
   captureSelectedMessageSnapshots,
+  prepareMessagesForExport,
   selectHydratedExport,
 } from "../src/export-selection.ts";
 import { formatMarkdown } from "../src/formatter.ts";
@@ -20,6 +21,31 @@ function message(
 }
 
 describe("selected export with generated images", () => {
+  it("keeps image metadata out of exports when image bundling is disabled", () => {
+    const messages = [
+      { ...message("user-text", "user", "Question with a picture", 0), imageCount: 1 },
+      { ...message("user-image", "user", "", 1), imageCount: 1 },
+      { ...message("assistant-text", "assistant", "Answer", 2), imageCount: 2 },
+    ];
+
+    const prepared = prepareMessagesForExport(messages, DEFAULT_SETTINGS);
+
+    expect(prepared.map((item) => item.id)).toEqual(["user-text", "assistant-text"]);
+    expect(prepared.every((item) => item.imageCount === undefined)).toBe(true);
+    expect(prepared[0].content).toBe("Question with a picture");
+    expect(formatMarkdown(prepared, DEFAULT_SETTINGS)).not.toContain("Image not bundled");
+  });
+
+  it("retains exportable image-only messages when image bundling is enabled", () => {
+    const prepared = prepareMessagesForExport([
+      { ...message("user-image", "user", "", 0), imageCount: 1 },
+      { ...message("assistant-image", "assistant", "", 1), imageCount: 1 },
+    ], { ...DEFAULT_SETTINGS, downloadImages: true, includeGeneratedImages: false });
+
+    expect(prepared.map((item) => item.id)).toEqual(["user-image"]);
+    expect(prepared[0].imageCount).toBe(1);
+  });
+
   it("keeps a newly recovered image-only answer and bundles only its file", async () => {
     const conversation: ConversationData = {
       messages: [
@@ -32,6 +58,7 @@ describe("selected export with generated images", () => {
         { path: "images/image-001.png", mimeType: "image/png", base64: "AA==", sizeBytes: 1 },
         { path: "images/image-002.png", mimeType: "image/png", base64: "AA==", sizeBytes: 1 },
       ],
+      revision: "revision-21",
       messageQuestionNumbersById: {
         "user-21": 21,
         "rendered-generated-image:card-21": 21,
@@ -46,6 +73,7 @@ describe("selected export with generated images", () => {
       "rendered-generated-image:card-21",
     ]);
     expect(selected.images.map((image) => image.path)).toEqual(["images/image-001.png"]);
+    expect(selected.revision).toBe("revision-21");
 
     const markdown = formatMarkdown(selected.messages, DEFAULT_SETTINGS);
     expect(markdown).toContain("images/image-001.png");

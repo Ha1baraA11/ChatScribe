@@ -275,6 +275,39 @@ describe("Claude conversation parser", () => {
     }
   });
 
+  it("deduplicates repeated image records and retains inline image data for export", () => {
+    const image = {
+      type: "image",
+      id: "upload-1",
+      source: { url: "https://claude.ai/images/upload-1", media_type: "image/png" },
+    };
+    const raw = conversation([
+      {
+        ...message("u1", "human", null, [{ type: "text", text: "Question" }, image]),
+        attachments: [image],
+        files: [{ type: "image", id: "upload-1", url: image.source.url }],
+      },
+      {
+        ...message("a1", "assistant", "u1", [{
+          type: "image",
+          id: "inline-1",
+          source: { type: "base64", media_type: "image/png", data: "AQID" },
+        }]),
+      },
+    ], "a1");
+
+    const parsed = parseClaudeConversation(raw, parserOptions);
+
+    expect(parsed.messages[0].imageCount).toBe(1);
+    expect(parsed.imageReferences.filter((reference) => reference.messageId === "u1"))
+      .toHaveLength(1);
+    expect(parsed.imageReferences.find((reference) => reference.messageId === "u1"))
+      .toMatchObject({ resourceId: "id:upload-1", url: image.source.url });
+    expect(parsed.messages[1].imageCount).toBe(1);
+    expect(parsed.imageReferences.find((reference) => reference.messageId === "a1"))
+      .toMatchObject({ inlineData: "AQID", mimeType: "image/png" });
+  });
+
   it("places the final Artifact version in the last answer and marks its earlier mention", () => {
     const raw = conversation([
       message("a1", "assistant", null, [
@@ -314,6 +347,26 @@ describe("Claude conversation parser", () => {
     expect(parsed.messages[0].content).not.toContain("const value = 1;");
     expect(parsed.messages[1].content).toContain("const value = 2;");
     expect(parsed.messages[1].content).toContain("(final version)");
+  });
+
+  it("recognizes explicitly named create_artifact and update_artifact tools", () => {
+    const raw = conversation([
+      message("a1", "assistant", null, [{
+        type: "tool_use",
+        name: "create_artifact",
+        input: { artifact_id: "artifact-1", title: "page.html", language: "html", content: "<h1>Old</h1>" },
+      }]),
+      message("a2", "assistant", "a1", [{
+        type: "tool_use",
+        name: "update_artifact",
+        input: { artifact_id: "artifact-1", old_text: "Old", new_text: "New" },
+      }]),
+    ], "a2");
+
+    const parsed = parseClaudeConversation(raw, parserOptions);
+
+    expect(parsed.artifacts["artifact-1"].content).toBe("<h1>New</h1>");
+    expect(parsed.messages[1].content).toContain("<h1>New</h1>");
   });
 
   it("places the active conversation's final Artifact in an earlier selected message", () => {
@@ -429,10 +482,12 @@ describe("Claude conversation parser", () => {
 
     const parsed = parseClaudeConversation(raw, parserOptions);
 
-    expect(parsed.imageReferences).toEqual([{
+    expect(parsed.imageReferences).toEqual([expect.objectContaining({
       messageId: "u1",
+      resourceId: "url:https://claude.ai/api/image/1",
       url: "https://claude.ai/api/image/1",
-    }]);
+      source: "conversation-api",
+    })]);
     expect(parsed.revision).toMatch(/^[0-9a-f]{16}$/);
     expect(parsed.revision).not.toContain("What is this?");
   });
@@ -445,7 +500,10 @@ describe("Claude conversation parser", () => {
     const parsed = parseClaudeConversation(raw, parserOptions);
     expect(parsed.messages[0].content).toBe("");
     expect(parsed.messages[0].imageCount).toBe(1);
-    expect(parsed.imageReferences).toEqual([]);
+    expect(parsed.imageReferences).toEqual([expect.objectContaining({
+      messageId: "u1",
+      source: "rendered-image-recovery",
+    })]);
   });
 
   it("preserves non-image attachment names and descriptions without bundling their files", () => {

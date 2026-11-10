@@ -818,6 +818,55 @@
         border-color: var(--github);
       }
 
+      #resource-choice-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 1300;
+        align-items: center;
+        justify-content: center;
+        padding: 14px;
+        background: var(--overlay);
+      }
+
+      #resource-choice-overlay.open {
+        display: flex;
+      }
+
+      #resource-choice-modal {
+        width: 100%;
+        padding: 14px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        background: var(--surface);
+        box-shadow: var(--shadow);
+      }
+
+      #resource-choice-title {
+        margin: 0 0 8px;
+        font-size: 14px;
+        font-weight: 600;
+      }
+
+      #resource-choice-message {
+        margin: 0 0 12px;
+        color: var(--text-muted);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .resource-choice-actions {
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+      }
+
+      #resource-choice-primary {
+        background: var(--accent);
+        color: var(--github-text);
+        border-color: var(--accent);
+      }
+
       #github-confirm-export:hover:not(:disabled) {
         background: var(--github-hover);
       }
@@ -1058,6 +1107,25 @@
         >
           Cancel
         </button>
+      </div>
+    </div>
+
+    <div
+      id="resource-choice-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="resource-choice-title"
+      aria-describedby="resource-choice-message"
+      aria-hidden="true"
+    >
+      <div id="resource-choice-modal">
+        <p id="resource-choice-title" data-i18n="popup.resources.title">Export resources</p>
+        <p id="resource-choice-message"></p>
+        <div class="resource-choice-actions">
+          <button id="resource-choice-primary" type="button"></button>
+          <button id="resource-choice-secondary" type="button"></button>
+          <button id="resource-choice-cancel" type="button" data-i18n="popup.resources.cancel">Cancel</button>
+        </div>
       </div>
     </div>
 

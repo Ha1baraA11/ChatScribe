@@ -575,6 +575,29 @@ const COMPONENT_WRAPPERS = new Set([
   "list",
 ]);
 
+const CHATGPT_COMPONENT_NAMES = [
+  ...COMPONENT_WRAPPERS,
+  "divider",
+  "icon",
+  "badge",
+  "radio",
+  "list-item",
+].join("|");
+
+/** Detect serialized ChatGPT presentation markup outside Markdown code spans. */
+export function hasChatGptComponentMarkup(markdown: string): boolean {
+  const withoutFencedCode = markdown.replace(FENCED_CODE_PATTERN, " ");
+  const withoutInlineCode = withoutFencedCode.replace(
+    /(^|[^`])(`+)(?!`)[^\n]*?\2(?!`)/g,
+    "$1",
+  );
+  const pattern = new RegExp(
+    `<\\s*\\/?\\s*(?:${CHATGPT_COMPONENT_NAMES})\\b|\\{#(?:each|if)\\b|\\{@body\\b`,
+    "i",
+  );
+  return pattern.test(withoutInlineCode);
+}
+
 /**
  * Convert ChatGPT's presentation-only component markup into readable
  * Markdown. Fenced code is left untouched so examples remain literal.

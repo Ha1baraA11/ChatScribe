@@ -1,8 +1,10 @@
 import type {
   ConversationData,
   ExportImageFile,
+  ExportArtifactData,
   ExportMessage,
   ImageExportDiagnostics,
+  Settings,
 } from "./types.ts";
 import { materializeClaudeArtifactSelection } from "./claude-conversation.ts";
 
@@ -37,6 +39,30 @@ export function assertSelectedMessagesUnchanged(
   }
 }
 
+/** Remove clipboard-only image metadata when preserving legacy export settings. */
+export function prepareMessagesForExport(
+  messages: readonly ExportMessage[],
+  settings: Settings,
+): ExportMessage[] {
+  return messages.flatMap((message) => {
+    const includeImages = settings.downloadImages &&
+      (message.role !== "assistant" || settings.includeGeneratedImages);
+    const imageCount = includeImages ? message.imageCount : undefined;
+    const body = message.artifactBaseContent ?? message.content;
+    if (!body.trim() && !imageCount && !message.artifactReferences?.length) return [];
+
+    if (includeImages) return [message];
+    return [{
+      ...message,
+      imageCount: undefined,
+      imageMarkdownContent: undefined,
+      imagePathsByFilename: undefined,
+      renderedDiagramPaths: undefined,
+      imagePaths: [],
+    }];
+  });
+}
+
 /** Keep downloaded image-only replies that were created after the selector loaded. */
 export function selectHydratedExport(
   conversation: ConversationData,
@@ -46,7 +72,9 @@ export function selectHydratedExport(
   messages: ExportMessage[];
   images: ExportImageFile[];
   imageDiagnostics?: ImageExportDiagnostics;
+  artifacts?: Record<string, ExportArtifactData>;
   messageQuestionNumbersById?: Record<string, number>;
+  revision?: string;
 } {
   const selectedQuestionNumbers = new Set(
     [...selectedIds].flatMap((id) => {
@@ -73,6 +101,7 @@ export function selectHydratedExport(
       ? { imageDiagnostics: conversation.imageDiagnostics }
       : {}),
     ...(conversation.artifacts ? { artifacts: conversation.artifacts } : {}),
+    ...(conversation.revision ? { revision: conversation.revision } : {}),
     ...(conversation.messageQuestionNumbersById
       ? {
           messageQuestionNumbersById: Object.fromEntries(

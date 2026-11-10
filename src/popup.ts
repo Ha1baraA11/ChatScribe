@@ -15,6 +15,10 @@
 import { loadSettings, type Settings } from "./settings.ts";
 import { initI18n, applyTranslations, t } from "./i18n.ts";
 import {
+  formatClipboardMessages,
+  type ClipboardFormatResult,
+} from "./clipboard-formatter.ts";
+import {
   formatMarkdown,
   formatPlainText,
   formatJson,
@@ -25,6 +29,7 @@ import {
   type ExportFormat,
 } from "./formatter.ts";
 import { buildZipBlob, blobToBase64 } from "./zip.ts";
+import { buildClaudeArtifactArchive } from "./claude-export.ts";
 import {
   assertGitHubPayloadSize,
   base64LengthForByteCount,
@@ -33,6 +38,7 @@ import {
 import {
   assertSelectedMessagesUnchanged,
   captureSelectedMessageSnapshots,
+  prepareMessagesForExport,
   selectHydratedExport,
 } from "./export-selection.ts";
 import { getInitialSelectorScrollPosition } from "./selector-scroll.ts";
@@ -53,11 +59,13 @@ import {
 import type {
   ConversationData,
   ExportMessage,
+  ExportArchiveFile,
   ExportImageFile,
   ImageExportDiagnostics,
 } from "./types.ts";
 import {
   normalizeChatGptComponents,
+  hasChatGptComponentMarkup,
   replaceSvgTemplatesWithRenderedImages,
   renderSvgTemplatesAsMarkdown,
   type SvgDiagramMode,
@@ -154,6 +162,11 @@ const githubPanelCancel = $id<HTMLButtonElement>("github-panel-cancel");
 const githubConfirmOverlay = $id<HTMLDivElement>("github-confirm-overlay");
 const githubConfirmCancel = $id<HTMLButtonElement>("github-confirm-cancel");
 const githubConfirmExport = $id<HTMLButtonElement>("github-confirm-export");
+const resourceChoiceOverlay = $id<HTMLDivElement>("resource-choice-overlay");
+const resourceChoiceMessage = $id<HTMLParagraphElement>("resource-choice-message");
+const resourceChoicePrimary = $id<HTMLButtonElement>("resource-choice-primary");
+const resourceChoiceSecondary = $id<HTMLButtonElement>("resource-choice-secondary");
+const resourceChoiceCancel = $id<HTMLButtonElement>("resource-choice-cancel");
 
 const ALL_BUTTONS = [
   copyBtn,
@@ -173,7 +186,7 @@ const ALL_BUTTONS = [
 
 let conversationData: ConversationData | null = null;
 let conversationThinkingSetting: boolean | null = null;
-let conversationDownloadImages: boolean | null = null;
+let conversationImagesFetched: boolean | null = null;
 let settings: Settings | null = null;
 let pageTitle = "ChatGPT Conversation";
 let sourceTabId: number | null = null;
@@ -183,6 +196,7 @@ let sourceProvider: ConversationProvider | null = null;
 let latestCopyInFlight = false;
 let loadSequence = 0;
 let githubReturnSelection: Set<string> | null = null;
+let resourceChoiceResolve: ((choice: string) => void) | null = null;
 let selectorRevisionCheckTimer: number | undefined;
 let selectorRevisionCheckDueAt: number | undefined;
 let selectorRevisionCheckInFlight = false;
@@ -228,7 +242,6 @@ function captureExportContext(
 async function assertExportContext(
   context: ExportOperationContext,
   candidateData?: ConversationData,
-  verifySourceRevision = false,
 ): Promise<void> {
   if (
     loadSequence !== context.loadSequence ||
@@ -256,24 +269,6 @@ async function assertExportContext(
     );
   }
 
-  if (verifySourceRevision) {
-    if (!context.revision) {
-      throw new Error("Could not verify the active conversation branch before export.");
-    }
-    const currentHead = await requestConversationRevision(context.tabId);
-    if (!currentHead.success || !currentHead.revision) {
-      throw new Error(currentHead.error ?? "Could not verify the active conversation branch before export.");
-    }
-    if (
-      currentHead.conversationId !== context.conversationId ||
-      currentHead.revision !== context.revision
-    ) {
-      throw new Error("The conversation branch changed while the export was being prepared. Select the messages again.");
-    }
-    if (loadSequence !== context.loadSequence || sourceTabId !== context.tabId) {
-      throw new Error("The conversation changed while the export was being prepared. Select the messages again.");
-    }
-  }
 }
 
 function isExportContextChanged(error: unknown): boolean {
@@ -315,6 +310,7 @@ async function requestConversation(
   selectedMessageIds?: string[],
   forceRefresh = false,
   includeClaudeThinking = false,
+  includeImageMetadata = false,
 ): Promise<{
   success: boolean;
   data?: ConversationData;
@@ -329,6 +325,7 @@ async function requestConversation(
     selectedMessageIds,
     forceRefresh,
     includeClaudeThinking,
+    includeImageMetadata,
   };
 
   // Ensure the provider's content listener is available, repairing stale
@@ -362,6 +359,7 @@ async function requestConversationRevision(
     knownRevision?: string;
     returnDataIfChanged?: boolean;
     includeClaudeThinking?: boolean;
+    includeImageMetadata?: boolean;
   } = {},
 ): Promise<{
   success: boolean;
@@ -476,6 +474,53 @@ function showToast(msg: string, ms = 2200): void {
   toastTimer = window.setTimeout(() => toast.classList.remove("visible"), ms);
 }
 
+type ResourceChoiceMode = "settings-disabled" | "recovery-failed";
+
+function finishResourceChoice(choice: string): void {
+  const resolve = resourceChoiceResolve;
+  resourceChoiceResolve = null;
+  resourceChoiceOverlay.classList.remove("open");
+  resourceChoiceOverlay.setAttribute("aria-hidden", "true");
+  resolve?.(choice);
+}
+
+function askResourceChoice(
+  mode: ResourceChoiceMode,
+  count: number,
+): Promise<string> {
+  if (resourceChoiceResolve) finishResourceChoice("cancel");
+  resourceChoiceMessage.textContent = mode === "settings-disabled"
+    ? t("popup.resources.disabled", { count })
+    : t("popup.resources.failed", { count });
+  resourceChoicePrimary.textContent = t(
+    mode === "settings-disabled" ? "popup.resources.bundle" : "popup.resources.retry",
+  );
+  resourceChoiceSecondary.textContent = t(
+    mode === "settings-disabled"
+      ? "popup.resources.withoutImages"
+      : "popup.resources.exportAvailable",
+  );
+  resourceChoicePrimary.dataset.choice = mode === "settings-disabled" ? "bundle" : "retry";
+  resourceChoiceSecondary.dataset.choice = mode === "settings-disabled" ? "without" : "available";
+  resourceChoiceOverlay.classList.add("open");
+  resourceChoiceOverlay.setAttribute("aria-hidden", "false");
+  return new Promise((resolve) => {
+    resourceChoiceResolve = resolve;
+    resourceChoicePrimary.focus();
+  });
+}
+
+resourceChoicePrimary.addEventListener("click", () => {
+  finishResourceChoice(resourceChoicePrimary.dataset.choice ?? "cancel");
+});
+resourceChoiceSecondary.addEventListener("click", () => {
+  finishResourceChoice(resourceChoiceSecondary.dataset.choice ?? "cancel");
+});
+resourceChoiceCancel.addEventListener("click", () => finishResourceChoice("cancel"));
+resourceChoiceOverlay.addEventListener("click", (event) => {
+  if (event.target === resourceChoiceOverlay) finishResourceChoice("cancel");
+});
+
 // -----------------------------------------------------------------------
 // BUSY STATE
 // -----------------------------------------------------------------------
@@ -491,6 +536,26 @@ function setLatestCopyStatus(phase: "preparing" | "checking" | "writing" | null)
     return;
   }
   latestCopyStatusMessage.textContent = t(`popup.copyLatest.status.${phase}`);
+  latestCopyStatus.hidden = false;
+}
+
+function setCopyOperationStatus(phase: "preparing" | "checking" | "writing" | null): void {
+  if (!phase) {
+    latestCopyStatus.hidden = true;
+    latestCopyStatusMessage.textContent = "";
+    return;
+  }
+  latestCopyStatusMessage.textContent = t(`popup.copyOperation.status.${phase}`);
+  latestCopyStatus.hidden = false;
+}
+
+function setExportStatus(phase: "preparing" | "packaging" | "finishing" | null): void {
+  if (!phase) {
+    latestCopyStatus.hidden = true;
+    latestCopyStatusMessage.textContent = "";
+    return;
+  }
+  latestCopyStatusMessage.textContent = t(`popup.export.status.${phase}`);
   latestCopyStatus.hidden = false;
 }
 
@@ -554,7 +619,7 @@ async function loadConversationForTab(tabId: number): Promise<void> {
   sourceProvider = null;
   conversationData = null;
   conversationThinkingSetting = null;
-  conversationDownloadImages = null;
+  conversationImagesFetched = null;
   setLatestCopyStatus(null);
   closeSelector();
   showLoading(t("popup.loading"));
@@ -586,6 +651,7 @@ async function loadConversationForTab(tabId: number): Promise<void> {
       undefined,
       false,
       settings?.includeClaudeThinking ?? false,
+      true,
     );
 
     if (!response?.success || !response.data) {
@@ -597,7 +663,7 @@ async function loadConversationForTab(tabId: number): Promise<void> {
     const loaded = response.data;
     conversationData = loaded;
     conversationThinkingSetting = settings?.includeClaudeThinking ?? false;
-    conversationDownloadImages = settings?.downloadImages ?? false;
+    conversationImagesFetched = false;
     if (loaded.messages.length === 0) {
       throw new Error(t("popup.error.noMessages"));
     }
@@ -754,12 +820,13 @@ async function copyFullConversation(): Promise<void> {
     }
     const response = await requestConversation(
       tabId,
-      copySettings.downloadImages,
-      copySettings.includeGeneratedImages,
+      false,
+      false,
       false,
       undefined,
       true,
       copySettings.includeClaudeThinking,
+      true,
     );
     if (requestId !== loadSequence || sourceTabId !== tabId) return;
     if (!response?.success || !response.data) {
@@ -771,13 +838,13 @@ async function copyFullConversation(): Promise<void> {
 
     conversationData = response.data;
     conversationThinkingSetting = copySettings.includeClaudeThinking;
-    conversationDownloadImages = copySettings.downloadImages;
+    conversationImagesFetched = false;
     sourceProvider = provider;
     sourceConversationId = getConversationIdFromUrl(tab.url);
     pageTitle = tab.title ?? pageTitle;
     hideLoading();
     const context = captureExportContext(response.data.messages);
-    await copyMessages(response.data.messages, { title: context.title }, context);
+    await copyMessages(response.data.messages, context, response.data.artifacts);
   } catch (error) {
     if (requestId !== loadSequence || sourceTabId !== tabId) return;
     devError("Failed to refresh conversation before copying:", error);
@@ -891,7 +958,7 @@ async function copyLatestClaudeAnswer(
     initialData = response.data;
     conversationData = initialData;
     conversationThinkingSetting = copySettings.includeClaudeThinking;
-    conversationDownloadImages = false;
+    conversationImagesFetched = false;
     sourceProvider = "claude";
     sourceConversationId = conversationId;
   }
@@ -931,7 +998,8 @@ async function copyLatestChatGptAnswer(
     sourceTabId === tabId &&
     sourceConversationId === conversationId &&
     Boolean(cachedData?.revision) &&
-    conversationDownloadImages === false;
+    cachedData?.imageMetadataIncluded === true &&
+    conversationImagesFetched === false;
 
   if (!canUseCachedData || !initialData) {
     const response = await requestConversation(
@@ -942,6 +1010,7 @@ async function copyLatestChatGptAnswer(
       undefined,
       true,
       copySettings.includeClaudeThinking,
+      true,
     );
     if (requestId !== loadSequence || sourceTabId !== tabId) return;
     if (!response?.success || !response.data) {
@@ -953,7 +1022,7 @@ async function copyLatestChatGptAnswer(
     initialData = response.data;
     conversationData = initialData;
     conversationThinkingSetting = copySettings.includeClaudeThinking;
-    conversationDownloadImages = false;
+    conversationImagesFetched = false;
     sourceProvider = "chatgpt";
     sourceConversationId = conversationId;
   }
@@ -970,6 +1039,7 @@ async function copyLatestChatGptAnswer(
       const response = await requestConversationRevision(tabId, false, {
         knownRevision: revision,
         returnDataIfChanged: true,
+        includeImageMetadata: true,
       });
       if (response.success && response.conversationId !== conversationId) {
         throw new Error("The conversation changed while the latest answer was being prepared.");
@@ -987,11 +1057,12 @@ async function copyLatestAnswerFromData(
   initialData: ConversationData,
   checkRevision: (revision: string) => Promise<LatestCopyRevisionResponse<ConversationData>>,
 ): Promise<void> {
+  let clipboardResult: ClipboardFormatResult | null = null;
 
   await runLatestCopyTransaction<ConversationData, {
     data: ConversationData;
     context: ExportOperationContext;
-    markdown: string;
+    clipboard: ClipboardFormatResult;
   }>({
     initialData,
     getRevision: (data) => data.revision,
@@ -1002,29 +1073,24 @@ async function copyLatestAnswerFromData(
       if (data !== conversationData) {
         conversationData = data;
         conversationThinkingSetting = copySettings.includeClaudeThinking;
-        conversationDownloadImages = false;
+        conversationImagesFetched = false;
       }
       if (data.messages.length === 0) throw new Error(t("popup.error.noMessages"));
       const latestAnswer = [...data.messages].reverse().find((message) =>
         message.role === "assistant" &&
         (message.content.trim().length > 0 ||
-          (provider === "claude" && Boolean(message.imageCount))) &&
+          Boolean(message.imageCount)) &&
         (provider !== "chatgpt" ||
           !message.id.startsWith("rendered-generated-image:"))
       );
       if (!latestAnswer) throw new Error(t("popup.error.noAssistantAnswer"));
 
-      const selected = provider === "claude"
-        ? materializeClaudeArtifactSelection([latestAnswer], data.artifacts)
-        : [latestAnswer];
+      const selected = [latestAnswer];
       const context = captureExportContext(selected, data);
-      const prepared = await prepareDiagramMessages(selected, "text", provider);
-      const markdown = formatMarkdown(prepared.messages, copySettings, {
-        includeRoleHeadings: false,
-        title: context.title,
-      });
-      if (!markdown.trim()) throw new Error(t("popup.error.noCopyableContent"));
-      return { data, context, markdown };
+      const prepared = prepareClipboardMessages(selected, provider);
+      const clipboard = formatClipboardMessages(prepared, data.artifacts);
+      clipboardResult = clipboard;
+      return { data, context, clipboard };
     },
     check: checkRevision,
     ensureCurrent: async (prepared) => {
@@ -1033,10 +1099,49 @@ async function copyLatestAnswerFromData(
       }
       await assertExportContext(prepared.context, prepared.data);
     },
-    write: async (prepared) => writeClipboard(prepared.markdown),
+    write: async (prepared) => {
+      if (prepared.clipboard.text.trim()) {
+        await writeClipboard(prepared.clipboard.text, prepared.context.tabId);
+      }
+    },
     onPhase: setLatestCopyStatus,
   });
-  showToast(t("popup.toast.copied"));
+  if (clipboardResult) showCopyOutcomeToast(clipboardResult);
+}
+
+function prepareClipboardMessages(
+  messages: ExportMessage[],
+  provider: ConversationProvider,
+): ExportMessage[] {
+  if (provider !== "chatgpt") return messages;
+  return messages.map((message) => hasChatGptComponentMarkup(message.content)
+    ? { ...message, content: normalizeChatGptComponents(message.content) }
+    : message);
+}
+
+function showCopyOutcomeToast(result: ClipboardFormatResult): void {
+  const warnings: string[] = [];
+  if (result.omittedImageCount > 0) {
+    warnings.push(t("popup.copy.warning.images", { count: result.omittedImageCount }));
+  }
+  if (result.unavailableArtifactCount > 0) {
+    warnings.push(t("popup.copy.warning.artifacts", {
+      count: result.unavailableArtifactCount,
+    }));
+  }
+
+  if (!result.text.trim() && warnings.length === 0) {
+    showToast(t("popup.error.noCopyableContent"));
+    return;
+  }
+
+  const lead = result.text.trim()
+    ? t("popup.toast.copied")
+    : t("popup.copy.warning.nothingCopied");
+  const detail = warnings.length > 0
+    ? ` ${warnings.join(" ")} ${t("popup.copy.warning.export")}`
+    : "";
+  showToast(`${lead}${detail}`, warnings.length > 0 ? 7000 : 4000);
 }
 
 copySelectBtn.addEventListener("click", () => {
@@ -1073,6 +1178,10 @@ function applyCopyOptionsPreference(): void {
 }
 
 document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && resourceChoiceResolve) {
+    finishResourceChoice("cancel");
+    return;
+  }
   if (
     event.key === "Escape" &&
     !copyOptions.hidden &&
@@ -1138,6 +1247,7 @@ async function refreshConversationForSelector(
       undefined,
       true,
       selectorSettings.includeClaudeThinking,
+      true,
     );
     if (requestId !== loadSequence || sourceTabId !== tabId) return;
     if (!response?.success || !response.data) {
@@ -1151,7 +1261,7 @@ async function refreshConversationForSelector(
     if (requestId !== loadSequence || sourceTabId !== tabId) return;
     conversationData = response.data;
     conversationThinkingSetting = selectorSettings.includeClaudeThinking;
-    conversationDownloadImages = selectorSettings.downloadImages;
+    conversationImagesFetched = false;
     sourceProvider = getConversationProvider(tab.url);
     sourceConversationId = getConversationIdFromUrl(tab.url);
     pageTitle = tab.title ?? pageTitle;
@@ -1270,7 +1380,7 @@ function refreshOpenSelector(data: ConversationData): void {
 
   conversationData = data;
   conversationThinkingSetting = settings?.includeClaudeThinking ?? conversationThinkingSetting;
-  conversationDownloadImages = settings?.downloadImages ?? conversationDownloadImages;
+  conversationImagesFetched = false;
   populateSelector(data.messages, false, selectedIds);
   selList.scrollTop = wasAtBottom
     ? selList.scrollHeight
@@ -1326,6 +1436,7 @@ async function checkSelectorRevision(): Promise<void> {
         undefined,
         true,
         settings.includeClaudeThinking,
+        true,
       );
       if (requestId !== loadSequence || sourceTabId !== tabId) return;
       if (!response?.success || !response.data) {
@@ -1485,15 +1596,18 @@ function getSelectedMessages(): ExportMessage[] {
 async function hydrateSelectedImages(
   messages: ExportMessage[],
   context: ExportOperationContext,
+  forceBundle = false,
 ): Promise<{
   messages: ExportMessage[];
   images: ExportImageFile[];
   imageDiagnostics?: ImageExportDiagnostics;
   messageQuestionNumbersById?: Record<string, number>;
+  revision?: string;
 }> {
-  if (!settings?.downloadImages || sourceTabId === null) {
+  if (!settings || (!settings.downloadImages && !forceBundle) || sourceTabId === null) {
     return { messages, images: [] };
   }
+  const requestSettings = settings;
 
   await assertExportContext(context);
   showLoading(t("popup.loadingImages"));
@@ -1501,11 +1615,11 @@ async function hydrateSelectedImages(
     const response = await requestConversation(
       context.tabId,
       true,
-      settings.includeGeneratedImages,
+      requestSettings.includeGeneratedImages,
       true,
       messages.map((message) => message.id),
       false,
-      settings.includeClaudeThinking,
+      requestSettings.includeClaudeThinking,
     );
     if (!response?.success || !response.data) {
       const reason = response?.error ?? t("popup.error.loadFailed");
@@ -1521,14 +1635,138 @@ async function hydrateSelectedImages(
 
     await assertExportContext(context, response.data);
 
-    return selectHydratedExport(
-      response.data,
-      new Set(messages.map((message) => message.id)),
-      context.knownMessageIds,
-    );
+    return {
+      ...selectHydratedExport(
+        response.data,
+        new Set(messages.map((message) => message.id)),
+        context.knownMessageIds,
+      ),
+      revision: response.data.revision,
+    };
   } finally {
     hideLoading();
   }
+}
+
+function missingImageCount(messages: readonly ExportMessage[]): number {
+  return messages.reduce((sum, message) =>
+    sum + Math.max(0, (message.imageCount ?? 0) - message.imagePaths.length),
+  0);
+}
+
+function createClaudeImageLoadFailureDiagnostics(
+  messages: readonly ExportMessage[],
+): ImageExportDiagnostics {
+  return {
+    schemaVersion: 1,
+    startedAt: new Date().toISOString(),
+    failure: {
+      stage: "claude-image-load",
+      reason: "Claude image resources could not be loaded.",
+    },
+    settings: {
+      bundleImages: true,
+      includeGeneratedImages: true,
+      fetchImages: true,
+      selectedMessagesOnly: true,
+    },
+    events: [{
+      elapsedMs: 0,
+      stage: "claude-image-load",
+      details: { selectedImageCount: messages.reduce((sum, message) => sum + (message.imageCount ?? 0), 0) },
+    }],
+    messages: messages
+      .filter((message) => (message.imageCount ?? 0) > 0)
+      .map((message) => ({
+        questionNumber: null,
+        role: message.role,
+        origin: "conversation-api",
+        includedBySettings: true,
+        imageResourceCount: message.imageCount ?? 0,
+        imageResourceKinds: [],
+        sandboxReferenceCount: 0,
+        downloadAttemptedCount: 0,
+        downloadedPaths: [],
+        downloadFailures: ["conversation-load-failed"],
+      })),
+  };
+}
+
+interface PreparedImageBundle {
+  messages: ExportMessage[];
+  images: ExportImageFile[];
+  imageDiagnostics?: ImageExportDiagnostics;
+  messageQuestionNumbersById?: Record<string, number>;
+  revision?: string;
+  freshSnapshotVerified: boolean;
+  missingImageCount: number;
+  cancelled: boolean;
+}
+
+async function prepareSelectedImages(
+  messages: ExportMessage[],
+  context: ExportOperationContext,
+): Promise<PreparedImageBundle> {
+  const isClaude = context.provider === "claude";
+  const selectedImageCount = messages.reduce((sum, message) => sum + (message.imageCount ?? 0), 0);
+  if (!isClaude && !settings?.downloadImages) {
+    return { messages, images: [], freshSnapshotVerified: false, missingImageCount: 0, cancelled: false };
+  }
+  if (isClaude && selectedImageCount === 0 && !settings?.downloadImages) {
+    return { messages, images: [], freshSnapshotVerified: false, missingImageCount: 0, cancelled: false };
+  }
+
+  let shouldBundle = settings?.downloadImages === true;
+  if (isClaude && selectedImageCount > 0 && !shouldBundle) {
+    const choice = await askResourceChoice("settings-disabled", selectedImageCount);
+    if (choice === "cancel") {
+      return { messages, images: [], freshSnapshotVerified: false, missingImageCount: 0, cancelled: true };
+    }
+    shouldBundle = choice === "bundle";
+    if (!shouldBundle) {
+      return {
+        messages,
+        images: [],
+        freshSnapshotVerified: false,
+        missingImageCount: selectedImageCount,
+        cancelled: false,
+      };
+    }
+  }
+  if (!shouldBundle) {
+    return { messages, images: [], freshSnapshotVerified: false, missingImageCount: 0, cancelled: false };
+  }
+  if (sourceTabId === null) {
+    throw new Error(t("popup.error.loadFailed"));
+  }
+
+  const loadBundle = async () => {
+    try {
+      const hydrated = await hydrateSelectedImages(messages, context, isClaude);
+      return { ...hydrated, freshSnapshotVerified: Boolean(hydrated.revision) };
+    } catch (error) {
+      if (!isClaude || isExportContextChanged(error)) throw error;
+      return {
+        messages,
+        images: [],
+        freshSnapshotVerified: false,
+        imageDiagnostics: createClaudeImageLoadFailureDiagnostics(messages),
+      };
+    }
+  };
+
+  let hydrated = await loadBundle();
+  let missing = missingImageCount(hydrated.messages);
+  while (isClaude && missing > 0) {
+    const choice = await askResourceChoice("recovery-failed", missing);
+    if (choice === "cancel") {
+      return { ...hydrated, missingImageCount: missing, cancelled: true };
+    }
+    if (choice === "available") break;
+    hydrated = await loadBundle();
+    missing = missingImageCount(hydrated.messages);
+  }
+  return { ...hydrated, missingImageCount: missing, cancelled: false };
 }
 
 function buildImageExportDiagnosticsForArchive(
@@ -1729,13 +1967,25 @@ async function prepareDiagramMessages(
 async function exportSelected(): Promise<void> {
   if (!settings || !conversationData) return;
 
-  let chosen = getSelectedMessages();
-  if (chosen.length === 0) return;
-  const context = captureExportContext(chosen);
-  chosen = materializeClaudeArtifactSelection(chosen, conversationData.artifacts);
+  const selected = getSelectedMessages();
+  if (selected.length === 0) return;
+  const context = captureExportContext(selected);
+  let chosen = prepareMessagesForExport(selected, settings);
+  if (chosen.length === 0) {
+    showToast(t("popup.error.noMessages"));
+    return;
+  }
+  const artifactStates = conversationData.artifacts ?? {};
+  chosen = materializeClaudeArtifactSelection(chosen, artifactStates);
 
   let imageDiagnostics: ImageExportDiagnostics | undefined;
+  let freshSnapshotMessages: ExportMessage[] | undefined;
+  let freshSnapshotRevision: string | undefined;
+  let missingImages = 0;
+  let unavailableArtifacts = 0;
+  let failedArtifactPreviews = 0;
   setBusy(true);
+  setExportStatus("preparing");
   closeSelector();
 
   try {
@@ -1747,27 +1997,50 @@ async function exportSelected(): Promise<void> {
 
     let selectedImages: ExportImageFile[] = [];
     let messageQuestionNumbersById: Record<string, number> | undefined;
-    if (fmt === "md" && settings.downloadImages && sourceTabId !== null) {
-      const hydrated = await hydrateSelectedImages(chosen, context);
-      chosen = hydrated.messages;
-      selectedImages = hydrated.images;
-      imageDiagnostics = hydrated.imageDiagnostics;
-      messageQuestionNumbersById = hydrated.messageQuestionNumbersById;
+    if (fmt === "md") {
+      const imageBundle = await prepareSelectedImages(chosen, context);
+      if (imageBundle.cancelled) return;
+      chosen = imageBundle.messages;
+      selectedImages = imageBundle.images;
+      imageDiagnostics = imageBundle.imageDiagnostics;
+      messageQuestionNumbersById = imageBundle.messageQuestionNumbersById;
+      missingImages = imageBundle.missingImageCount;
+      if (imageBundle.freshSnapshotVerified && imageBundle.revision) {
+        freshSnapshotMessages = chosen;
+        freshSnapshotRevision = imageBundle.revision;
+      }
     }
 
+    setExportStatus("packaging");
     await assertExportContext(context);
     const prepared = await prepareDiagramMessages(chosen, diagramMode, context.provider);
     await assertExportContext(context);
-    const exportMessages = prepared.messages;
-    const images = [...selectedImages, ...prepared.assets];
-    const hasImages = images.length > 0;
+    let exportMessages = prepared.messages;
+    let artifactFiles: ExportArchiveFile[] = [];
+    let artifactPreviewImages: ExportImageFile[] = [];
+    if (fmt === "md" && context.provider === "claude") {
+      const artifactBundle = await buildClaudeArtifactArchive(exportMessages, artifactStates);
+      exportMessages = artifactBundle.messages;
+      artifactFiles = artifactBundle.files;
+      artifactPreviewImages = artifactBundle.files.filter((file) =>
+        file.path.startsWith("images/")
+      );
+      unavailableArtifacts = artifactBundle.unavailableCount;
+      failedArtifactPreviews = artifactBundle.previewFailureCount;
+    }
+    await assertExportContext(context);
+    const images = [...selectedImages, ...prepared.assets, ...artifactPreviewImages];
+    const archiveFiles: ExportArchiveFile[] = [
+      ...images,
+      ...artifactFiles.filter((file) => file.path.startsWith("artifacts/")),
+    ];
     const exportTime = new Date();
 
     let filename: string;
     let blob: Blob;
 
-    if (fmt === "md" && (hasImages || imageDiagnostics)) {
-      // Bundle Markdown + images into ZIP
+    if (fmt === "md" && (archiveFiles.length > 0 || imageDiagnostics)) {
+      // Keep the transcript at the root and place images/ and artifacts/ beside it.
       const md = formatMarkdown(exportMessages, settings, { title: context.title });
       const mdFilename = buildFilename(context.title, "md", settings.filenameTemplate, exportTime);
       filename = buildFilename(context.title, "zip", settings.filenameTemplate, exportTime);
@@ -1778,7 +2051,7 @@ async function exportSelected(): Promise<void> {
         exportMessages,
         messageQuestionNumbersById,
       );
-      blob = buildZipBlob(md, mdFilename, images, archiveDiagnostics);
+      blob = buildZipBlob(md, mdFilename, archiveFiles, archiveDiagnostics);
     } else {
       let text: string;
       let ext: string;
@@ -1812,7 +2085,11 @@ async function exportSelected(): Promise<void> {
     const objectUrl = URL.createObjectURL(blob);
 
     try {
-      await assertExportContext(context, undefined, true);
+      setExportStatus("finishing");
+      const freshSnapshot = freshSnapshotMessages && freshSnapshotRevision
+        ? { messages: freshSnapshotMessages, images: [], revision: freshSnapshotRevision }
+        : undefined;
+      await assertExportContext(context, freshSnapshot);
       const dlResponse = await chrome.runtime.sendMessage({
         type: "TRACKED_DOWNLOAD",
         url: objectUrl,
@@ -1828,7 +2105,21 @@ async function exportSelected(): Promise<void> {
         throw new ImageExportFailure(reason, imageDiagnostics, "archive-download");
       }
 
-      showToast(t("popup.toast.downloadStarted"));
+      if (missingImages > 0 || unavailableArtifacts > 0 || failedArtifactPreviews > 0) {
+        const partialMessage = t("popup.resources.partial", {
+          images: missingImages,
+          artifacts: unavailableArtifacts,
+        });
+        const previewMessage = failedArtifactPreviews > 0
+          ? ` ${t("popup.resources.previewFailure", { count: failedArtifactPreviews })}`
+          : "";
+        const diagnosticsMessage = imageDiagnostics
+          ? ` ${t("popup.resources.diagnostics")}`
+          : "";
+        showToast(`${partialMessage}${previewMessage}${diagnosticsMessage}`, 8000);
+      } else {
+        showToast(t("popup.toast.downloadStarted"));
+      }
     } finally {
       window.setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
     }
@@ -1865,6 +2156,7 @@ async function exportSelected(): Promise<void> {
       await refreshConversationForSelector(false, new Set(context.selectedIds));
     }
   } finally {
+    setExportStatus(null);
     setBusy(false);
   }
 }
@@ -1872,35 +2164,39 @@ async function exportSelected(): Promise<void> {
 async function copySelected(): Promise<void> {
   if (!settings || !conversationData) return;
 
-  let chosen = getSelectedMessages();
+  const chosen = getSelectedMessages();
   if (chosen.length === 0) return;
   const context = captureExportContext(chosen);
-  chosen = materializeClaudeArtifactSelection(chosen, conversationData.artifacts);
-  await copyMessages(chosen, { title: context.title }, context);
+  await copyMessages(chosen, context, conversationData.artifacts);
 }
 
 async function copyMessages(
   messages: ExportMessage[],
-  options: { includeRoleHeadings?: boolean; title?: string } = {},
   context: ExportOperationContext,
+  artifacts: ConversationData["artifacts"] = {},
 ): Promise<void> {
   if (!settings || messages.length === 0) return;
 
   setBusy(true);
+  setCopyOperationStatus("preparing");
   closeSelector();
 
   try {
-    await assertExportContext(context);
-    const prepared = await prepareDiagramMessages(messages, "text", context.provider);
-    await assertExportContext(context);
-    const markdown = formatMarkdown(prepared.messages, settings, options);
-    if (!markdown.trim()) {
-      showToast(t("popup.error.noCopyableContent"));
+    const prepared = prepareClipboardMessages(messages, context.provider);
+    const clipboard = formatClipboardMessages(prepared, artifacts);
+    if (!clipboard.text.trim()) {
+      showCopyOutcomeToast(clipboard);
       return;
     }
-    await assertExportContext(context, undefined, true);
-    await writeClipboard(markdown);
-    showToast(t("popup.toast.copied"));
+    // The selector is opened from a forced fresh load and keeps its snapshot
+    // synchronized while visible. Copy that selected snapshot, then validate
+    // the local tab/message context once; another revision request would
+    // re-read the provider's entire conversation without improving this copy.
+    setCopyOperationStatus("checking");
+    await assertExportContext(context);
+    setCopyOperationStatus("writing");
+    await writeClipboard(clipboard.text, context.tabId);
+    showCopyOutcomeToast(clipboard);
   } catch (err) {
     devError("Copy failed:", err);
     showToast(err instanceof Error ? err.message : t("popup.toast.copyFailed"), 5000);
@@ -1908,6 +2204,7 @@ async function copyMessages(
       await refreshConversationForSelector(false, new Set(context.selectedIds));
     }
   } finally {
+    setCopyOperationStatus(null);
     setBusy(false);
   }
 }
@@ -2017,35 +2314,74 @@ async function saveToGitHub(): Promise<void> {
   const fullName = githubRepoSelect.value;
   if (!fullName) return;
 
-  let chosen = getSelectedMessages();
-  if (chosen.length === 0) return;
-  const context = captureExportContext(chosen);
-  chosen = materializeClaudeArtifactSelection(chosen, conversationData?.artifacts);
+  const selected = getSelectedMessages();
+  if (selected.length === 0) return;
+  const context = captureExportContext(selected);
+  let chosen = prepareMessagesForExport(selected, settings);
+  if (chosen.length === 0) {
+    showToast(t("popup.error.noMessages"));
+    return;
+  }
+  const artifactStates = conversationData?.artifacts ?? {};
+  chosen = materializeClaudeArtifactSelection(chosen, artifactStates);
+  let missingImages = 0;
+  let unavailableArtifacts = 0;
+  let failedArtifactPreviews = 0;
+  let freshSnapshotMessages: ExportMessage[] | undefined;
+  let freshSnapshotRevision: string | undefined;
 
   setBusy(true);
+  setExportStatus("preparing");
   githubPanelSave.textContent = t("popup.github.saving");
 
   try {
     await assertExportContext(context);
-    const hydrated = await hydrateSelectedImages(chosen, context);
-    chosen = hydrated.messages;
+    const imageBundle = await prepareSelectedImages(chosen, context);
+    if (imageBundle.cancelled) return;
+    chosen = imageBundle.messages;
+    missingImages = imageBundle.missingImageCount;
+    const imageDiagnostics = imageBundle.imageDiagnostics;
+    if (imageBundle.freshSnapshotVerified && imageBundle.revision) {
+      freshSnapshotMessages = chosen;
+      freshSnapshotRevision = imageBundle.revision;
+    }
+    setExportStatus("packaging");
     await assertExportContext(context);
     const prepared = await prepareDiagramMessages(chosen, "assets", context.provider);
     await assertExportContext(context);
-    const images = [...hydrated.images, ...prepared.assets];
-    const hasImages = images.length > 0;
+    let exportMessages = prepared.messages;
+    let artifactFiles: ExportArchiveFile[] = [];
+    let artifactPreviewImages: ExportImageFile[] = [];
+    if (context.provider === "claude") {
+      const artifactBundle = await buildClaudeArtifactArchive(exportMessages, artifactStates);
+      exportMessages = artifactBundle.messages;
+      artifactFiles = artifactBundle.files.filter((file) => file.path.startsWith("artifacts/"));
+      artifactPreviewImages = artifactBundle.files.filter((file) => file.path.startsWith("images/"));
+      unavailableArtifacts = artifactBundle.unavailableCount;
+      failedArtifactPreviews = artifactBundle.previewFailureCount;
+    }
+    await assertExportContext(context);
+    const images = [...imageBundle.images, ...prepared.assets, ...artifactPreviewImages];
+    const archiveFiles: ExportArchiveFile[] = [...images, ...artifactFiles];
     const exportTime = new Date();
 
-    const md = formatMarkdown(prepared.messages, settings, { title: context.title });
+    const md = formatMarkdown(exportMessages, settings, { title: context.title });
     const mdFilename = buildFilename(context.title, "md", settings.filenameTemplate, exportTime);
 
     let filename: string;
     let content: string;
     let isBinary = false;
 
-    if (hasImages) {
+    if (archiveFiles.length > 0 || imageDiagnostics) {
       filename = buildFilename(context.title, "zip", settings.filenameTemplate, exportTime);
-      const zipBlob = buildZipBlob(md, mdFilename, images);
+      const archiveDiagnostics = buildImageExportDiagnosticsForArchive(
+        imageDiagnostics,
+        md,
+        images,
+        exportMessages,
+        imageBundle.messageQuestionNumbersById,
+      );
+      const zipBlob = buildZipBlob(md, mdFilename, archiveFiles, archiveDiagnostics);
       assertGitHubPayloadSize(base64LengthForByteCount(zipBlob.size));
       content = await blobToBase64(zipBlob);
       isBinary = true;
@@ -2056,7 +2392,11 @@ async function saveToGitHub(): Promise<void> {
     }
 
     assertGitHubPayloadSize(isBinary ? content.length : base64LengthForText(content));
-    await assertExportContext(context, undefined, true);
+    setExportStatus("finishing");
+    const freshSnapshot = freshSnapshotMessages && freshSnapshotRevision
+      ? { messages: freshSnapshotMessages, images: [], revision: freshSnapshotRevision }
+      : undefined;
+    await assertExportContext(context, freshSnapshot);
     const saveResp = await chrome.runtime.sendMessage({
       type: "GITHUB_SAVE_FILE",
       fullName,
@@ -2076,9 +2416,17 @@ async function saveToGitHub(): Promise<void> {
     devLog("GitHub save complete:", saveResp.data?.htmlUrl);
 
     githubPanel.classList.remove("open");
+    const githubStatus = missingImages > 0 || unavailableArtifacts > 0 || failedArtifactPreviews > 0
+      ? `${t("popup.resources.partial", {
+          images: missingImages,
+          artifacts: unavailableArtifacts,
+        })}${failedArtifactPreviews > 0
+          ? ` ${t("popup.resources.previewFailure", { count: failedArtifactPreviews })}`
+          : ""}${imageDiagnostics ? ` ${t("popup.resources.diagnostics")}` : ""}`
+      : t("popup.toast.githubSaved");
     showToast(saveResp.data?.path
-      ? `${t("popup.toast.githubSaved")} — ${saveResp.data.path}`
-      : t("popup.toast.githubSaved"));
+      ? `${githubStatus} — ${saveResp.data.path}`
+      : githubStatus, 7000);
     void sendToPage({
       type: "SHOW_EXPORT_SUCCESS",
       message: t("popup.toast.githubSaved"),
@@ -2094,16 +2442,17 @@ async function saveToGitHub(): Promise<void> {
       await refreshConversationForSelector(false, new Set(context.selectedIds));
     }
   } finally {
+    setExportStatus(null);
     setBusy(false);
     githubPanelSave.textContent = t("popup.github.save");
   }
 }
 
-async function writeClipboard(text: string): Promise<void> {
+async function writeClipboard(text: string, tabId = sourceTabId ?? undefined): Promise<void> {
   const response = await chrome.runtime.sendMessage({
     type: "COPY_TO_CLIPBOARD",
     text,
-    tabId: sourceTabId ?? undefined,
+    tabId,
   }) as { success?: boolean; error?: string } | undefined;
 
   if (!response?.success) {

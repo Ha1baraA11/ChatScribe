@@ -53,15 +53,18 @@ export interface ExportArtifactData {
   modifiedLaterBlock: string;
 }
 
-/** A downloaded image file for bundling. */
-export interface ExportImageFile {
-  /** Relative path used in Markdown links, e.g. "images/image-001.png". */
+/** A binary or text resource included in a ZIP archive. */
+export interface ExportArchiveFile {
+  /** Relative path used inside the archive, e.g. "images/image-001.png". */
   path: string;
   mimeType: string;
   /** Base-64 encoded file bytes. */
   base64: string;
   sizeBytes: number;
 }
+
+/** A downloaded or recovered image file for bundling. */
+export interface ExportImageFile extends ExportArchiveFile {}
 
 /** A privacy-safe checkpoint captured during generated-image export. */
 export interface ImageExportDiagnosticEvent {
@@ -135,6 +138,9 @@ export interface ConversationData {
   revision?: string;
   /** Runtime-only Claude Artifact states, omitted by the public export formatters. */
   artifacts?: Record<string, ExportArtifactData>;
+  /** True when this snapshot also records image metadata for clipboard feedback. */
+  imageMetadataIncluded?: boolean;
+  /** Runtime-only file recovery result for Claude image attachments. */
   imageDiagnostics?: ImageExportDiagnostics;
   /** Runtime-only map used to align selected exports with full-conversation question numbers. */
   messageQuestionNumbersById?: Record<string, number>;
@@ -282,12 +288,14 @@ export type ChromeMessage =
       fetchImages?: boolean;
       forceRefresh?: boolean;
       selectedMessageIds?: string[];
+      includeImageMetadata?: boolean;
     }
   | {
       type: typeof CONTENT_CHECK_REVISION_TYPE;
       knownRevision?: string;
       returnDataIfChanged?: boolean;
       includeClaudeThinking?: boolean;
+      includeImageMetadata?: boolean;
     }
   | { type: typeof CONTENT_WATCH_CONVERSATION_TYPE; watch: boolean }
   | { type: typeof CONTENT_CONVERSATION_CHANGED_TYPE; conversationId: string }

@@ -414,14 +414,15 @@ function isExportable(
   msg: ApiMessage,
   downloadImages: boolean,
   includeGeneratedImages: boolean,
+  includeImageMetadata = false,
 ): boolean {
   const role = msg.author?.role;
   if (role !== "user" && role !== "assistant") return false;
   if (msg.metadata?.is_visually_hidden_from_conversation) return false;
 
   const hasText = Boolean(extractText(msg));
-  const mayIncludeImages = downloadImages &&
-    (role !== "assistant" || includeGeneratedImages);
+  const mayIncludeImages = (downloadImages || includeImageMetadata) &&
+    (includeImageMetadata || role !== "assistant" || includeGeneratedImages);
   // Branch filtering runs repeatedly. Use API metadata here; rendered-image
   // fallbacks are collected once after the active branch has been resolved.
   const hasImage = mayIncludeImages && getImageResources(msg, false).length > 0;
@@ -452,6 +453,7 @@ function buildChronologicalMessages(
   exportable: ApiMessage[],
   downloadImages: boolean,
   includeGeneratedImages: boolean,
+  includeImageMetadata = false,
 ): ApiMessage[] {
   const users = exportable
     .filter((m) => m.author?.role === "user")
@@ -502,7 +504,12 @@ function buildChronologicalMessages(
     if (
       chosen?.id &&
       !used.has(chosen.id) &&
-      isExportable(chosen, downloadImages, includeGeneratedImages)
+      isExportable(
+        chosen,
+        downloadImages,
+        includeGeneratedImages,
+        includeImageMetadata,
+      )
     ) {
       used.add(chosen.id);
       result.push(chosen);
@@ -2730,12 +2737,13 @@ async function loadConversation(
   fetchImages: boolean,
   selectedMessageIds?: string[],
   forceRefresh = false,
+  includeImageMetadata = false,
 ): Promise<ConversationData> {
   const requestPath = window.location.pathname;
   const selectedKey = selectedMessageIds
     ? [...selectedMessageIds].sort().join(",")
     : "all";
-  const key = `${requestPath}:${downloadImages}:${includeGeneratedImages}:${fetchImages}:${selectedKey}:${forceRefresh}`;
+  const key = `${requestPath}:${downloadImages}:${includeGeneratedImages}:${fetchImages}:${selectedKey}:${forceRefresh}:${includeImageMetadata}`;
   if (loadInFlight?.key === key) return loadInFlight.promise;
   if (
     !forceRefresh &&
@@ -2768,6 +2776,7 @@ async function loadConversation(
     selectedMessageIds ? new Set(selectedMessageIds) : null,
     forceRefresh,
     requestPath,
+    includeImageMetadata,
   )
     .then((data) => {
       const isLatestForcedLoad = forceRefresh &&
@@ -2800,6 +2809,7 @@ async function doLoadConversation(
   selectedMessageIds: ReadonlySet<string> | null,
   forceRefresh: boolean,
   requestPath: string,
+  includeImageMetadata: boolean,
 ): Promise<ConversationData> {
   imageResourceCache = new WeakMap();
   const diagnosticStartedAtMs = performance.now();
@@ -2888,6 +2898,7 @@ async function doLoadConversation(
           allById.get(id)!,
           downloadImages,
           includeGeneratedImages,
+          includeImageMetadata,
         )) {
           collected++;
         }
@@ -2956,7 +2967,7 @@ async function doLoadConversation(
 
   // ---- Resolve the active branch ----
   const exportableAll = Array.from(allById.values()).filter((m) =>
-    isExportable(m, downloadImages, includeGeneratedImages),
+    isExportable(m, downloadImages, includeGeneratedImages, includeImageMetadata),
   );
 
   let orderedMessages: ApiMessage[];
@@ -2971,7 +2982,7 @@ async function doLoadConversation(
     branchWalkStopReason = branchWalk.stopReason;
     branchWalkVisitedNodeCount = branchWalk.visitedNodeCount;
     const branch = activeBranchNodes?.filter((message) =>
-      isExportable(message, downloadImages, includeGeneratedImages),
+      isExportable(message, downloadImages, includeGeneratedImages, includeImageMetadata),
     );
     if (branch && branch.length > 0) {
       orderedMessages = branch;
@@ -2985,6 +2996,7 @@ async function doLoadConversation(
         exportableAll,
         downloadImages,
         includeGeneratedImages,
+        includeImageMetadata,
       );
     }
   } else {
@@ -2994,6 +3006,7 @@ async function doLoadConversation(
       exportableAll,
       downloadImages,
       includeGeneratedImages,
+      includeImageMetadata,
     );
   }
 
@@ -3049,7 +3062,12 @@ async function doLoadConversation(
     if (role === "user") audit.rawUserNodes++;
     if (role === "assistant") {
       audit.rawAssistantNodes++;
-      if (isExportable(message, downloadImages, includeGeneratedImages)) {
+      if (isExportable(
+        message,
+        downloadImages,
+        includeGeneratedImages,
+        includeImageMetadata,
+      )) {
         audit.exportableAssistantNodes++;
       }
       if (extractText(message)) audit.assistantNodesWithText++;
@@ -3290,12 +3308,14 @@ async function doLoadConversation(
 
       const mayIncludeImages = downloadImages &&
         (role !== "assistant" || includeGeneratedImages);
-      const hasImageResource = mayIncludeImages && getImageResources(msg).length > 0;
+      const imageResources = mayIncludeImages || includeImageMetadata
+        ? getImageResources(msg)
+        : [];
+      const hasImageResource = imageResources.length > 0;
       const mayDownloadImages = fetchImages && mayIncludeImages &&
         isSelectedForImageDownload(msg, selectedMessageIds);
       const diagnosticMessage = diagnosticMessagesById.get(msg.id);
       if (mayDownloadImages) {
-        const imageResources = getImageResources(msg);
         if (diagnosticMessage) {
           diagnosticMessage.downloadAttemptedCount = imageResources.length;
         }
@@ -3441,6 +3461,7 @@ async function doLoadConversation(
         role,
         content,
         ...(svgBackgroundColor ? { svgBackgroundColor } : {}),
+        ...(imageResources.length > 0 ? { imageCount: imageResources.length } : {}),
         ...(imageMarkdownContent !== content ? { imageMarkdownContent } : {}),
         ...(localImagePathsByFilename.size > 0
           ? { imagePathsByFilename: Object.fromEntries(localImagePathsByFilename) }
@@ -3619,6 +3640,7 @@ async function doLoadConversation(
     messages,
     images,
     revision,
+    imageMetadataIncluded: includeImageMetadata,
     imageDiagnostics,
     messageQuestionNumbersById,
   };
@@ -3833,6 +3855,7 @@ function showExportSuccess(message: string): void {
 async function checkConversationRevision(options: {
   knownRevision?: string;
   returnDataIfChanged?: boolean;
+  includeImageMetadata?: boolean;
 } = {}): Promise<{
   conversationId: string;
   revision: string;
@@ -3858,7 +3881,14 @@ async function checkConversationRevision(options: {
   const checkedRevision = getConversationRevision(page);
   const changed = options.knownRevision !== checkedRevision;
   if (options.returnDataIfChanged === true && changed) {
-    const data = await loadConversation(false, false, false, undefined, true);
+    const data = await loadConversation(
+      false,
+      false,
+      false,
+      undefined,
+      true,
+      options.includeImageMetadata === true,
+    );
     if (window.location.pathname !== requestPath) {
       throw new Error("The ChatGPT conversation changed while it was being checked.");
     }
@@ -3954,6 +3984,7 @@ const onContentMessage: Parameters<typeof chrome.runtime.onMessage.addListener>[
       forceRefresh?: boolean;
       knownRevision?: string;
       returnDataIfChanged?: boolean;
+      includeImageMetadata?: boolean;
       selectedMessageIds?: string[];
       text?: string;
       message?: string;
@@ -3990,6 +4021,7 @@ const onContentMessage: Parameters<typeof chrome.runtime.onMessage.addListener>[
         message.fetchImages ?? message.downloadImages === true,
         message.selectedMessageIds,
         message.forceRefresh === true,
+        message.includeImageMetadata === true,
       )
         .then((data) => sendResponse({ success: true, data }))
         .catch((err: unknown) => {
